@@ -37,6 +37,85 @@ class WorkerSimulator:
 
     # ... existing code ...
 
+        # ... 原有的代码保持不变 ...
+
+        def move_idle_workers_towards_center(
+                self,
+                centers: Dict[int, Any],
+                time_delta_seconds: float
+        ) -> None:
+            """
+            【新增功能】模拟时间流逝，将所有空闲 (idle) 的工人向所属区域的中心移动。
+            如果在 time_delta_seconds 时间内能到达中心，则位置更新为中心；
+            否则沿着最短路移动相应的距离，停在途中的某个节点上。
+            """
+            # 计算这段时间内工人最多能走多远
+            max_travel_dist = time_delta_seconds * self.config.WORKER_SPEED_MS
+
+            moved_count = 0
+            reached_center_count = 0
+
+            for wid, status in self.worker_status.items():
+                # 只移动空闲的工人
+                if status == 'idle':
+                    region_id = self.worker_center_map.get(wid)
+                    if region_id is None or region_id not in centers:
+                        continue
+
+                    curr_node, _, _ = self.worker_positions[wid]
+                    center_node = centers[region_id]
+
+                    if curr_node == center_node:
+                        continue  # 已经在中心待命，不需要移动
+
+                    try:
+                        # 计算从当前位置到中心的最短路径
+                        path = nx.shortest_path(self.G, source=curr_node, target=center_node, weight='length')
+
+                        if len(path) <= 1:
+                            continue
+
+                        traveled_dist = 0.0
+                        new_node = curr_node
+
+                        # 沿着最短路径的节点一截一截走
+                        for i in range(len(path) - 1):
+                            u = path[i]
+                            v = path[i + 1]
+
+                            # 获取边长数据 (兼容 Graph 和 MultiGraph)
+                            edge_data = self.G.get_edge_data(u, v)
+                            if isinstance(edge_data, dict) and 0 in edge_data:
+                                length = edge_data[0].get('length', 0)
+                            else:
+                                length = edge_data.get('length', 0) if edge_data else 0
+
+                            # 如果这段路能在剩余时间内走完
+                            if traveled_dist + length <= max_travel_dist:
+                                traveled_dist += length
+                                new_node = v
+                            else:
+                                # 走不完，为了简化节点映射，停在当前边起点的节点 u
+                                break
+
+                        # 提取到达的新节点坐标并更新工人位置
+                        node_data = self.G.nodes[new_node]
+                        new_lon = node_data.get('x', node_data.get('lon'))
+                        new_lat = node_data.get('y', node_data.get('lat'))
+
+                        self.worker_positions[wid] = (new_node, new_lon, new_lat)
+
+                        moved_count += 1
+                        if new_node == center_node:
+                            reached_center_count += 1
+
+                    except nx.NetworkXNoPath:
+                        # 如果图不连通找不到路，就原地不动
+                        pass
+
+            if moved_count > 0:
+                print(f"   [主动返航] {moved_count} 名空闲工人向中心移动 (其中 {reached_center_count} 人已就位)")
+
     def get_available_workers_with_center_info(
             self,
             region_id: int,
@@ -303,3 +382,82 @@ def load_task_locations(
     )
 
     return tasks_per_center
+
+    # ... 原有的代码保持不变 ...
+
+def move_idle_workers_towards_center(
+            self,
+            centers: Dict[int, Any],
+            time_delta_seconds: float
+    ) -> None:
+        """
+        【新增功能】模拟时间流逝，将所有空闲 (idle) 的工人向所属区域的中心移动。
+        如果在 time_delta_seconds 时间内能到达中心，则位置更新为中心；
+        否则沿着最短路移动相应的距离，停在途中的某个节点上。
+        """
+        # 计算这段时间内工人最多能走多远
+        max_travel_dist = time_delta_seconds * self.config.WORKER_SPEED_MS
+
+        moved_count = 0
+        reached_center_count = 0
+
+        for wid, status in self.worker_status.items():
+            # 只移动空闲的工人
+            if status == 'idle':
+                region_id = self.worker_center_map.get(wid)
+                if region_id is None or region_id not in centers:
+                    continue
+
+                curr_node, _, _ = self.worker_positions[wid]
+                center_node = centers[region_id]
+
+                if curr_node == center_node:
+                    continue  # 已经在中心待命，不需要移动
+
+                try:
+                    # 计算从当前位置到中心的最短路径
+                    path = nx.shortest_path(self.G, source=curr_node, target=center_node, weight='length')
+
+                    if len(path) <= 1:
+                        continue
+
+                    traveled_dist = 0.0
+                    new_node = curr_node
+
+                    # 沿着最短路径的节点一截一截走
+                    for i in range(len(path) - 1):
+                        u = path[i]
+                        v = path[i + 1]
+
+                        # 获取边长数据 (兼容 Graph 和 MultiGraph)
+                        edge_data = self.G.get_edge_data(u, v)
+                        if isinstance(edge_data, dict) and 0 in edge_data:
+                            length = edge_data[0].get('length', 0)
+                        else:
+                            length = edge_data.get('length', 0) if edge_data else 0
+
+                        # 如果这段路能在剩余时间内走完
+                        if traveled_dist + length <= max_travel_dist:
+                            traveled_dist += length
+                            new_node = v
+                        else:
+                            # 走不完，为了简化节点映射，停在当前边起点的节点 u
+                            break
+
+                    # 提取到达的新节点坐标并更新工人位置
+                    node_data = self.G.nodes[new_node]
+                    new_lon = node_data.get('x', node_data.get('lon'))
+                    new_lat = node_data.get('y', node_data.get('lat'))
+
+                    self.worker_positions[wid] = (new_node, new_lon, new_lat)
+
+                    moved_count += 1
+                    if new_node == center_node:
+                        reached_center_count += 1
+
+                except nx.NetworkXNoPath:
+                    # 如果图不连通找不到路，就原地不动
+                    pass
+
+        if moved_count > 0:
+            print(f"   [主动返航] {moved_count} 名空闲工人向中心移动 (其中 {reached_center_count} 人已就位)")
