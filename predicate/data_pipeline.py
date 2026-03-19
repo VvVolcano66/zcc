@@ -44,7 +44,7 @@ class SpatioTemporalDataset:
         all_data = pd.concat(df_list, ignore_index=True)
         all_data['first_time'] = pd.to_datetime(all_data['first_time'])
 
-        # 按时间片聚合 (例如每30分钟)
+        # 按时间片聚合 (例如每 30 分钟)
         all_data['time_slot'] = all_data['first_time'].dt.floor(f'{self.time_interval}T')
         all_data['x_idx'] = np.digitize(all_data['first_lon'], self.lon_bins) - 1
         all_data['y_idx'] = np.digitize(all_data['first_lat'], self.lat_bins) - 1
@@ -71,8 +71,52 @@ class SpatioTemporalDataset:
 
         return demand_tensor, all_slots
 
+    def load_and_gridify_from_dataframe(self, df):
+        """
+        从 DataFrame 加载并映射到时空网格 (Time, H, W)
+
+        Args:
+            df: 已经加载好的 DataFrame，必须包含 first_time, first_lon, first_lat 列
+
+        Returns:
+            demand_tensor: 需求张量 (Time, H, W)
+            all_slots: 时间槽列表
+        """
+        df_copy = df.copy()
+        df_copy['first_time'] = pd.to_datetime(df_copy['first_time'])
+
+        # 按时间片聚合 (例如每 30 分钟)
+        df_copy['time_slot'] = df_copy['first_time'].dt.floor(f'{self.time_interval}T')
+        df_copy['x_idx'] = np.digitize(df_copy['first_lon'], self.lon_bins) - 1
+        df_copy['y_idx'] = np.digitize(df_copy['first_lat'], self.lat_bins) - 1
+
+        # 过滤掉边界外的数据
+        valid = df_copy[(df_copy['x_idx'] >= 0) & (df_copy['x_idx'] < self.grid_size[1]) &
+                        (df_copy['y_idx'] >= 0) & (df_copy['y_idx'] < self.grid_size[0])]
+
+        if len(valid) == 0:
+            raise ValueError("过滤后没有有效数据，请检查网格边界设置")
+
+        # 生成完整的时间序列
+        min_time = valid['time_slot'].min()
+        max_time = valid['time_slot'].max()
+        all_slots = pd.date_range(min_time, max_time, freq=f'{self.time_interval}T')
+
+        tensor_shape = (len(all_slots), self.grid_size[0], self.grid_size[1])
+        demand_tensor = np.zeros(tensor_shape)
+
+        # 填充张量
+        grouped = valid.groupby(['time_slot', 'y_idx', 'x_idx']).size().reset_index(name='count')
+        time_to_idx = {t: i for i, t in enumerate(all_slots)}
+
+        for _, row in grouped.iterrows():
+            t_idx = time_to_idx[row['time_slot']]
+            demand_tensor[t_idx, int(row['y_idx']), int(row['x_idx'])] = row['count']
+
+        return demand_tensor, all_slots
+
     def create_seq_data(self, demand_tensor, seq_len=6, pre_len=1, train_ratio=0.8):
-        """构造滑动窗口数据集: 用前 seq_len 个时间步预测后 pre_len 个时间步"""
+        """构造滑动窗口数据集：用前 seq_len 个时间步预测后 pre_len 个时间步"""
         X, Y = [], []
         for i in range(len(demand_tensor) - seq_len - pre_len + 1):
             X.append(demand_tensor[i: i + seq_len])
@@ -83,3 +127,25 @@ class SpatioTemporalDataset:
 
         train_size = int(len(X) * train_ratio)
         return X[:train_size], Y[:train_size], X[train_size:], Y[train_size:]
+
+    def create_seq_data_single_tensor(self, demand_tensor, seq_len=6, pre_len=1):
+        """
+        从单个张量构造滑动窗口数据集（不划分训练测试）
+
+        Args:
+            demand_tensor: 需求张量
+            seq_len: 序列长度
+            pre_len: 预测长度
+
+        Returns:
+            X, Y: 特征和标签
+        """
+        X, Y = [], []
+        for i in range(len(demand_tensor) - seq_len - pre_len + 1):
+            X.append(demand_tensor[i: i + seq_len])
+            Y.append(demand_tensor[i + seq_len: i + seq_len + pre_len])
+
+        X = np.array(X)  # (Samples, seq_len, H, W)
+        Y = np.array(Y)  # (Samples, pre_len, H, W)
+
+        return X, Y
