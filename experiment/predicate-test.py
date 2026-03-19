@@ -102,8 +102,8 @@ TEST_DATES = [
 
 # 2. 选择时间段（测试哪个时间段）
 # 设置为 None 表示使用全天数据
-START_HOUR = None  # 例如：7 表示从 7:00 开始
-END_HOUR = None  # 例如：9 表示到 9:00 结束（不包含 9:00）
+START_HOUR = 7  # 例如：7 表示从 7:00 开始
+END_HOUR = 9  # 例如：9 表示到 9:00 结束（不包含 9:00）
 
 # 3. 数据集参数
 SEQ_LEN = 5  # 序列长度（用几个历史时间步）
@@ -191,6 +191,7 @@ if __name__ == "__main__":
     X_tr_t = torch.FloatTensor(X_train)
     Y_tr_t = torch.FloatTensor(Y_train)
     X_te_t = torch.FloatTensor(X_test)
+    Y_te_t = torch.FloatTensor(Y_test)
 
     # 动态导入 CNN-LSTM 模型
     import importlib.util
