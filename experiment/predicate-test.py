@@ -87,6 +87,10 @@ SEQ_LEN = 5
 PRE_LEN = 1
 TRAIN_RATIO = 0.8
 # ================================================
+max_epochs = 300  # 把上限设高一点
+patience = 100  # 容忍度：如果连续 20 个 epoch 测试集误差不降，就停止
+best_val_loss = float('inf')
+patience_counter = 0
 
 if __name__ == "__main__":
     print("=" * 70)
@@ -165,13 +169,40 @@ if __name__ == "__main__":
     optimizer_dl = torch.optim.Adam(dl_model.parameters(), lr=0.01)
     criterion_dl = torch.nn.MSELoss()
 
-    print(f"训练 {50} 个 epoch...")
-    for epoch in range(50):
+    max_epochs = 300
+    patience = 20
+    best_val_loss_dl = float('inf')
+    patience_counter_dl = 0  # 独立计数器
+
+    print(f"训练最大 {max_epochs} 个 epoch，已启用早停机制 (Patience={patience})...")
+    for epoch in range(max_epochs):
+        dl_model.train()
         optimizer_dl.zero_grad()
-        outputs = dl_model(X_tr_t)
-        loss = criterion_dl(outputs, Y_tr_t)
-        loss.backward()
+        outputs_dl = dl_model(X_tr_t)
+        # CNN-LSTM 的输出就是 (B, 1, H, W)，所以直接用 Y_tr_t 即可，不要 squeeze
+        loss_dl = criterion_dl(outputs_dl, Y_tr_t)
+        loss_dl.backward()
         optimizer_dl.step()
+
+        # 验证阶段
+        dl_model.eval()
+        with torch.no_grad():
+            preds_val_dl = dl_model(X_te_t)
+            val_loss_dl = criterion_dl(preds_val_dl, Y_te_t).item()
+
+        if val_loss_dl < best_val_loss_dl:
+            best_val_loss_dl = val_loss_dl
+            patience_counter_dl = 0
+        else:
+            patience_counter_dl += 1
+
+        if (epoch + 1) % 10 == 0:
+            print(
+                f"  Epoch [{epoch + 1:03d}/{max_epochs}], Train Loss: {loss_dl.item():.4f} | Test Loss: {val_loss_dl:.4f}")
+
+        if patience_counter_dl >= patience:
+            print(f"⚠️ CNN-LSTM 触发早停！结束于 Epoch: {epoch + 1}")
+            break
 
     dl_model.eval()
     with torch.no_grad():
@@ -179,6 +210,7 @@ if __name__ == "__main__":
     dl_mae, dl_rmse = calculate_metrics(Y_test, dl_preds)
     print(f"[CNN-LSTM]      MAE: {dl_mae:.4f}, RMSE: {dl_rmse:.4f}")
 
+    # ================= 模型测试 3：ST-Transformer (创新点) =================
     print("\n" + "=" * 70)
     print("【模型测试 3】ST-Transformer 时空注意力网络 (论文创新)")
     print("=" * 70)
@@ -189,42 +221,57 @@ if __name__ == "__main__":
     spec_st.loader.exec_module(st_module)
     ST_Transformer = st_module.ST_Transformer
 
-    # 动态获取网格大小 (H, W)
     grid_size = (X_train.shape[2], X_train.shape[3])
-
-    # 初始化你的创新模型
     st_model = ST_Transformer(seq_len=SEQ_LEN, grid_size=grid_size, d_model=64, nhead=4, num_layers=2)
     optimizer_st = torch.optim.Adam(st_model.parameters(), lr=0.005)
     criterion_st = torch.nn.MSELoss()
 
-    print(f"训练 {50} 个 epoch...")
-    for epoch in range(50):
+    best_val_loss_st = float('inf')
+    patience_counter_st = 0  # 重新归零！！！
+
+    print(f"训练最大 {max_epochs} 个 epoch，已启用早停机制 (Patience={patience})...")
+    for epoch in range(max_epochs):
+        st_model.train()
         optimizer_st.zero_grad()
         outputs_st = st_model(X_tr_t)
 
-        # 适配维度：由于模型输出的是 (Batch, H, W)，而标签是 (Batch, 1, H, W)
+        # Transformer 输出是 (B, H, W)，所以需要将 Y_tr_t 降维对齐
         target_st = Y_tr_t.squeeze(1) if len(Y_tr_t.shape) == 4 else Y_tr_t
-
         loss_st = criterion_st(outputs_st, target_st)
         loss_st.backward()
         optimizer_st.step()
 
-        # 打印部分日志
+        # 验证阶段
+        st_model.eval()
+        with torch.no_grad():
+            preds_val_st = st_model(X_te_t)
+            target_val_st = Y_te_t.squeeze(1) if len(Y_te_t.shape) == 4 else Y_te_t
+            val_loss_st = criterion_st(preds_val_st, target_val_st).item()
+
+        if val_loss_st < best_val_loss_st:
+            best_val_loss_st = val_loss_st
+            patience_counter_st = 0
+        else:
+            patience_counter_st += 1
+
         if (epoch + 1) % 10 == 0:
-            print(f"  Epoch [{epoch + 1}/50], Loss: {loss_st.item():.6f}")
+            print(
+                f"  Epoch [{epoch + 1:03d}/{max_epochs}], Train Loss: {loss_st.item():.4f} | Test Loss: {val_loss_st:.4f}")
+
+        if patience_counter_st >= patience:
+            print(f"⚠️ ST-Transformer 触发早停！结束于 Epoch: {epoch + 1}")
+            break
 
     st_model.eval()
     with torch.no_grad():
         st_preds_raw = st_model(X_te_t).numpy()
-        # 恢复预测维度以匹配真实标签 (Batch, 1, H, W)
         st_preds = np.expand_dims(st_preds_raw, axis=1) if len(st_preds_raw.shape) == 3 else st_preds_raw
-
     st_mae, st_rmse = calculate_metrics(Y_test, st_preds)
     print(f"[ST-Transformer] MAE: {st_mae:.4f}, RMSE: {st_rmse:.4f}")
 
-    # ================= 模型测试 4：ST-GCN 图卷积网络 =================
+    # ================= 模型测试 4：ST-GCN 时空图卷积网络 =================
     print("\n" + "=" * 70)
-    print("【模型测试 4】ST-GCN 时空图卷积网络")
+    print("【模型测试 4】ST-GCN 时空图卷积网络 (Grid-as-Graph 适配版)")
     print("=" * 70)
 
     spec_gcn = importlib.util.spec_from_file_location("ST_GCN",
@@ -233,30 +280,78 @@ if __name__ == "__main__":
     spec_gcn.loader.exec_module(gcn_module)
     ST_GCN = gcn_module.ST_GCN
 
-    # 初始化 ST-GCN 模型
-    gcn_model = ST_GCN(seq_len=SEQ_LEN, grid_size=grid_size, hidden_dim=64)
+    num_nodes = grid_size[0] * grid_size[1]
+    gcn_model = ST_GCN(num_nodes=num_nodes, seq_len=SEQ_LEN, hidden_dim=64)
     optimizer_gcn = torch.optim.Adam(gcn_model.parameters(), lr=0.001)
     criterion_gcn = torch.nn.MSELoss()
 
-    print(f"训练 {50} 个 epoch...")
-    for epoch in range(50):
+    # 构建邻接矩阵
+    adj = torch.zeros((num_nodes, num_nodes))
+    for i in range(grid_size[0]):
+        for j in range(grid_size[1]):
+            idx = i * grid_size[1] + j
+            adj[idx, idx] = 1.0
+            if i > 0: adj[idx, (i - 1) * grid_size[1] + j] = 1.0
+            if i < grid_size[0] - 1: adj[idx, (i + 1) * grid_size[1] + j] = 1.0
+            if j > 0: adj[idx, i * grid_size[1] + (j - 1)] = 1.0
+            if j < grid_size[1] - 1: adj[idx, i * grid_size[1] + (j + 1)] = 1.0
+
+    rowsum = adj.sum(1)
+    d_inv_sqrt = torch.pow(rowsum, -0.5).flatten()
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    adj_normalized = adj.matmul(d_mat_inv_sqrt).transpose(0, 1).matmul(d_mat_inv_sqrt)
+
+    best_val_loss_gcn = float('inf')
+    patience_counter_gcn = 0  # 重新归零！！！
+
+    print(f"训练最大 {max_epochs} 个 epoch，已启用早停机制 (Patience={patience})...")
+    for epoch in range(max_epochs):
+        gcn_model.train()
         optimizer_gcn.zero_grad()
-        outputs_gcn = gcn_model(X_tr_t)
 
-        # 适配维度
+        # 【极其关键】将 4 维张量转为图所需的 3 维张量
+        X_tr_gcn = X_tr_t.view(X_tr_t.shape[0], X_tr_t.shape[1], num_nodes)
+
+        # 【极其关键】图卷积同时传入特征 X 和 邻接矩阵 adj
+        outputs_gcn_raw = gcn_model(X_tr_gcn, adj_normalized)
+
+        outputs_gcn = outputs_gcn_raw.view(-1, grid_size[0], grid_size[1])
         target_gcn = Y_tr_t.squeeze(1) if len(Y_tr_t.shape) == 4 else Y_tr_t
-
         loss_gcn = criterion_gcn(outputs_gcn, target_gcn)
         loss_gcn.backward()
         optimizer_gcn.step()
 
+        # 验证阶段
+        gcn_model.eval()
+        with torch.no_grad():
+            X_te_gcn = X_te_t.view(X_te_t.shape[0], X_te_t.shape[1], num_nodes)
+            preds_val_gcn_raw = gcn_model(X_te_gcn, adj_normalized)
+            preds_val_gcn = preds_val_gcn_raw.view(-1, grid_size[0], grid_size[1])
+            target_val_gcn = Y_te_t.squeeze(1) if len(Y_te_t.shape) == 4 else Y_te_t
+            val_loss_gcn = criterion_gcn(preds_val_gcn, target_val_gcn).item()
+
+        if val_loss_gcn < best_val_loss_gcn:
+            best_val_loss_gcn = val_loss_gcn
+            patience_counter_gcn = 0
+        else:
+            patience_counter_gcn += 1
+
         if (epoch + 1) % 10 == 0:
-            print(f"  Epoch [{epoch + 1}/50], Loss: {loss_gcn.item():.6f}")
+            print(
+                f"  Epoch [{epoch + 1:03d}/{max_epochs}], Train Loss: {loss_gcn.item():.4f} | Test Loss: {val_loss_gcn:.4f}")
+
+        if patience_counter_gcn >= patience:
+            print(f"⚠️ ST-GCN 触发早停！结束于 Epoch: {epoch + 1}")
+            break
 
     gcn_model.eval()
     with torch.no_grad():
-        gcn_preds_raw = gcn_model(X_te_t).numpy()
-        gcn_preds = np.expand_dims(gcn_preds_raw, axis=1) if len(gcn_preds_raw.shape) == 3 else gcn_preds_raw
+        X_te_gcn = X_te_t.view(X_te_t.shape[0], X_te_t.shape[1], num_nodes)
+        gcn_preds_raw = gcn_model(X_te_gcn, adj_normalized)
+        gcn_preds_reshaped = gcn_preds_raw.view(-1, grid_size[0], grid_size[1]).numpy()
+        gcn_preds = np.expand_dims(gcn_preds_reshaped, axis=1) if len(
+            gcn_preds_reshaped.shape) == 3 else gcn_preds_reshaped
 
     gcn_mae, gcn_rmse = calculate_metrics(Y_test, gcn_preds)
     print(f"[ST-GCN]        MAE: {gcn_mae:.4f}, RMSE: {gcn_rmse:.4f}")

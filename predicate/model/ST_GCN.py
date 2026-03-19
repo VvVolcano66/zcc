@@ -39,15 +39,11 @@ class GraphConvolution(nn.Module):
 
 
 class ST_GCN(nn.Module):
-    """
-    Road-Aware 时空图卷积网络
-    将 GCN (提取空间路网特征) 和 一维卷积/GRU (提取时间序列特征) 结合
-    """
-
     def __init__(self, num_nodes, seq_len, in_channels=1, hidden_dim=64):
         super(ST_GCN, self).__init__()
         self.num_nodes = num_nodes
         self.seq_len = seq_len
+        self.hidden_dim = hidden_dim  # <--- 新增这一行！
 
         # 1. 空间层: 图卷积提取空间相关性
         self.gcn1 = GraphConvolution(in_features=in_channels, out_features=32)
