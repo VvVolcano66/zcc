@@ -1,7 +1,7 @@
 # config.py
 
 # --- 模拟与算法参数 ---
-NUM_ZONES = 10        # 分区数量 (论文中的 k_n)
+NUM_ZONES = 5        # 分区数量 (论文中的 k_n)
 CITY_NAME = "Chengdu"
 
 # --- 地理位置参数 ---
@@ -29,3 +29,4 @@ TRAVEL_COST_PER_METER = TRAVEL_COST_PER_KM / 1000.0 # 换算为每米成本 (0.0
 
 # 3. 惩罚参数 (用于高级算法中的成本核算)
 DELAY_PENALTY = 5.0                   # 订单超时/无法分配的系统声誉损失惩罚 (5元/单)
+TASK_EXPIRE_MINUTES = 30

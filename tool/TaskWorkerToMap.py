@@ -6,7 +6,10 @@ import networkx as nx
 
 
 def snap_to_network(lon: float, lat: float, coords: np.ndarray, nodes: list) -> Any:
-    """将经纬度坐标映射到路网中最近的节点"""
+    """
+    将经纬度坐标映射到路网中最近的节点
+    注意：此函数仅供单次、少量调用。若处理大批量数据，请使用向量化批量查询。
+    """
     tree = KDTree(coords)
     _, idx = tree.query([[lon, lat]])
     return nodes[idx[0]]
@@ -85,7 +88,7 @@ class WorkerSimulator:
             centers: Dict[int, Any] = None
     ) -> None:
         """
-        从真实数据初始化工人位置，并绑定到对应区域中心
+        从真实数据初始化工人位置，并将工人【平均分配】到各个区域中心
         """
         import pandas as pd
         import os
@@ -121,30 +124,42 @@ class WorkerSimulator:
         # 取每个工人的最后一个位置
         latest_positions = workers_in_window.sort_values('timestamp').groupby('wid').last().reset_index()
 
-        # 初始化位置，并绑定到对应的中心区域
+        # 🚀 性能优化：在循环外统一构建 KDTree 并批量查询所有工人的最近路网节点
+        if coords is not None and nodes is not None:
+            from scipy.spatial import KDTree
+            tree = KDTree(coords)
+            worker_coords = latest_positions[['lon_gcj', 'lat_gcj']].values
+            _, idxs = tree.query(worker_coords)
+            latest_positions['nearest_node'] = [nodes[i] for i in idxs]
+        else:
+            latest_positions['nearest_node'] = None
+
+        # 获取所有的中心区域 ID
+        region_ids = list(centers.keys()) if centers else []
+        num_regions = len(region_ids)
+
+        # 初始化位置，并执行【平均分配】逻辑
         assigned_count = 0
-        for _, row in latest_positions.iterrows():
+        for idx, row in latest_positions.iterrows():
             wid = row['wid']
             lon = row['lon_gcj']
             lat = row['lat_gcj']
+            node = row['nearest_node']
 
-            # 映射到路网节点
-            if coords is not None and nodes is not None:
-                node = snap_to_network(lon, lat, coords, nodes)
+            # 💡 核心修改：利用取模运算 (idx % num_regions)，将工人像发牌一样均匀分发给各个中心
+            if num_regions > 0:
+                assigned_region_id = region_ids[idx % num_regions]
+                self.worker_center_map[wid] = assigned_region_id
+                assigned_count += 1
 
-                # 确定工人属于哪个中心区域
-                if partition is not None and node in partition:
-                    region_id = partition[node]
-                    self.worker_center_map[wid] = region_id
-                    assigned_count += 1
-            else:
-                node = None
-
+            # 保留工人真实的初始坐标
             self.worker_positions[wid] = (node, lon, lat)
             self.worker_status[wid] = 'idle'
 
         print(f"✅ 初始化完成：共 {len(self.worker_positions)} 个工人")
-        print(f"   - 已分配到中心区域：{assigned_count} 个工人")
+        if num_regions > 0:
+            print(
+                f"   - 已将 {assigned_count} 名工人强制平均分配至 {num_regions} 个中心 (每个中心约 {assigned_count // num_regions} 人)")
 
     def calculate_route_with_center(
             self,
@@ -323,13 +338,23 @@ def load_task_locations(
 
     tasks_per_center = {region_id: [] for region_id in centers.keys()}
 
-    matched_count = 0
-    for _, row in df.iterrows():
-        lon = row['first_lon']
-        lat = row['first_lat']
-        task_id = row['task_id']
+    if len(df) == 0:
+        print("   ⚠️ 没有满足时间或采样条件的任务")
+        return tasks_per_center
 
-        nearest_node = snap_to_network(lon, lat, coords, nodes)
+    # 🚀 性能优化：在循环外统一构建 KDTree，进行批量向量化查询 (彻底告别单行建树缓慢的问题)
+    tree = KDTree(coords)
+    task_coords = df[['first_lon', 'first_lat']].values
+    _, idxs = tree.query(task_coords)
+
+    # 将批量查询到的 nearest_node 保存回 df，方便后续遍历使用
+    df['nearest_node'] = [nodes[i] for i in idxs]
+
+    matched_count = 0
+    # 由于已经有了路网点映射，这里的遍历速度极快
+    for _, row in df.iterrows():
+        task_id = row['task_id']
+        nearest_node = row['nearest_node']
 
         if nearest_node in partition:
             region_id = partition[nearest_node]

@@ -12,14 +12,16 @@ class ST_Transformer(nn.Module):
         self.spatial_conv = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2),  # 降采样，例如 10x10 -> 5x5
+            nn.MaxPool2d(kernel_size=2),  # 降采样，例如 10x10 -> 5x5, 5x5 -> 2x2
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU()
         )
 
-        # 计算卷积后的特征维度 (假设网格是 10x10，MaxPool后是 5x5)
-        # 如果你使用 config 里的其他 NUM_ZONES，这里需要动态计算
-        conv_out_size = 5 * 5 * 32
+        # 💡 核心修复：根据传入的 grid_size 动态计算池化后的维度
+        # MaxPool2d(kernel_size=2) 默认 stride 也为 2，尺寸折半并向下取整
+        h_out = grid_size[0] // 2
+        w_out = grid_size[1] // 2
+        conv_out_size = h_out * w_out * 32
 
         # 将空间特征映射到 Transformer 的隐层维度
         self.feature_proj = nn.Linear(conv_out_size, d_model)
@@ -44,7 +46,7 @@ class ST_Transformer(nn.Module):
         spatial_features = []
         for t in range(self.seq_len):
             xt = x[:, t, :, :, :]  # 取出第 t 个时间步
-            conv_out = self.spatial_conv(xt)  # (Batch, 32, 5, 5)
+            conv_out = self.spatial_conv(xt)  # (Batch, 32, H_out, W_out)
             flat_out = conv_out.view(batch_size, -1)  # 展平
             proj_out = self.feature_proj(flat_out)  # (Batch, d_model)
             spatial_features.append(proj_out.unsqueeze(1))
