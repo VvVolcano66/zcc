@@ -9,7 +9,7 @@ def greedy_assignment_with_center_pickup(
         partition: Dict[Any, int],
         workers_per_center: Dict[int, List[Tuple[Any, str, float, float, Any]]],
         tasks_per_center: Dict[int, List[Tuple[Any, str, float, float]]],
-        slot_start_seconds: float = 0.0  # 💡 新增：传入当前时间槽的绝对起始时间
+        slot_start_seconds: float = 0.0
 ) -> Tuple[Dict[Tuple[str, str], float], float, List[Dict]]:
     """
     执行动态贪心任务分配算法（带时间窗约束 + 每人负载上限 4 单）
@@ -72,13 +72,14 @@ def _assign_single_region_dynamic_greedy(
     worker_nodes = {w[1]: w[0] for w in workers}
     worker_capacity = {w[1]: 4 for w in workers}
 
+    # 预计算：工人初始真实位置到中心的距离
     dist_worker_to_center = {}
     for wid, w_node in worker_nodes.items():
         dist_worker_to_center[wid] = get_dist(w_node, center_node)
 
-    # 💡 修复：工人的虚拟位置应该是其真实位置，而不是中心节点
-    # 这样在计算距离时会正确计算：工人真实位置 → 中心 → 任务
-    worker_virtual_loc = {w[1]: w[0] for w in workers}
+    # 💡 修复 Bug 2：工人的第一单接力起点必须是中心点！
+    # 因为完整的轨迹是：真实位置 -> [中心取货] -> 任务点1
+    worker_virtual_loc = {w[1]: center_node for w in workers}
     worker_paid_center_cost = {w[1]: False for w in workers}
     worker_current_time = {w[1]: slot_start_seconds for w in workers}
 
@@ -93,6 +94,7 @@ def _assign_single_region_dynamic_greedy(
         best_dist_to_task = 0
 
         for wid, capacity in worker_capacity.items():
+            # 容量不足的工人直接跳过
             if capacity <= 0:
                 continue
 
@@ -100,12 +102,12 @@ def _assign_single_region_dynamic_greedy(
                 t_node = task_nodes[tid]
                 reward = task_rewards[tid]
 
-                # 💡 修复：从工人虚拟位置 (真实位置) 到任务点的距离
+                # 从工人当前虚拟位置到任务点的距离
                 dist_to_task = get_dist(worker_virtual_loc[wid], t_node)
                 if dist_to_task == float('inf'):
                     continue
 
-                # 💡 修复：如果工人还没有支付过中心取货成本，则需要加上这段距离
+                # 如果工人还没有支付过中心取货成本，则加上去中心的距离
                 if not worker_paid_center_cost[wid]:
                     dist_to_center = dist_worker_to_center[wid]
                 else:
@@ -113,12 +115,14 @@ def _assign_single_region_dynamic_greedy(
 
                 total_dist = dist_to_center + dist_to_task
 
+                # 时间窗死线校验
                 travel_time = total_dist / config.WORKER_SPEED_MS
                 arrival_time = worker_current_time[wid] + travel_time
 
                 if arrival_time > task_expires[tid]:
                     continue
 
+                # 核算经济利润
                 travel_cost = total_dist * config.TRAVEL_COST_PER_METER
                 profit = reward - travel_cost
 
@@ -128,18 +132,26 @@ def _assign_single_region_dynamic_greedy(
                     best_dist_to_center = dist_to_center
                     best_dist_to_task = dist_to_task
 
+        # 如果找不到能赚钱且不超时的订单，提前结束该区域分配
         if best_pair is None:
             break
 
+        # ==================================
+        # 落实分配操作，更新所有物理状态
+        # ==================================
         best_wid, best_tid = best_pair
 
         assignments[(best_wid, best_tid)] = best_profit
 
-        # 💡 修复：更新工人的虚拟位置到任务点 (模拟完成配送)
+        # 💡 修复 Bug 1：必须扣减该工人的可接单容量，防止变身超人！
+        worker_capacity[best_wid] -= 1
+
+        # 更新工人的虚拟位置到任务点 (模拟完成配送，准备从这里去接下一单)
         worker_virtual_loc[best_wid] = task_nodes[best_tid]
-        # 标记该工人已经支付过中心取货成本
+        # 标记该工人已经跑过中心取完货了
         worker_paid_center_cost[best_wid] = True
 
+        # 更新工人完成当前任务后的绝对物理时间
         travel_time = (best_dist_to_center + best_dist_to_task) / config.WORKER_SPEED_MS
         worker_current_time[best_wid] += travel_time
 
@@ -154,6 +166,7 @@ def _assign_single_region_dynamic_greedy(
             'profit': best_profit
         })
 
+        # 把已经被接走的外卖从池子里删掉
         available_tasks.remove(best_tid)
 
         if len(details) % 100 == 0:

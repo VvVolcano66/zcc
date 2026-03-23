@@ -33,10 +33,10 @@ def run_imtao_for_slot(G, config, centers_dict, workers_per_center, tasks_per_ce
     for rid, w_list in workers_per_center.items():
         for w in w_list:
             w_node, wid, w_lon, w_lat, _ = w
-            # 💡 修复：将工人的位置设置为其所属区域的中心点 (强制中心取货约束)
+            # 💡 修复：将圆括号改为中括号 G.nodes[center_node]
             center_node = centers_dict[rid]
-            center_lon = G.nodes(center_node).get('x', G.nodes(center_node).get('lon'))
-            center_lat = G.nodes(center_node).get('y', G.nodes(center_node).get('lat'))
+            center_lon = G.nodes[center_node].get('x', G.nodes[center_node].get('lon'))
+            center_lat = G.nodes[center_node].get('y', G.nodes[center_node].get('lat'))
             imtao_workers.append(IMTAOWorker(wid, center_lon, center_lat, max_t=4))
             worker_node_map[wid] = w_node
 

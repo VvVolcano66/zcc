@@ -2,6 +2,8 @@ import numpy as np
 import copy
 from typing import List, Dict
 
+import config
+
 
 class Task:
     def __init__(self, t_id, lon, lat, expire_time):
@@ -34,15 +36,24 @@ class Center:
         self.rho = 0.0  # 任务分配率 \rho_i
 
 
-def calculate_travel_time(lon1, lat1, lon2, lat2, speed=5.0):
+def calculate_travel_time(lon1, lat1, lon2, lat2, speed=None):
     """
     计算两点间的行驶时间
-    加入了对成都纬度(北纬30度左右)的 cos 补偿，使得空间距离估算更准。
+    💡 核心修复：坐标系投影自适应！
     """
-    mean_lat_rad = np.radians((lat1 + lat2) / 2.0)
-    dx = (lon1 - lon2) * 111320.0 * np.cos(mean_lat_rad)
-    dy = (lat1 - lat2) * 111320.0
-    dist_m = np.sqrt(dx ** 2 + dy ** 2)
+    if speed is None:
+        speed = config.WORKER_SPEED_MS
+
+    # 如果坐标绝对值大于 180，说明传入的已经是投影后的米制坐标 (如 UTM)，无需经纬度换算
+    if abs(lon1) > 180 or abs(lat1) > 90:
+        dist_m = np.sqrt((lon1 - lon2) ** 2 + (lat1 - lat2) ** 2)
+    else:
+        # 传入的是标准 GPS 经纬度 (EPSG:4326)，需要乘以地球赤道常数换算成米
+        mean_lat_rad = np.radians((lat1 + lat2) / 2.0)
+        dx = (lon1 - lon2) * 111320.0 * np.cos(mean_lat_rad)
+        dy = (lat1 - lat2) * 111320.0
+        dist_m = np.sqrt(dx ** 2 + dy ** 2)
+
     return dist_m / speed
 
 
@@ -95,22 +106,17 @@ class IMTAO_Framework:
             current_lon, current_lat = center.lon, center.lat
 
             while len(S_w) < w.maxT and len(center.S_left) > 0:
-                # 💡 核心逻辑优化：接单时，只在“自己能在死线前赶到的任务”里挑
                 valid_tasks = []
                 for s in center.S_left:
                     travel_t = calculate_travel_time(current_lon, current_lat, s.lon, s.lat)
-                    # 校验时间窗约束
                     if current_time + travel_t <= s.e:
                         valid_tasks.append((s, travel_t))
 
-                # 如果这个工人发现剩下的所有订单自己都来不及送了
                 if not valid_tasks:
-                    break  # 该工人停止接单，把任务留在池子里给其他更近的工人
+                    break
 
-                # 在所有能赶得及的任务里，挑一个距离最近的
                 nearest_task, best_travel_time = min(valid_tasks, key=lambda x: x[1])
 
-                # 落实分配
                 center.S_left.remove(nearest_task)
                 S_w.append(nearest_task)
                 current_time += best_travel_time
@@ -122,7 +128,6 @@ class IMTAO_Framework:
 
         center.W_left = [w for w in workers_to_assign if w not in used_workers]
 
-        # 分配率 rho 的计算
         assigned_tasks_count = sum(len(tasks) for worker, tasks in center.A)
         if len(center.S) > 0:
             center.rho = assigned_tasks_count / len(center.S)
