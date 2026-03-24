@@ -63,6 +63,59 @@ class IMTAO_Framework:
         self.tasks = tasks
         self.workers = workers
 
+    def _calculate_collaboration_unfairness(self) -> float:
+        if len(self.centers) <= 1:
+            return 0.0
+
+        rhos = [c.rho for c in self.centers]
+        u_rho = 0.0
+        for i in range(len(rhos)):
+            for j in range(len(rhos)):
+                if i != j:
+                    u_rho += abs(rhos[i] - rhos[j])
+        return u_rho / (len(self.centers) * (len(self.centers) - 1))
+
+    def _calculate_center_utility(self, center: Center) -> float:
+        """
+        Paper Eq. (5): UUP(ci, BWS(ci)) = rho_i - average_{j != i} rho_j
+        """
+        if len(self.centers) <= 1:
+            return center.rho
+
+        other_rhos = [c.rho for c in self.centers if c.id != center.id]
+        return center.rho - sum(other_rhos) / len(other_rhos)
+
+    def _select_best_worker_for_center(self, center: Center, available_workers: List[Worker]):
+        """
+        Best-response step in the paper:
+        evaluate each candidate borrowed worker, re-run the sequential
+        assignment for the recipient center, and keep the worker that
+        maximizes the recipient center's utility.
+        """
+        best_worker = None
+        best_utility = self._calculate_center_utility(center)
+        best_snapshot = None
+
+        original_state = (center.rho, copy.deepcopy(center.A), copy.deepcopy(center.S_left), copy.deepcopy(center.W_left))
+
+        for worker in available_workers:
+            combined_workers = center.W + [worker]
+            self.algo2_sequential_assignment(center, combined_workers)
+            candidate_utility = self._calculate_center_utility(center)
+
+            if candidate_utility > best_utility:
+                best_worker = worker
+                best_utility = candidate_utility
+                best_snapshot = (
+                    center.rho,
+                    copy.deepcopy(center.A),
+                    copy.deepcopy(center.S_left),
+                    copy.deepcopy(center.W_left)
+                )
+
+        center.rho, center.A, center.S_left, center.W_left = original_state
+        return best_worker, best_snapshot
+
     # =====================================================================
     # Algorithm 1: Voronoi-based Service Area Partition
     # =====================================================================
@@ -154,33 +207,18 @@ class IMTAO_Framework:
                 break
 
             c_i = min(C_prime, key=lambda c: c.rho)
-            w_move = global_W_left[0]
 
-            original_rho = c_i.rho
-            original_A = copy.deepcopy(c_i.A)
-            original_S_left = copy.deepcopy(c_i.S_left)
+            w_move, best_snapshot = self._select_best_worker_for_center(c_i, global_W_left)
 
-            combined_workers = c_i.W + [w_move]
-            self.algo2_sequential_assignment(c_i, combined_workers)
-
-            if c_i.rho > original_rho:
-                global_W_left.pop(0)
+            if w_move is not None and best_snapshot is not None:
+                c_i.rho, c_i.A, c_i.S_left, c_i.W_left = best_snapshot
                 c_i.W.append(w_move)
+                global_W_left = [w for w in global_W_left if w.id != w_move.id]
             else:
-                c_i.rho = original_rho
-                c_i.A = original_A
-                c_i.S_left = original_S_left
                 C_prime.remove(c_i)
 
             iteration += 1
 
-        rhos = [c.rho for c in self.centers]
-        u_rho = 0
-        for i in range(len(rhos)):
-            for j in range(len(rhos)):
-                if i != j:
-                    u_rho += abs(rhos[i] - rhos[j])
-        u_rho = u_rho / (len(self.centers) * (len(self.centers) - 1))
-
+        u_rho = self._calculate_collaboration_unfairness()
         total_assigned = sum(sum(len(tasks) for w, tasks in c.A) for c in self.centers)
         return total_assigned, u_rho

@@ -12,8 +12,12 @@ class SpatioTemporalDataset:
         self.data_dir = data_dir
         self.time_interval = time_interval  # 分钟
 
-        # 1. 自动读取 config 中的网格划分数量 (10x10)
-        self.grid_size = (config.NUM_ZONES, config.NUM_ZONES)
+        # 1. 使用预测模块独立网格，避免与多中心分区数量耦合
+        pred_grid_size = getattr(config, 'PRED_GRID_SIZE', (config.NUM_ZONES, config.NUM_ZONES))
+        if isinstance(pred_grid_size, int):
+            self.grid_size = (pred_grid_size, pred_grid_size)
+        else:
+            self.grid_size = tuple(pred_grid_size)
 
         # 2. 读取 config 中的中心点和下载半径
         center_lat, center_lon = config.CHENGDU_CENTER
@@ -33,6 +37,24 @@ class SpatioTemporalDataset:
         print(
             f"动态网格生成完成: 经度范围 [{self.lon_bins[0]:.4f}, {self.lon_bins[-1]:.4f}], 纬度范围 [{self.lat_bins[0]:.4f}, {self.lat_bins[-1]:.4f}]")
 
+    def _build_slots_for_dates(self, dates, start_hour=None, end_hour=None):
+        if start_hour is None or end_hour is None:
+            return None
+
+        all_slots = []
+        normalized_dates = sorted(pd.to_datetime(pd.Series(dates)).dt.normalize().unique())
+        for date_value in normalized_dates:
+            day_start = pd.Timestamp(date_value) + pd.Timedelta(hours=start_hour)
+            day_end = pd.Timestamp(date_value) + pd.Timedelta(hours=end_hour)
+            day_slots = pd.date_range(
+                day_start,
+                day_end - pd.Timedelta(minutes=self.time_interval),
+                freq=f'{self.time_interval}min'
+            )
+            all_slots.extend(day_slots)
+
+        return pd.DatetimeIndex(all_slots)
+
     def load_and_gridify(self):
         """将所有 CSV 加载并映射到时空网格 (Time, H, W)"""
         files = sorted([f for f in os.listdir(self.data_dir) if f.endswith('.csv')])
@@ -45,7 +67,7 @@ class SpatioTemporalDataset:
         all_data['first_time'] = pd.to_datetime(all_data['first_time'])
 
         # 按时间片聚合 (例如每 30 分钟)
-        all_data['time_slot'] = all_data['first_time'].dt.floor(f'{self.time_interval}T')
+        all_data['time_slot'] = all_data['first_time'].dt.floor(f'{self.time_interval}min')
         all_data['x_idx'] = np.digitize(all_data['first_lon'], self.lon_bins) - 1
         all_data['y_idx'] = np.digitize(all_data['first_lat'], self.lat_bins) - 1
 
@@ -56,7 +78,7 @@ class SpatioTemporalDataset:
         # 生成完整的时间序列
         min_time = valid['time_slot'].min()
         max_time = valid['time_slot'].max()
-        all_slots = pd.date_range(min_time, max_time, freq=f'{self.time_interval}T')
+        all_slots = pd.date_range(min_time, max_time, freq=f'{self.time_interval}min')
 
         tensor_shape = (len(all_slots), self.grid_size[0], self.grid_size[1])
         demand_tensor = np.zeros(tensor_shape)
@@ -71,7 +93,7 @@ class SpatioTemporalDataset:
 
         return demand_tensor, all_slots
 
-    def load_and_gridify_from_dataframe(self, df):
+    def load_and_gridify_from_dataframe(self, df, start_hour=None, end_hour=None):
         """
         从 DataFrame 加载并映射到时空网格 (Time, H, W)
 
@@ -86,7 +108,7 @@ class SpatioTemporalDataset:
         df_copy['first_time'] = pd.to_datetime(df_copy['first_time'])
 
         # 按时间片聚合 (例如每 30 分钟)
-        df_copy['time_slot'] = df_copy['first_time'].dt.floor(f'{self.time_interval}T')
+        df_copy['time_slot'] = df_copy['first_time'].dt.floor(f'{self.time_interval}min')
         df_copy['x_idx'] = np.digitize(df_copy['first_lon'], self.lon_bins) - 1
         df_copy['y_idx'] = np.digitize(df_copy['first_lat'], self.lat_bins) - 1
 
@@ -98,9 +120,11 @@ class SpatioTemporalDataset:
             raise ValueError("过滤后没有有效数据，请检查网格边界设置")
 
         # 生成完整的时间序列
-        min_time = valid['time_slot'].min()
-        max_time = valid['time_slot'].max()
-        all_slots = pd.date_range(min_time, max_time, freq=f'{self.time_interval}T')
+        all_slots = self._build_slots_for_dates(df_copy['first_time'], start_hour=start_hour, end_hour=end_hour)
+        if all_slots is None or len(all_slots) == 0:
+            min_time = valid['time_slot'].min()
+            max_time = valid['time_slot'].max()
+            all_slots = pd.date_range(min_time, max_time, freq=f'{self.time_interval}min')
 
         tensor_shape = (len(all_slots), self.grid_size[0], self.grid_size[1])
         demand_tensor = np.zeros(tensor_shape)

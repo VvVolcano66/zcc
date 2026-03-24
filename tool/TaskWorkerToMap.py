@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import KDTree
 import networkx as nx
+import config
 
 
 def snap_to_network(lon: float, lat: float, coords: np.ndarray, nodes: list) -> Any:
@@ -13,6 +14,48 @@ def snap_to_network(lon: float, lat: float, coords: np.ndarray, nodes: list) -> 
     tree = KDTree(coords)
     _, idx = tree.query([[lon, lat]])
     return nodes[idx[0]]
+
+
+def _out_of_china(lon: float, lat: float) -> bool:
+    return not (73.66 < lon < 135.05 and 3.86 < lat < 53.55)
+
+
+def _transform_lat(x: float, y: float) -> float:
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * np.sqrt(abs(x))
+    ret += (20.0 * np.sin(6.0 * x * np.pi) + 20.0 * np.sin(2.0 * x * np.pi)) * 2.0 / 3.0
+    ret += (20.0 * np.sin(y * np.pi) + 40.0 * np.sin(y / 3.0 * np.pi)) * 2.0 / 3.0
+    ret += (160.0 * np.sin(y / 12.0 * np.pi) + 320 * np.sin(y * np.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _transform_lon(x: float, y: float) -> float:
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * np.sqrt(abs(x))
+    ret += (20.0 * np.sin(6.0 * x * np.pi) + 20.0 * np.sin(2.0 * x * np.pi)) * 2.0 / 3.0
+    ret += (20.0 * np.sin(x * np.pi) + 40.0 * np.sin(x / 3.0 * np.pi)) * 2.0 / 3.0
+    ret += (150.0 * np.sin(x / 12.0 * np.pi) + 300.0 * np.sin(x / 30.0 * np.pi)) * 2.0 / 3.0
+    return ret
+
+
+def gcj02_to_wgs84(lon: float, lat: float) -> Tuple[float, float]:
+    """
+    将 GCJ-02 坐标近似转换为 WGS84，便于和 OSM 路网对齐。
+    """
+    if _out_of_china(lon, lat):
+        return lon, lat
+
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    dlat = _transform_lat(lon - 105.0, lat - 35.0)
+    dlon = _transform_lon(lon - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * np.pi
+    magic = np.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = np.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * np.pi)
+    dlon = (dlon * 180.0) / (a / sqrtmagic * np.cos(radlat) * np.pi)
+    mg_lat = lat + dlat
+    mg_lon = lon + dlon
+    return lon * 2 - mg_lon, lat * 2 - mg_lat
 
 
 class WorkerSimulator:
@@ -37,6 +80,7 @@ class WorkerSimulator:
         self.worker_status = {}  # {wid: 'idle', 'en_route_to_center', or 'en_route_to_task'}
         self.worker_center_map = {}  # {wid: region_id} 工人所属的中心区域
         self.worker_busy_until = {}  # {wid: timestamp} 工人忙碌到的时间点
+        self.worker_available_from = {}  # {wid: timestamp} 工人从该时刻起可在当前位置自由移动
 
     def get_available_workers_with_center_info(
             self,
@@ -59,6 +103,7 @@ class WorkerSimulator:
                     if wid in self.worker_busy_until:
                         if current_time is not None and current_time >= self.worker_busy_until[wid]:
                             self.worker_status[wid] = 'idle'
+                            self.worker_available_from[wid] = self.worker_busy_until[wid]
                             status = 'idle'
 
                 if status in ['idle', 'en_route_to_center']:
@@ -71,11 +116,13 @@ class WorkerSimulator:
         """设置工人正在前往中心（仍可接单）"""
         self.worker_status[wid] = 'en_route_to_center'
         self.worker_busy_until[wid] = until_timestamp
+        self.worker_available_from[wid] = until_timestamp
 
     def set_worker_en_route_to_task(self, wid: str, until_timestamp: float) -> None:
         """设置工人正在前往任务点（不能接单）"""
         self.worker_status[wid] = 'en_route_to_task'
         self.worker_busy_until[wid] = until_timestamp
+        self.worker_available_from[wid] = until_timestamp
 
     def initialize_from_real_data(
             self,
@@ -128,11 +175,18 @@ class WorkerSimulator:
         if coords is not None and nodes is not None:
             from scipy.spatial import KDTree
             tree = KDTree(coords)
-            worker_coords = latest_positions[['lon_gcj', 'lat_gcj']].values
+            worker_wgs84 = latest_positions.apply(
+                lambda row: gcj02_to_wgs84(row['lon_gcj'], row['lat_gcj']),
+                axis=1
+            )
+            worker_coords = np.array(worker_wgs84.tolist())
             _, idxs = tree.query(worker_coords)
             latest_positions['nearest_node'] = [nodes[i] for i in idxs]
+            latest_positions[['lon_wgs84', 'lat_wgs84']] = worker_coords
         else:
             latest_positions['nearest_node'] = None
+            latest_positions['lon_wgs84'] = latest_positions['lon_gcj']
+            latest_positions['lat_wgs84'] = latest_positions['lat_gcj']
 
         # 获取所有的中心区域 ID
         region_ids = list(centers.keys()) if centers else []
@@ -142,12 +196,16 @@ class WorkerSimulator:
         assigned_count = 0
         for idx, row in latest_positions.iterrows():
             wid = row['wid']
-            lon = row['lon_gcj']
-            lat = row['lat_gcj']
+            lon = row['lon_wgs84']
+            lat = row['lat_wgs84']
             node = row['nearest_node']
 
-            # 💡 核心修改：利用取模运算 (idx % num_regions)，将工人像发牌一样均匀分发给各个中心
-            if num_regions > 0:
+            if partition is not None and node in partition:
+                assigned_region_id = partition[node]
+                self.worker_center_map[wid] = assigned_region_id
+                assigned_count += 1
+            elif num_regions > 0:
+                # 回退策略：如果当前节点未落入任何分区，再做均匀分配。
                 assigned_region_id = region_ids[idx % num_regions]
                 self.worker_center_map[wid] = assigned_region_id
                 assigned_count += 1
@@ -155,6 +213,7 @@ class WorkerSimulator:
             # 保留工人真实的初始坐标
             self.worker_positions[wid] = (node, lon, lat)
             self.worker_status[wid] = 'idle'
+            self.worker_available_from[wid] = end_timestamp
 
         print(f"✅ 初始化完成：共 {len(self.worker_positions)} 个工人")
         if num_regions > 0:
@@ -210,12 +269,109 @@ class WorkerSimulator:
 
     def set_worker_busy(self, wid: str) -> None:
         """设置工人忙碌状态"""
-        self.worker_status[wid] = 'busy'
+        self.worker_status[wid] = 'en_route_to_task'
 
     def set_worker_idle(self, wid: str) -> None:
         """设置工人空闲状态（完成任务后）"""
         self.worker_status[wid] = 'idle'
+        self.worker_available_from[wid] = self.worker_busy_until.get(wid, self.worker_available_from.get(wid, 0.0))
         # 注意：位置已经在 update_worker_position 中更新过了
+
+    def _move_worker_towards_center(
+            self,
+            wid: str,
+            centers: Dict[int, Any],
+            time_delta_seconds: float
+    ) -> bool:
+        """
+        将单个工人在给定空闲时间内向所属中心推进，返回是否发生位移。
+        """
+        if time_delta_seconds <= 0:
+            return False
+
+        region_id = self.worker_center_map.get(wid)
+        if region_id is None or region_id not in centers:
+            return False
+
+        curr_node, _, _ = self.worker_positions[wid]
+        center_node = centers[region_id]
+
+        if curr_node == center_node:
+            return False
+
+        max_travel_dist = time_delta_seconds * self.config.WORKER_SPEED_MS
+
+        try:
+            path = nx.shortest_path(self.G, source=curr_node, target=center_node, weight='length')
+        except nx.NetworkXNoPath:
+            return False
+
+        if len(path) <= 1:
+            return False
+
+        traveled_dist = 0.0
+        new_node = curr_node
+
+        for i in range(len(path) - 1):
+            u = path[i]
+            v = path[i + 1]
+            edge_data = self.G.get_edge_data(u, v)
+            if isinstance(edge_data, dict) and 0 in edge_data:
+                length = edge_data[0].get('length', 0)
+            else:
+                length = edge_data.get('length', 0) if edge_data else 0
+
+            if traveled_dist + length <= max_travel_dist:
+                traveled_dist += length
+                new_node = v
+            else:
+                break
+
+        if new_node == curr_node:
+            return False
+
+        node_data = self.G.nodes[new_node]
+        new_lon = node_data.get('x', node_data.get('lon'))
+        new_lat = node_data.get('y', node_data.get('lat'))
+        self.worker_positions[wid] = (new_node, new_lon, new_lat)
+        return True
+
+    def advance_workers_to_time(
+            self,
+            centers: Dict[int, Any],
+            current_time: float
+    ) -> None:
+        """
+        将工人状态推进到 current_time。
+
+        规则：
+        1. 仍在送货且尚未完成的工人保持忙碌。
+        2. 已完成送货的工人，从完成时刻开始，在空闲时间内向所属中心移动。
+        3. 原本就空闲的工人，从上次可自由移动的时刻开始继续向中心移动。
+        """
+        moved_count = 0
+
+        for wid in list(self.worker_positions.keys()):
+            status = self.worker_status.get(wid, 'idle')
+            busy_until = self.worker_busy_until.get(wid)
+            idle_start = self.worker_available_from.get(wid, current_time)
+
+            if status == 'en_route_to_task':
+                if busy_until is None or busy_until > current_time:
+                    continue
+                self.worker_status[wid] = 'idle'
+                idle_start = busy_until
+
+            if self.worker_status.get(wid, 'idle') != 'idle':
+                continue
+
+            if current_time > idle_start:
+                if self._move_worker_towards_center(wid, centers, current_time - idle_start):
+                    moved_count += 1
+                self.worker_available_from[wid] = current_time
+
+        if moved_count > 0:
+            print(f"   [位置推进] {moved_count} 名工人在空闲时间内向中心移动")
 
     def move_idle_workers_towards_center(
             self,
@@ -223,76 +379,16 @@ class WorkerSimulator:
             time_delta_seconds: float
     ) -> None:
         """
-        【新增功能】模拟时间流逝，将所有空闲 (idle) 的工人向所属区域的中心移动。
-        如果在 time_delta_seconds 时间内能到达中心，则位置更新为中心；
-        否则沿着最短路移动相应的距离，停在途中的某个节点上。
+        兼容旧调用：将当前已空闲的工人推进固定时长。
         """
-        # 计算这段时间内工人最多能走多远
-        max_travel_dist = time_delta_seconds * self.config.WORKER_SPEED_MS
-
-        moved_count = 0
-        reached_center_count = 0
-
-        for wid, status in self.worker_status.items():
-            # 只移动空闲的工人
+        for wid, status in list(self.worker_status.items()):
             if status == 'idle':
-                region_id = self.worker_center_map.get(wid)
-                if region_id is None or region_id not in centers:
-                    continue
-
-                curr_node, _, _ = self.worker_positions[wid]
-                center_node = centers[region_id]
-
-                if curr_node == center_node:
-                    continue  # 已经在中心待命，不需要移动
-
-                try:
-                    # 计算从当前位置到中心的最短路径
-                    path = nx.shortest_path(self.G, source=curr_node, target=center_node, weight='length')
-
-                    if len(path) <= 1:
-                        continue
-
-                    traveled_dist = 0.0
-                    new_node = curr_node
-
-                    # 沿着最短路径的节点一截一截走
-                    for i in range(len(path) - 1):
-                        u = path[i]
-                        v = path[i + 1]
-
-                        # 获取边长数据 (兼容 Graph 和 MultiGraph)
-                        edge_data = self.G.get_edge_data(u, v)
-                        if isinstance(edge_data, dict) and 0 in edge_data:
-                            length = edge_data[0].get('length', 0)
-                        else:
-                            length = edge_data.get('length', 0) if edge_data else 0
-
-                        # 如果这段路能在剩余时间内走完
-                        if traveled_dist + length <= max_travel_dist:
-                            traveled_dist += length
-                            new_node = v
-                        else:
-                            # 走不完，为了简化节点映射，停在当前边起点的节点 u
-                            break
-
-                    # 提取到达的新节点坐标并更新工人位置
-                    node_data = self.G.nodes[new_node]
-                    new_lon = node_data.get('x', node_data.get('lon'))
-                    new_lat = node_data.get('y', node_data.get('lat'))
-
-                    self.worker_positions[wid] = (new_node, new_lon, new_lat)
-
-                    moved_count += 1
-                    if new_node == center_node:
-                        reached_center_count += 1
-
-                except nx.NetworkXNoPath:
-                    # 如果图不连通找不到路，就原地不动
-                    pass
-
-        if moved_count > 0:
-            print(f"   [主动返航] {moved_count} 名空闲工人向中心移动 (其中 {reached_center_count} 人已就位)")
+                idle_start = self.worker_available_from.get(wid, 0.0)
+                self.worker_available_from[wid] = idle_start + time_delta_seconds
+        self.advance_workers_to_time(
+            centers,
+            max(self.worker_available_from.values(), default=0.0)
+        )
 
 
 def load_task_locations(
@@ -304,7 +400,7 @@ def load_task_locations(
         start_hour: Optional[int] = None,
         end_hour: Optional[int] = None,
         sample_size: Optional[int] = None,
-        reward_range: Tuple[float, float] = (8.0, 15.0)
+        reward_range: Optional[Tuple[float, float]] = None
 ) -> Dict[int, List[Tuple[Any, str, float]]]:
     """
     加载指定日期的任务位置数据，并按中心分组
@@ -359,7 +455,7 @@ def load_task_locations(
         if nearest_node in partition:
             region_id = partition[nearest_node]
             if region_id in tasks_per_center:
-                reward = np.random.uniform(reward_range[0], reward_range[1])
+                reward = config.TASK_BASE_REWARD
                 tasks_per_center[region_id].append(
                     (nearest_node, task_id, reward)
                 )

@@ -157,12 +157,17 @@ def _assign_single_region_dynamic_greedy(
 
         region_profit += best_profit
 
+        travel_cost = (best_dist_to_center + best_dist_to_task) * config.TRAVEL_COST_PER_METER
         details.append({
+            'region_id': region_id,
             'wid': best_wid,
             'task_id': best_tid,
             'dist_to_center': best_dist_to_center,
             'dist_to_task': best_dist_to_task,
             'task_node': task_nodes[best_tid],
+            'reward': task_rewards[best_tid],
+            'cost': travel_cost,
+            'finish_time': worker_current_time[best_wid],
             'profit': best_profit
         })
 

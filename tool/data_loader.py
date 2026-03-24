@@ -5,20 +5,31 @@ import warnings
 import os
 import pickle
 
-# 定义缓存文件路径
-CACHE_FILE = r"D:\biyelunwen\tool\cache\chengdu_road_network.pkl"
+CACHE_DIR = r"D:\biyelunwen\tool\cache"
+
+
+def _build_cache_file(center_point, dist):
+    lat, lon = center_point
+    safe_lat = str(lat).replace('.', '_')
+    safe_lon = str(lon).replace('.', '_')
+    return os.path.join(
+        CACHE_DIR,
+        f"road_network_v2_{safe_lat}_{safe_lon}_dist{dist}.pkl"
+    )
 
 
 def get_real_road_network(center_point, dist=2000):
     """
     带缓存的路网加载器
     """
+    cache_file = _build_cache_file(center_point, dist)
+
     # --- 1. 尝试从本地加载 ---
-    if os.path.exists(CACHE_FILE):
-        print(f"✅ [Cache] 发现本地缓存: {CACHE_FILE}")
+    if os.path.exists(cache_file):
+        print(f"✅ [Cache] 发现本地缓存: {cache_file}")
         print(">> 正在直接加载路网，跳过下载...")
         try:
-            with open(CACHE_FILE, 'rb') as f:
+            with open(cache_file, 'rb') as f:
                 G_simple, coords, nodes = pickle.load(f)
             print(f"   - 加载完成: {len(nodes)} 节点, {len(G_simple.edges)} 边")
             return G_simple, coords, nodes
@@ -35,10 +46,8 @@ def get_real_road_network(center_point, dist=2000):
     try:
         # 下载
         G_raw = ox.graph_from_point(center_point, dist=dist, network_type='drive')
-        # 投影
-        G_proj = ox.project_graph(G_raw)
         # 转无向图
-        G_simple = nx.Graph(G_proj)
+        G_simple = nx.Graph(G_raw)
 
         print(f"路网处理完成: {len(G_simple.nodes)} 节点")
 
@@ -55,11 +64,11 @@ def get_real_road_network(center_point, dist=2000):
         coords = np.array(coords)
 
         # --- 3. 保存到本地缓存 ---
-        print(f">> 正在保存路网到缓存文件: {CACHE_FILE} ...")
+        print(f">> 正在保存路网到缓存文件: {cache_file} ...")
         # 确保目录存在
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
 
-        with open(CACHE_FILE, 'wb') as f:
+        with open(cache_file, 'wb') as f:
             # 打包保存 G, coords, nodes
             pickle.dump((G_simple, coords, nodes), f)
         print("✅ 保存成功！下次运行将秒开。")
