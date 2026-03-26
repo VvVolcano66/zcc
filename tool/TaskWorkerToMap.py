@@ -99,12 +99,12 @@ class WorkerSimulator:
             if cur_region_id == region_id:
                 status = self.worker_status.get(wid, 'idle')
 
-                if status in ['en_route_to_center', 'en_route_to_task']:
-                    if wid in self.worker_busy_until:
-                        if current_time is not None and current_time >= self.worker_busy_until[wid]:
-                            self.worker_status[wid] = 'idle'
-                            self.worker_available_from[wid] = self.worker_busy_until[wid]
-                            status = 'idle'
+                if status == 'en_route_to_task':
+                    busy_until = self.worker_busy_until.get(wid)
+                    if current_time is not None and busy_until is not None and current_time >= busy_until:
+                        self.worker_status[wid] = 'en_route_to_center'
+                        self.worker_available_from[wid] = busy_until
+                        status = 'en_route_to_center'
 
                 if status in ['idle', 'en_route_to_center']:
                     node, lon, lat = self.worker_positions[wid]
@@ -334,6 +334,10 @@ class WorkerSimulator:
         new_lon = node_data.get('x', node_data.get('lon'))
         new_lat = node_data.get('y', node_data.get('lat'))
         self.worker_positions[wid] = (new_node, new_lon, new_lat)
+        if new_node == center_node:
+            self.worker_status[wid] = 'idle'
+        else:
+            self.worker_status[wid] = 'en_route_to_center'
         return True
 
     def advance_workers_to_time(
@@ -359,10 +363,18 @@ class WorkerSimulator:
             if status == 'en_route_to_task':
                 if busy_until is None or busy_until > current_time:
                     continue
-                self.worker_status[wid] = 'idle'
+                self.worker_status[wid] = 'en_route_to_center'
                 idle_start = busy_until
 
-            if self.worker_status.get(wid, 'idle') != 'idle':
+            status = self.worker_status.get(wid, 'idle')
+            if status == 'en_route_to_center':
+                if current_time > idle_start:
+                    if self._move_worker_towards_center(wid, centers, current_time - idle_start):
+                        moved_count += 1
+                    self.worker_available_from[wid] = current_time
+                continue
+
+            if status != 'idle':
                 continue
 
             if current_time > idle_start:

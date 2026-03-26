@@ -8,7 +8,7 @@ def greedy_assignment_with_center_pickup(
         centers: Dict[int, Any],
         partition: Dict[Any, int],
         workers_per_center: Dict[int, List[Tuple[Any, str, float, float, Any]]],
-        tasks_per_center: Dict[int, List[Tuple[Any, str, float, float]]],
+        tasks_per_center: Dict[int, List[Tuple[Any, str, float, float, float]]],
         slot_start_seconds: float = 0.0
 ) -> Tuple[Dict[Tuple[str, str], float], float, List[Dict]]:
     """
@@ -68,9 +68,10 @@ def _assign_single_region_dynamic_greedy(
     task_nodes = {t[1]: t[0] for t in tasks}
     task_rewards = {t[1]: t[2] for t in tasks}
     task_expires = {t[1]: (t[3] if len(t) > 3 else float('inf')) for t in tasks}
+    task_releases = {t[1]: (t[4] if len(t) > 4 else -float('inf')) for t in tasks}
 
     worker_nodes = {w[1]: w[0] for w in workers}
-    worker_capacity = {w[1]: 4 for w in workers}
+    worker_capacity = {w[1]: config.MAX_TASKS_PER_WORKER for w in workers}
 
     # 预计算：工人初始真实位置到中心的距离
     dist_worker_to_center = {}
@@ -92,6 +93,7 @@ def _assign_single_region_dynamic_greedy(
         best_profit = -float('inf')
         best_dist_to_center = 0
         best_dist_to_task = 0
+        best_finish_time = slot_start_seconds
 
         for wid, capacity in worker_capacity.items():
             # 容量不足的工人直接跳过
@@ -101,6 +103,7 @@ def _assign_single_region_dynamic_greedy(
             for tid in available_tasks:
                 t_node = task_nodes[tid]
                 reward = task_rewards[tid]
+                release_time = task_releases[tid]
 
                 # 从工人当前虚拟位置到任务点的距离
                 dist_to_task = get_dist(worker_virtual_loc[wid], t_node)
@@ -117,7 +120,7 @@ def _assign_single_region_dynamic_greedy(
 
                 # 时间窗死线校验
                 travel_time = total_dist / config.WORKER_SPEED_MS
-                arrival_time = worker_current_time[wid] + travel_time
+                arrival_time = max(worker_current_time[wid] + travel_time, release_time)
 
                 if arrival_time > task_expires[tid]:
                     continue
@@ -131,6 +134,7 @@ def _assign_single_region_dynamic_greedy(
                     best_pair = (wid, tid)
                     best_dist_to_center = dist_to_center
                     best_dist_to_task = dist_to_task
+                    best_finish_time = arrival_time
 
         # 如果找不到能赚钱且不超时的订单，提前结束该区域分配
         if best_pair is None:
@@ -152,8 +156,7 @@ def _assign_single_region_dynamic_greedy(
         worker_paid_center_cost[best_wid] = True
 
         # 更新工人完成当前任务后的绝对物理时间
-        travel_time = (best_dist_to_center + best_dist_to_task) / config.WORKER_SPEED_MS
-        worker_current_time[best_wid] += travel_time
+        worker_current_time[best_wid] = best_finish_time
 
         region_profit += best_profit
 

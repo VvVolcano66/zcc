@@ -6,26 +6,30 @@ import config
 
 
 class Task:
-    def __init__(self, t_id, lon, lat, expire_time):
+    def __init__(self, t_id, lon, lat, expire_time, release_time=0, node=None):
         self.id = t_id
         self.lon = lon
         self.lat = lat
         self.e = expire_time  # 论文中的 s.e (expiration time)
+        self.r = release_time
+        self.node = node
 
 
 class Worker:
-    def __init__(self, w_id, lon, lat, max_t=4):
+    def __init__(self, w_id, lon, lat, max_t=4, node=None):
         self.id = w_id
         self.lon = lon
         self.lat = lat
         self.maxT = max_t  # 论文中的 w.maxT (task capacity)
+        self.node = node
 
 
 class Center:
-    def __init__(self, c_id, lon, lat):
+    def __init__(self, c_id, lon, lat, node=None):
         self.id = c_id
         self.lon = lon
         self.lat = lat
+        self.node = node
         self.S = []  # 分配给该中心的任务 c.S
         self.W = []  # 该中心的原始工人 c.W
 
@@ -58,10 +62,20 @@ def calculate_travel_time(lon1, lat1, lon2, lat2, speed=None):
 
 
 class IMTAO_Framework:
-    def __init__(self, centers: List[Center], tasks: List[Task], workers: List[Worker]):
+    def __init__(self, centers: List[Center], tasks: List[Task], workers: List[Worker], travel_time_func=None):
         self.centers = centers
         self.tasks = tasks
         self.workers = workers
+        self.travel_time_func = travel_time_func
+
+    def _travel_time(self, src, dst) -> float:
+        src_node = getattr(src, 'node', None)
+        dst_node = getattr(dst, 'node', None)
+        if self.travel_time_func is not None and src_node is not None and dst_node is not None:
+            travel_t = self.travel_time_func(src_node, dst_node)
+            if travel_t is not None:
+                return travel_t
+        return calculate_travel_time(src.lon, src.lat, dst.lon, dst.lat)
 
     def _calculate_collaboration_unfairness(self) -> float:
         if len(self.centers) <= 1:
@@ -125,14 +139,23 @@ class IMTAO_Framework:
             c.W = []
 
         for s in self.tasks:
-            nearest_c = min(self.centers, key=lambda c: calculate_travel_time(s.lon, s.lat, c.lon, c.lat))
+            nearest_c = min(self.centers, key=lambda c: self._travel_time(s, c))
             nearest_c.S.append(s)
 
         for w in self.workers:
-            nearest_c = min(self.centers, key=lambda c: calculate_travel_time(w.lon, w.lat, c.lon, c.lat))
+            nearest_c = min(self.centers, key=lambda c: self._travel_time(w, c))
             nearest_c.W.append(w)
 
         for c in self.centers:
+            c.S_left = c.S.copy()
+            c.W_left = c.W.copy()
+            c.A = []
+            c.rho = 0.0
+
+    def initialize_existing_partition(self, center_to_tasks: Dict[int, List[Task]], center_to_workers: Dict[int, List[Worker]]):
+        for c in self.centers:
+            c.S = list(center_to_tasks.get(c.id, []))
+            c.W = list(center_to_workers.get(c.id, []))
             c.S_left = c.S.copy()
             c.W_left = c.W.copy()
             c.A = []
@@ -149,31 +172,32 @@ class IMTAO_Framework:
         # 按照工人到中心的距离降序排列 (优先分配边缘工人)
         workers_sorted = sorted(
             workers_to_assign,
-            key=lambda w: calculate_travel_time(w.lon, w.lat, center.lon, center.lat),
+            key=lambda w: self._travel_time(w, center),
             reverse=True
         )
 
         for w in workers_sorted:
             S_w = []
-            current_time = calculate_travel_time(w.lon, w.lat, center.lon, center.lat)
-            current_lon, current_lat = center.lon, center.lat
+            current_time = self._travel_time(w, center)
+            current_ref = center
 
             while len(S_w) < w.maxT and len(center.S_left) > 0:
                 valid_tasks = []
                 for s in center.S_left:
-                    travel_t = calculate_travel_time(current_lon, current_lat, s.lon, s.lat)
-                    if current_time + travel_t <= s.e:
-                        valid_tasks.append((s, travel_t))
+                    travel_t = self._travel_time(current_ref, s)
+                    finish_time = max(current_time + travel_t, s.r)
+                    if finish_time <= s.e:
+                        valid_tasks.append((s, travel_t, finish_time))
 
                 if not valid_tasks:
                     break
 
-                nearest_task, best_travel_time = min(valid_tasks, key=lambda x: x[1])
+                nearest_task, best_travel_time, best_finish_time = min(valid_tasks, key=lambda x: x[1])
 
                 center.S_left.remove(nearest_task)
                 S_w.append(nearest_task)
-                current_time += best_travel_time
-                current_lon, current_lat = nearest_task.lon, nearest_task.lat
+                current_time = best_finish_time
+                current_ref = nearest_task
 
             if len(S_w) > 0:
                 center.A.append((w, S_w))
@@ -190,19 +214,18 @@ class IMTAO_Framework:
     # =====================================================================
     # Algorithm 3: Game-Theoretic Multi-Center Collaboration
     # =====================================================================
-    def algo3_game_theoretic_collaboration(self):
-        self.algo1_voronoi_partition()
+    def algo3_game_theoretic_collaboration(self, repartition: bool = True):
+        if repartition:
+            self.algo1_voronoi_partition()
         for c in self.centers:
             self.algo2_sequential_assignment(c, c.W)
 
-        global_W_left = []
-        for c in self.centers:
-            global_W_left.extend(c.W_left)
-
         C_prime = [c for c in self.centers if c.rho < 1.0]
+        worker_owner = {w.id: c for c in self.centers for w in c.W}
 
         iteration = 1
         while True:
+            global_W_left = [w for c in self.centers for w in c.W_left]
             if len(C_prime) == 0 or len(global_W_left) == 0:
                 break
 
@@ -212,8 +235,11 @@ class IMTAO_Framework:
 
             if w_move is not None and best_snapshot is not None:
                 c_i.rho, c_i.A, c_i.S_left, c_i.W_left = best_snapshot
-                c_i.W.append(w_move)
-                global_W_left = [w for w in global_W_left if w.id != w_move.id]
+                if all(existing.id != w_move.id for existing in c_i.W):
+                    c_i.W.append(w_move)
+                donor_center = worker_owner.get(w_move.id)
+                if donor_center is not None:
+                    donor_center.W_left = [w for w in donor_center.W_left if w.id != w_move.id]
             else:
                 C_prime.remove(c_i)
 
