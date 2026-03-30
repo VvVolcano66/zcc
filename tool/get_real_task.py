@@ -12,12 +12,12 @@ import numpy as np
 from datetime import datetime, date, timezone, timedelta
 
 # ============ 路径与日期范围（只改这里） ============
-RAW_DIR = r"D:\2016年10月成都市二环局部区域轨迹数据"
+RAW_DIR = r"D:\2016年11月成都市二环局部区域轨迹数据"
 OUT_DIR = r"D:\biyelunwen\data\task"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-START_DAY = "2016-10-01"   # 含
-END_DAY   = "2016-10-31"   # 含
+START_DAY = "2016-11-01"   # 含
+END_DAY   = "2016-11-30"   # 含
 
 # ============ 空间范围（10 km × 10 km） ============
 CENTER_LON, CENTER_LAT = 104.06, 30.67     # 中心点
@@ -81,11 +81,11 @@ def parse_day_from_tar(filename: str) -> date | None:
         try: return date(y, mth, d)
         except: return None
     # 10-19
-    m = re.match(r"^10-(\d{1,2})$", base)
+    m = re.match(r"^11-(\d{1,2})$", base)
     if m:
         d = int(m.group(1))
         if 1 <= d <= 31:
-            return date(2016, 10, d)
+            return date(2016, 11, d)
     return None
 
 def in_target_range(day_dt: date, start_s: str, end_s: str) -> bool:

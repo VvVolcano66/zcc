@@ -34,15 +34,25 @@ def _compute_service_ratio(
 
 def _compute_center_utility(
         region_id: int,
+        worker_counts: Dict[int, int],
+        effective_demand: Dict[int, int],
+        max_tasks_per_worker: int,
         service_ratio: Dict[int, float],
         fairness_weight: float
 ) -> float:
     other_ids = [rid for rid in service_ratio.keys() if rid != region_id]
+    demand = max(0, effective_demand.get(region_id, 0))
+    covered_tasks = min(demand, worker_counts.get(region_id, 0) * max_tasks_per_worker)
+    total_demand = max(1.0, float(sum(effective_demand.values())))
+    local_task_share = covered_tasks / total_demand
+
     if not other_ids:
-        return service_ratio[region_id]
+        return service_ratio[region_id] + local_task_share
 
     disparity = sum(abs(service_ratio[region_id] - service_ratio[rid]) for rid in other_ids) / len(other_ids)
-    return service_ratio[region_id] - fairness_weight * disparity
+    # Favor moves that unlock more covered tasks in high-demand regions while still
+    # keeping a light fairness regularizer to avoid extreme imbalance.
+    return service_ratio[region_id] + local_task_share - fairness_weight * disparity
 
 
 def _compute_potential(
@@ -155,7 +165,14 @@ def game_theoretic_predispatch_workers(
     for _ in range(max_iterations):
         current_service = _compute_service_ratio(worker_counts, effective_demand, max_tasks_per_worker)
         current_utilities = {
-            rid: _compute_center_utility(rid, current_service, fairness_weight)
+            rid: _compute_center_utility(
+                rid,
+                worker_counts,
+                effective_demand,
+                max_tasks_per_worker,
+                current_service,
+                fairness_weight
+            )
             for rid in region_ids
         }
         current_potential = _compute_potential(worker_counts, effective_demand, max_tasks_per_worker, fairness_weight)
@@ -200,8 +217,22 @@ def game_theoretic_predispatch_workers(
                 new_service = _compute_service_ratio(simulated_counts, effective_demand, max_tasks_per_worker)
                 donor_old_utility = current_utilities[donor]
                 receiver_old_utility = current_utilities[receiver]
-                donor_new_utility = _compute_center_utility(donor, new_service, fairness_weight)
-                receiver_new_utility = _compute_center_utility(receiver, new_service, fairness_weight)
+                donor_new_utility = _compute_center_utility(
+                    donor,
+                    simulated_counts,
+                    effective_demand,
+                    max_tasks_per_worker,
+                    new_service,
+                    fairness_weight
+                )
+                receiver_new_utility = _compute_center_utility(
+                    receiver,
+                    simulated_counts,
+                    effective_demand,
+                    max_tasks_per_worker,
+                    new_service,
+                    fairness_weight
+                )
 
                 receiver_gain = receiver_new_utility - receiver_old_utility
                 donor_drop = donor_old_utility - donor_new_utility
@@ -243,7 +274,14 @@ def game_theoretic_predispatch_workers(
 
     final_service = _compute_service_ratio(worker_counts, effective_demand, max_tasks_per_worker)
     final_utilities = {
-        rid: _compute_center_utility(rid, final_service, fairness_weight)
+        rid: _compute_center_utility(
+            rid,
+            worker_counts,
+            effective_demand,
+            max_tasks_per_worker,
+            final_service,
+            fairness_weight
+        )
         for rid in region_ids
     }
 
