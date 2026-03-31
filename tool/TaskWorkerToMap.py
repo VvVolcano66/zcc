@@ -82,6 +82,54 @@ class WorkerSimulator:
         self.worker_busy_until = {}  # {wid: timestamp} 工人忙碌到的时间点
         self.worker_available_from = {}  # {wid: timestamp} 工人从该时刻起可在当前位置自由移动
 
+    def initialize_from_real_data(
+            self, date: str, test_start_hour: int, prep_minutes: int = 5,
+            coords=None, nodes=None, partition=None, centers=None
+    ) -> None:
+        # 计算时间窗口：例如 7点开始，则窗口是 06:55 - 07:00
+        end_timestamp = test_start_hour * 3600
+        start_timestamp = end_timestamp - prep_minutes * 60
+
+        file_path = f"D:/biyelunwen/data/worker/workers_{date}.csv"
+        df = pd.read_csv(file_path)
+        df['seconds_of_day'] = pd.to_datetime(df['time_str']).dt.hour * 3600 + \
+                               pd.to_datetime(df['time_str']).dt.minute * 60 + \
+                               pd.to_datetime(df['time_str']).dt.second
+
+        mask = (df['seconds_of_day'] >= start_timestamp) & (df['seconds_of_day'] < end_timestamp)
+        workers_in_window = df[mask].copy()
+
+        if len(workers_in_window) == 0:
+            raise ValueError(f"在 {date} 的 {start_timestamp} 窗口内没有找到工人数据")
+
+        latest_positions = workers_in_window.sort_values('timestamp').groupby('wid').last().reset_index()
+
+        # 坐标转换与路网映射 (略，同原代码)
+        tree = KDTree(coords)
+        worker_wgs84 = latest_positions.apply(lambda row: gcj02_to_wgs84(row['lon_gcj'], row['lat_gcj']), axis=1)
+        worker_coords = np.array(worker_wgs84.tolist())
+        _, idxs = tree.query(worker_coords)
+        latest_positions['nearest_node'] = [nodes[i] for i in idxs]
+        latest_positions[['lon_wgs84', 'lat_wgs84']] = worker_coords
+
+        region_ids = list(centers.keys())
+        for idx, row in latest_positions.iterrows():
+            wid = row['wid']
+            # 初始位置是 06:55 的真实位置
+            self.worker_positions[wid] = (row['nearest_node'], row['lon_wgs84'], row['lat_wgs84'])
+            self.worker_status[wid] = 'idle'
+
+            # 【关键修改】：起始可用时间设为 06:55，确保有 5 分钟的空闲移动时间
+            self.worker_available_from[wid] = start_timestamp
+
+            # 初始分配中心
+            node = row['nearest_node']
+            if partition and node in partition:
+                self.worker_center_map[wid] = partition[node]
+            else:
+                self.worker_center_map[wid] = region_ids[idx % len(region_ids)]
+
+        print(f"✅ 工人初始化完成，起始时刻固定为: {start_timestamp // 3600:02d}:{(start_timestamp % 3600) // 60:02d}")
     def get_available_workers_with_center_info(
             self,
             region_id: int,
@@ -132,7 +180,10 @@ class WorkerSimulator:
             coords: np.ndarray = None,
             nodes: list = None,
             partition: Dict[Any, int] = None,
-            centers: Dict[int, Any] = None
+            centers: Dict[int, Any] = None,
+            max_workers: Optional[int] = None,
+            sampling_mode: str = 'snapshot_global',
+            random_seed: int = 42
     ) -> None:
         """
         从真实数据初始化工人位置，并将工人【平均分配】到各个区域中心
@@ -161,9 +212,7 @@ class WorkerSimulator:
                                pd.to_datetime(df['time_str']).dt.second
 
         # 筛选时间窗口内的数据
-        mask = (df['seconds_of_day'] >= start_timestamp) & \
-               (df['seconds_of_day'] < end_timestamp)
-        workers_in_window = df[mask].copy()
+        workers_in_window = df[df['seconds_of_day'] <= start_timestamp].copy()
 
         if len(workers_in_window) == 0:
             raise ValueError(f"在时间窗口内没有找到工人数据")
@@ -192,28 +241,94 @@ class WorkerSimulator:
         region_ids = list(centers.keys()) if centers else []
         num_regions = len(region_ids)
 
-        # 初始化位置，并执行【平均分配】逻辑
-        assigned_count = 0
+        assigned_region_ids = []
         for idx, row in latest_positions.iterrows():
+            node = row['nearest_node']
+            if partition is not None and node in partition:
+                assigned_region_id = partition[node]
+            elif num_regions > 0:
+                # 回退策略：如果当前节点未落入任何分区，再做均匀分配。
+                assigned_region_id = region_ids[idx % num_regions]
+            else:
+                assigned_region_id = None
+            assigned_region_ids.append(assigned_region_id)
+        latest_positions['assigned_region_id'] = assigned_region_ids
+
+        worker_limit = None if max_workers is None else max(0, int(max_workers))
+        sampling_mode = (sampling_mode or 'snapshot_global').lower()
+        if worker_limit is not None and worker_limit < len(latest_positions):
+            if sampling_mode == 'per_region' and num_regions > 0:
+                grouped = {
+                    rid: group.copy()
+                    for rid, group in latest_positions.groupby('assigned_region_id', sort=True)
+                }
+                active_regions = [rid for rid in region_ids if rid in grouped and len(grouped[rid]) > 0]
+                selected_frames = []
+                selected_wids = set()
+
+                if active_regions:
+                    quotas = {
+                        rid: min(len(grouped[rid]), worker_limit // len(active_regions))
+                        for rid in active_regions
+                    }
+                    remaining = worker_limit - sum(quotas.values())
+
+                    while remaining > 0:
+                        progressed = False
+                        for rid in sorted(active_regions, key=lambda region: len(grouped[region]), reverse=True):
+                            if quotas[rid] < len(grouped[rid]):
+                                quotas[rid] += 1
+                                remaining -= 1
+                                progressed = True
+                                if remaining == 0:
+                                    break
+                        if not progressed:
+                            break
+
+                    for offset, rid in enumerate(active_regions):
+                        quota = quotas[rid]
+                        if quota <= 0:
+                            continue
+                        sampled = grouped[rid].sample(n=quota, random_state=random_seed + offset)
+                        selected_frames.append(sampled)
+                        selected_wids.update(sampled['wid'].tolist())
+
+                    selected_total = sum(len(frame) for frame in selected_frames)
+                    if selected_total < worker_limit:
+                        remainder_df = latest_positions[~latest_positions['wid'].isin(selected_wids)]
+                        if len(remainder_df) > 0:
+                            selected_frames.append(
+                                remainder_df.sample(
+                                    n=min(worker_limit - selected_total, len(remainder_df)),
+                                    random_state=random_seed + 999
+                                )
+                            )
+
+                    if selected_frames:
+                        latest_positions = pd.concat(selected_frames, ignore_index=True)
+                    else:
+                        latest_positions = latest_positions.sample(n=worker_limit, random_state=random_seed)
+                else:
+                    latest_positions = latest_positions.sample(n=worker_limit, random_state=random_seed)
+            else:
+                latest_positions = latest_positions.sample(n=worker_limit, random_state=random_seed)
+
+        assigned_count = 0
+        for _, row in latest_positions.iterrows():
             wid = row['wid']
             lon = row['lon_wgs84']
             lat = row['lat_wgs84']
             node = row['nearest_node']
+            assigned_region_id = row['assigned_region_id']
 
-            if partition is not None and node in partition:
-                assigned_region_id = partition[node]
-                self.worker_center_map[wid] = assigned_region_id
-                assigned_count += 1
-            elif num_regions > 0:
-                # 回退策略：如果当前节点未落入任何分区，再做均匀分配。
-                assigned_region_id = region_ids[idx % num_regions]
+            if assigned_region_id is not None:
                 self.worker_center_map[wid] = assigned_region_id
                 assigned_count += 1
 
             # 保留工人真实的初始坐标
             self.worker_positions[wid] = (node, lon, lat)
             self.worker_status[wid] = 'idle'
-            self.worker_available_from[wid] = end_timestamp
+            self.worker_available_from[wid] = start_timestamp
 
         print(f"✅ 初始化完成：共 {len(self.worker_positions)} 个工人")
         if num_regions > 0:

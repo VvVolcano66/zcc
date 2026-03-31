@@ -21,7 +21,11 @@ DEFAULT_TEST_DATE = getattr(config, 'EXPERIMENT_TEST_DATE', '2016-10-31')
 DEFAULT_START_HOUR = int(getattr(config, 'EXPERIMENT_START_HOUR', 7))
 DEFAULT_END_HOUR = int(getattr(config, 'EXPERIMENT_END_HOUR', 9))
 DEFAULT_TIME_SLOT_MINUTES = int(getattr(config, 'EXPERIMENT_TIME_SLOT_MINUTES', 15))
-DEFAULT_PREP_MINUTES = int(getattr(config, 'WORKER_INIT_PREP_MINUTES', 5))
+FIXED_INIT_PREP_MINUTES = 5
+FIXED_COMPARE_SLOT_COUNT = 1
+DEFAULT_WORKER_LIMIT = getattr(config, 'EXPERIMENT_WORKER_LIMIT', None)
+DEFAULT_WORKER_SAMPLING_MODE = getattr(config, 'EXPERIMENT_WORKER_SAMPLING_MODE', 'snapshot_global')
+DEFAULT_WORKER_SAMPLE_SEED = int(getattr(config, 'EXPERIMENT_WORKER_SAMPLE_SEED', 42))
 
 _SIMULATION_CONTEXT_CACHE = {}
 _MCTG_PREDICTOR_CACHE = {}
@@ -29,6 +33,9 @@ _MCTG_PREDICTOR_CACHE = {}
 
 def build_prediction_date_split(test_date: str, data_dir: str):
     test_ts = pd.Timestamp(test_date).normalize()
+    # 显式定义学习数据的起始日期
+    train_start_ts = pd.Timestamp('2016-10-01').normalize()
+
     val_days = max(1, int(getattr(config, 'DISPATCH_PRED_VAL_DAYS', 2)))
 
     available_dates = []
@@ -40,29 +47,40 @@ def build_prediction_date_split(test_date: str, data_dir: str):
             date_ts = pd.Timestamp(date_str).normalize()
         except ValueError:
             continue
-        if date_ts < test_ts:
+
+        # 核心修改：确保日期在 2016-10-01 之后，且在测试日期之前
+        if train_start_ts <= date_ts < test_ts:
             available_dates.append(date_str)
 
     if len(available_dates) <= val_days:
         raise ValueError(
-            f"Not enough historical task files before {test_date} to build train/val split: "
-            f"{len(available_dates)} available, {val_days} reserved for validation."
+            f"从 {train_start_ts.date()} 到 {test_date} 之间的历史数据不足以构建训练/验证集: "
+            f"仅找到 {len(available_dates)} 天数据，但需要预留 {val_days} 天进行验证。"
         )
 
+    # 按照原逻辑切分：最后 val_days 天为验证集，其余为训练集
     train_dates = available_dates[:-val_days]
     val_dates = available_dates[-val_days:]
     return train_dates, val_dates
 
-
-def _build_simulation_context(test_date: str, test_start_hour: int, test_end_hour: int):
+def _build_simulation_context(
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        slots_to_run: int
+):
+    compare_end_seconds = test_start_hour * 3600 + slots_to_run * time_slot_minutes * 60
     cache_key = (
         test_date,
         test_start_hour,
         test_end_hour,
+        time_slot_minutes,
+        slots_to_run,
         config.NUM_ZONES,
         config.CHENGDU_CENTER,
         config.DOWNLOAD_DIST,
-        DEFAULT_PREP_MINUTES
+        FIXED_INIT_PREP_MINUTES
     )
     if cache_key in _SIMULATION_CONTEXT_CACHE:
         print("\n【阶段 1-4】复用缓存的地图、订单与工人初始数据...")
@@ -92,7 +110,7 @@ def _build_simulation_context(test_date: str, test_start_hour: int, test_end_hou
         print(f"✅ 全局订单池就绪，共 {len(df_tasks)} 个任务待命。")
 
         eval_mask = (df_tasks['seconds_of_day'] >= test_start_hour * 3600) & \
-                    (df_tasks['seconds_of_day'] < test_end_hour * 3600)
+                    (df_tasks['seconds_of_day'] < compare_end_seconds)
         eval_tasks = df_tasks[eval_mask].copy()
         eval_tasks = eval_tasks[eval_tasks['nearest_node'].isin(rcc_partition)].copy()
         eval_tasks['region_id'] = eval_tasks['nearest_node'].map(rcc_partition)
@@ -111,11 +129,14 @@ def _build_simulation_context(test_date: str, test_start_hour: int, test_end_hou
     base_worker_sim.initialize_from_real_data(
         date=test_date,
         test_start_hour=test_start_hour,
-        prep_minutes=DEFAULT_PREP_MINUTES,
+        prep_minutes=FIXED_INIT_PREP_MINUTES,
         coords=coords,
         nodes=nodes,
         partition=rcc_partition,
-        centers=centers
+        centers=centers,
+        max_workers=DEFAULT_WORKER_LIMIT,
+        sampling_mode=DEFAULT_WORKER_SAMPLING_MODE,
+        random_seed=DEFAULT_WORKER_SAMPLE_SEED
     )
 
     context = {
@@ -380,13 +401,26 @@ def run_online_simulation_with_center_pickup(
         time_slot_minutes: int = DEFAULT_TIME_SLOT_MINUTES
 ):
     cpu_start = time.process_time()
+    compare_slots = FIXED_COMPARE_SLOT_COUNT
+    compare_end_seconds = test_start_hour * 3600 + compare_slots * time_slot_minutes * 60
+    compare_end_hour = int(compare_end_seconds // 3600)
+    compare_end_minute = int((compare_end_seconds % 3600) // 60)
     print("=" * 70)
     print(f"在线物流调度仿真实验 (算法: {algo_name.upper()})")
     print("=" * 70)
-    print(f"测试日期：{test_date} | 时段：{test_start_hour}:00-{test_end_hour}:00 | 时间槽：{time_slot_minutes} 分钟")
+    print(
+        f"测试日期：{test_date} | 时段：{test_start_hour}:00-"
+        f"{compare_end_hour}:{compare_end_minute:02d} | 时间槽：{time_slot_minutes} 分钟"
+    )
     print("=" * 70)
 
-    context = _build_simulation_context(test_date, test_start_hour, test_end_hour)
+    context = _build_simulation_context(
+        test_date,
+        test_start_hour,
+        test_end_hour,
+        time_slot_minutes,
+        compare_slots
+    )
     G = context['G']
     rcc_partition = context['rcc_partition']
     centers = context['centers']
@@ -405,8 +439,7 @@ def run_online_simulation_with_center_pickup(
     total_dist_to_center = 0
     total_dist_to_task = 0
 
-    total_minutes = (test_end_hour - test_start_hour) * 60
-    num_slots = total_minutes // time_slot_minutes
+    num_slots = compare_slots
     observed_arrivals_history = []
     mctg_dispatch_predictor = None
     prediction_abs_errors = []
@@ -438,8 +471,6 @@ def run_online_simulation_with_center_pickup(
         # 4.1 提取当前时间槽的订单，并合并上轮积压的订单
         slot_start_seconds = test_start_hour * 3600 + slot_start_minute * 60
         slot_end_seconds = test_start_hour * 3600 + slot_end_minute * 60
-        print(f">> 按当前时刻推进工人位置与状态...")
-        worker_sim.advance_workers_to_time(centers, slot_start_seconds)
         current_slot_predicted_demand = None
         current_predict_label = None
 
@@ -506,6 +537,9 @@ def run_online_simulation_with_center_pickup(
                     print(f"   [{predict_label}] no worker rebalancing needed")
             else:
                 print("   [MCTGNet Predict] insufficient same-day history, skip pre-dispatch for this slot")
+
+        print(f">> 按当前时刻推进工人位置与状态...")
+        worker_sim.advance_workers_to_time(centers, slot_start_seconds)
 
         tasks_per_center = {region_id: [] for region_id in centers.keys()}
         slot_new_tasks_per_center = {region_id: 0 for region_id in centers.keys()}
@@ -783,4 +817,3 @@ if __name__ == "__main__":
         f"{_fmt_optional_metric(game_predictive_metrics.get('pred_rmse')):<16}"
     )
     print("=" * 110)
-

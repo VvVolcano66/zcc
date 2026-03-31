@@ -58,6 +58,11 @@ class MCTGNetDispatchPredictor:
         self.end_hour = None
         self.num_time_slots = None
         self.region_scale_factors = {rid: 1.0 for rid in centers.keys()}
+        self.region_slot_means = {rid: {} for rid in centers.keys()}
+        self.region_linear_models = {
+            rid: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            for rid in centers.keys()
+        }
 
     @staticmethod
     def _clone_state(model):
@@ -123,6 +128,45 @@ class MCTGNetDispatchPredictor:
             region_totals[rid] = total
         return region_totals
 
+    def _compute_region_slot_means(self, region_targets: np.ndarray, slot_ids: np.ndarray) -> None:
+        self.region_slot_means = {rid: {} for rid in self.centers.keys()}
+        for rid_idx, rid in enumerate(sorted(self.centers.keys())):
+            for slot_id in range(self.num_time_slots):
+                mask = slot_ids == slot_id
+                if np.any(mask):
+                    self.region_slot_means[rid][slot_id] = float(np.mean(region_targets[mask, rid_idx]))
+                else:
+                    self.region_slot_means[rid][slot_id] = float(np.mean(region_targets[:, rid_idx])) if len(region_targets) > 0 else 0.0
+
+    def _fit_region_linear_models(
+            self,
+            pred_region_scaled: np.ndarray,
+            actual_region: np.ndarray,
+            periodic_region: np.ndarray,
+            slot_ids: np.ndarray
+    ) -> None:
+        sorted_region_ids = sorted(self.centers.keys())
+        for rid_idx, rid in enumerate(sorted_region_ids):
+            slot_feature = np.array(
+                [self.region_slot_means[rid].get(int(slot_id), 0.0) for slot_id in slot_ids],
+                dtype=np.float32
+            )
+            features = np.column_stack([
+                pred_region_scaled[:, rid_idx],
+                slot_feature,
+                periodic_region[:, rid_idx],
+                np.ones(len(slot_ids), dtype=np.float32)
+            ])
+            target = actual_region[:, rid_idx].astype(np.float32)
+            if len(target) == 0:
+                continue
+
+            coef, *_ = np.linalg.lstsq(features, target, rcond=None)
+            coef = coef.astype(np.float32)
+            coef[:3] = np.clip(coef[:3], 0.0, 3.0)
+            coef[3] = float(np.clip(coef[3], -100.0, 100.0))
+            self.region_linear_models[rid] = coef
+
     def _build_periodic_features(self, demand_tensor, all_slots):
         slot_to_idx = {pd.Timestamp(ts): idx for idx, ts in enumerate(all_slots)}
         periodic_inputs = []
@@ -185,6 +229,30 @@ class MCTGNetDispatchPredictor:
 
         self.grid_size = (X_train_raw.shape[2], X_train_raw.shape[3])
         self._build_region_cell_index()
+
+        sorted_region_ids = sorted(self.centers.keys())
+        train_region_targets = np.array(
+            [
+                [self._aggregate_grid_to_regions(grid)[rid] for rid in sorted_region_ids]
+                for grid in Y_train_raw[:, 0]
+            ],
+            dtype=np.float32
+        )
+        val_region_targets = np.array(
+            [
+                [self._aggregate_grid_to_regions(grid)[rid] for rid in sorted_region_ids]
+                for grid in Y_val_raw[:, 0]
+            ],
+            dtype=np.float32
+        )
+        val_region_periodic = np.array(
+            [
+                [self._aggregate_grid_to_regions(grid[0])[rid] for rid in sorted_region_ids]
+                for grid in X_val_periodic_raw
+            ],
+            dtype=np.float32
+        )
+        self._compute_region_slot_means(train_region_targets, train_slot_ids)
 
         X_train = self._transform(X_train_raw)
         Y_train = self._transform(Y_train_raw)
@@ -300,6 +368,23 @@ class MCTGNetDispatchPredictor:
             blended_scale = 0.5 * region_scale + 0.5 * global_scale
             self.region_scale_factors[rid] = float(np.clip(blended_scale, 0.75, 2.5))
 
+        pred_region_scaled = np.array(
+            [
+                [
+                    self._aggregate_grid_to_regions(pred_grid)[rid] * self.region_scale_factors.get(rid, 1.0)
+                    for rid in sorted_region_ids
+                ]
+                for pred_grid in pred_val_np
+            ],
+            dtype=np.float32
+        )
+        self._fit_region_linear_models(
+            pred_region_scaled=pred_region_scaled,
+            actual_region=val_region_targets,
+            periodic_region=val_region_periodic,
+            slot_ids=val_slot_ids
+        )
+
     def predict_region_demand(self, slot_timestamp: pd.Timestamp) -> Optional[Dict[int, int]]:
         if self.model is None or self.target_tensor is None or self.target_slots is None:
             raise RuntimeError("MCTGNet dispatch predictor must be fitted before prediction.")
@@ -330,8 +415,22 @@ class MCTGNetDispatchPredictor:
         pred_grid = np.clip(pred_grid, 0.0, None)
 
         raw_region_demand = self._aggregate_grid_to_regions(pred_grid)
+        periodic_region_demand = self._aggregate_grid_to_regions(periodic_frame)
         region_demand = {}
         for rid, total in raw_region_demand.items():
             scale = self.region_scale_factors.get(rid, 1.0)
-            region_demand[rid] = int(round(total * scale))
+            scaled_total = total * scale
+            slot_mean = self.region_slot_means.get(rid, {}).get(slot_id, scaled_total)
+            periodic_total = periodic_region_demand.get(rid, 0.0)
+            coef = self.region_linear_models.get(rid)
+            if coef is None:
+                calibrated_total = scaled_total
+            else:
+                calibrated_total = (
+                    coef[0] * scaled_total
+                    + coef[1] * slot_mean
+                    + coef[2] * periodic_total
+                    + coef[3]
+                )
+            region_demand[rid] = int(round(max(0.0, calibrated_total)))
         return region_demand

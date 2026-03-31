@@ -23,7 +23,7 @@ COLOR_MAP = 'tab10'
 PRED_GRID_SIZE = (5, 5)
 
 # 1. 物理参数
-WORKER_SPEED_KMH = 18.0               # 骑手平均行驶速度 (18 km/h，考虑了红绿灯和市区路况)
+WORKER_SPEED_KMH = 10.0               # 骑手平均行驶速度 (18 km/h，考虑了红绿灯和市区路况)
 WORKER_SPEED_MS = WORKER_SPEED_KMH / 3.6 # 换算为米/秒 (约 5.0 m/s)
 
 # 2. 经济参数 (单位: 元 RMB)
@@ -36,7 +36,7 @@ DELAY_PENALTY = 5.0                   # 订单超时/无法分配的系统声誉
 TASK_EXPIRE_MINUTES = 10
 
 # 4. 在线模拟实验配置
-EXPERIMENT_TEST_DATE = "2016-10-31"   # 默认实验日期
+EXPERIMENT_TEST_DATE = "2016-11-30"  # 默认实验日期
 EXPERIMENT_START_HOUR = 7             # 默认实验开始时间（小时）
 EXPERIMENT_END_HOUR = 9               # 默认实验结束时间（小时）
 EXPERIMENT_TIME_SLOT_MINUTES = 15     # 默认时间槽长度（分钟）
@@ -63,3 +63,13 @@ GAME_DISPATCH_DISTANCE_PENALTY = 0.005
 GAME_DISPATCH_DONOR_MAX_UTILITY_DROP = 0.12
 GAME_DISPATCH_RECEIVER_MIN_GAIN = 0.002
 GAME_DISPATCH_MAX_ITERATIONS = 240
+
+# Worker sampling for the fixed 06:55 snapshot used by the 07:00 batch.
+# `None` means keep all workers from the snapshot.
+EXPERIMENT_WORKER_LIMIT = 400
+# Options:
+# - "snapshot_global": sample directly from the full 06:55 snapshot pool
+# - "per_region": sample as evenly as possible from each region's snapshot workers
+#EXPERIMENT_WORKER_SAMPLING_MODE = "snapshot_global"
+EXPERIMENT_WORKER_SAMPLING_MODE = "per_region"
+EXPERIMENT_WORKER_SAMPLE_SEED = 42
