@@ -27,6 +27,10 @@ class MCTGNetDispatchPredictor:
             log_interval: int = 20,
             weight_decay: float = 1e-4,
             hotspot_alpha: float = 2.5,
+            center_loss_weight: float = 0.35,
+            center_hotspot_alpha: float = 1.5,
+            center_underpredict_alpha: float = 2.0,
+            center_underpredict_power: float = 1.0,
             use_log1p: bool = True,
             device: Optional[str] = None
     ):
@@ -44,6 +48,10 @@ class MCTGNetDispatchPredictor:
         self.log_interval = max(1, log_interval)
         self.weight_decay = weight_decay
         self.hotspot_alpha = hotspot_alpha
+        self.center_loss_weight = center_loss_weight
+        self.center_hotspot_alpha = center_hotspot_alpha
+        self.center_underpredict_alpha = center_underpredict_alpha
+        self.center_underpredict_power = center_underpredict_power
         self.use_log1p = use_log1p
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -58,11 +66,13 @@ class MCTGNetDispatchPredictor:
         self.end_hour = None
         self.num_time_slots = None
         self.region_scale_factors = {rid: 1.0 for rid in centers.keys()}
+        self.sorted_region_ids = sorted(centers.keys())
         self.region_slot_means = {rid: {} for rid in centers.keys()}
         self.region_linear_models = {
-            rid: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            rid: np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
             for rid in centers.keys()
         }
+        self.region_masks_t = None
 
     @staticmethod
     def _clone_state(model):
@@ -81,6 +91,30 @@ class MCTGNetDispatchPredictor:
     def _weighted_mse(self, pred, target, raw_target):
         weights = 1.0 + self.hotspot_alpha * torch.log1p(torch.clamp(raw_target, min=0.0))
         return ((pred - target) ** 2 * weights).mean()
+
+    def _build_region_masks(self) -> None:
+        masks = np.zeros((len(self.sorted_region_ids), self.grid_size[0], self.grid_size[1]), dtype=np.float32)
+        for rid_idx, rid in enumerate(self.sorted_region_ids):
+            for y_idx, x_idx in self.region_cell_index.get(rid, []):
+                masks[rid_idx, y_idx, x_idx] = 1.0
+        self.region_masks_t = torch.FloatTensor(masks).to(self.device)
+
+    def _aggregate_grid_tensor_to_regions(self, grid_tensor: torch.Tensor) -> torch.Tensor:
+        return torch.einsum('bhw,khw->bk', grid_tensor, self.region_masks_t)
+
+    def _center_weighted_mse(self, pred_grid, target_region_raw):
+        pred_grid_raw = torch.expm1(pred_grid) if self.use_log1p else pred_grid
+        pred_grid_raw = torch.clamp(pred_grid_raw, min=0.0)
+        pred_region_raw = self._aggregate_grid_tensor_to_regions(pred_grid_raw)
+        weights = 1.0 + self.center_hotspot_alpha * torch.log1p(torch.clamp(target_region_raw, min=0.0))
+        residual = pred_region_raw - target_region_raw
+        under_gap = torch.clamp(target_region_raw - pred_region_raw, min=0.0)
+        relative_under_gap = under_gap / torch.clamp(target_region_raw + 1.0, min=1.0)
+        under_weights = 1.0 + self.center_underpredict_alpha * torch.pow(
+            relative_under_gap,
+            self.center_underpredict_power
+        )
+        return ((residual ** 2) * weights * under_weights).mean()
 
     def _load_dates(self, dates: List[str]) -> pd.DataFrame:
         df_list = []
@@ -143,6 +177,7 @@ class MCTGNetDispatchPredictor:
             pred_region_scaled: np.ndarray,
             actual_region: np.ndarray,
             periodic_region: np.ndarray,
+            weekly_region: np.ndarray,
             slot_ids: np.ndarray
     ) -> None:
         sorted_region_ids = sorted(self.centers.keys())
@@ -155,6 +190,7 @@ class MCTGNetDispatchPredictor:
                 pred_region_scaled[:, rid_idx],
                 slot_feature,
                 periodic_region[:, rid_idx],
+                weekly_region[:, rid_idx],
                 np.ones(len(slot_ids), dtype=np.float32)
             ])
             target = actual_region[:, rid_idx].astype(np.float32)
@@ -170,23 +206,37 @@ class MCTGNetDispatchPredictor:
     def _build_periodic_features(self, demand_tensor, all_slots):
         slot_to_idx = {pd.Timestamp(ts): idx for idx, ts in enumerate(all_slots)}
         periodic_inputs = []
+        weekly_inputs = []
         slot_ids = []
+        weekday_ids = []
 
         for i in range(len(demand_tensor) - self.seq_len - self.pre_len + 1):
             target_ts = pd.Timestamp(all_slots[i + self.seq_len])
             prev_day_ts = target_ts - pd.Timedelta(days=1)
+            prev_week_ts = target_ts - pd.Timedelta(days=7)
             if prev_day_ts in slot_to_idx:
                 periodic_frame = demand_tensor[slot_to_idx[prev_day_ts]]
             else:
                 periodic_frame = np.zeros_like(demand_tensor[0])
+            if prev_week_ts in slot_to_idx:
+                weekly_frame = demand_tensor[slot_to_idx[prev_week_ts]]
+            else:
+                weekly_frame = np.zeros_like(demand_tensor[0])
 
             slot_id = ((target_ts.hour * 60 + target_ts.minute) - self.history_start_hour * 60) // self.time_interval
             slot_id = int(np.clip(slot_id, 0, self.num_time_slots - 1))
 
             periodic_inputs.append(periodic_frame[None, ...])
+            weekly_inputs.append(weekly_frame[None, ...])
             slot_ids.append(slot_id)
+            weekday_ids.append(int(target_ts.dayofweek))
 
-        return np.array(periodic_inputs), np.array(slot_ids, dtype=np.int64)
+        return (
+            np.array(periodic_inputs),
+            np.array(weekly_inputs),
+            np.array(slot_ids, dtype=np.int64),
+            np.array(weekday_ids, dtype=np.int64)
+        )
 
     def fit(
             self,
@@ -221,16 +271,21 @@ class MCTGNetDispatchPredictor:
         X_val_raw, Y_val_raw = self.dataset.create_seq_data_single_tensor(
             demand_tensor_val, seq_len=self.seq_len, pre_len=self.pre_len
         )
-        X_train_periodic_raw, train_slot_ids = self._build_periodic_features(demand_tensor_train, slots_train)
-        X_val_periodic_raw, val_slot_ids = self._build_periodic_features(demand_tensor_val, slots_val)
+        X_train_periodic_raw, X_train_weekly_raw, train_slot_ids, train_weekday_ids = self._build_periodic_features(
+            demand_tensor_train, slots_train
+        )
+        X_val_periodic_raw, X_val_weekly_raw, val_slot_ids, val_weekday_ids = self._build_periodic_features(
+            demand_tensor_val, slots_val
+        )
 
         if len(X_train_raw) == 0 or len(X_val_raw) == 0:
             raise ValueError("Not enough samples to train MCTGNet dispatch predictor.")
 
         self.grid_size = (X_train_raw.shape[2], X_train_raw.shape[3])
         self._build_region_cell_index()
+        self._build_region_masks()
 
-        sorted_region_ids = sorted(self.centers.keys())
+        sorted_region_ids = self.sorted_region_ids
         train_region_targets = np.array(
             [
                 [self._aggregate_grid_to_regions(grid)[rid] for rid in sorted_region_ids]
@@ -252,6 +307,13 @@ class MCTGNetDispatchPredictor:
             ],
             dtype=np.float32
         )
+        val_region_weekly = np.array(
+            [
+                [self._aggregate_grid_to_regions(grid[0])[rid] for rid in sorted_region_ids]
+                for grid in X_val_weekly_raw
+            ],
+            dtype=np.float32
+        )
         self._compute_region_slot_means(train_region_targets, train_slot_ids)
 
         X_train = self._transform(X_train_raw)
@@ -260,13 +322,16 @@ class MCTGNetDispatchPredictor:
         Y_val = self._transform(Y_val_raw)
         X_train_periodic = self._transform(X_train_periodic_raw)
         X_val_periodic = self._transform(X_val_periodic_raw)
+        X_train_weekly = self._transform(X_train_weekly_raw)
+        X_val_weekly = self._transform(X_val_weekly_raw)
 
         self.model = MCTGNet(
             seq_len=self.seq_len,
             grid_size=self.grid_size,
             hidden_dim=64,
             num_centers=len(self.centers),
-            num_time_slots=self.num_time_slots
+            num_time_slots=self.num_time_slots,
+            num_weekdays=7
         ).to(self.device)
 
         optimizer = torch.optim.Adam(
@@ -281,13 +346,19 @@ class MCTGNetDispatchPredictor:
         X_tr_t = torch.FloatTensor(X_train).to(self.device)
         Y_tr_t = torch.FloatTensor(Y_train[:, 0]).to(self.device)
         Y_tr_raw_t = torch.FloatTensor(Y_train_raw[:, 0]).to(self.device)
+        Y_tr_region_raw_t = torch.FloatTensor(train_region_targets).to(self.device)
         X_val_t = torch.FloatTensor(X_val).to(self.device)
         Y_val_t = torch.FloatTensor(Y_val[:, 0]).to(self.device)
         Y_val_raw_t = torch.FloatTensor(Y_val_raw[:, 0]).to(self.device)
+        Y_val_region_raw_t = torch.FloatTensor(val_region_targets).to(self.device)
         X_tr_periodic_t = torch.FloatTensor(X_train_periodic).to(self.device)
         X_val_periodic_t = torch.FloatTensor(X_val_periodic).to(self.device)
+        X_tr_weekly_t = torch.FloatTensor(X_train_weekly).to(self.device)
+        X_val_weekly_t = torch.FloatTensor(X_val_weekly).to(self.device)
         train_slot_ids_t = torch.LongTensor(train_slot_ids).to(self.device)
         val_slot_ids_t = torch.LongTensor(val_slot_ids).to(self.device)
+        train_weekday_ids_t = torch.LongTensor(train_weekday_ids).to(self.device)
+        val_weekday_ids_t = torch.LongTensor(val_weekday_ids).to(self.device)
 
         best_val_loss = float('inf')
         best_state = self._clone_state(self.model)
@@ -297,15 +368,31 @@ class MCTGNetDispatchPredictor:
         for epoch in range(1, self.max_epochs + 1):
             self.model.train()
             optimizer.zero_grad()
-            pred_train = self.model(X_tr_t, X_tr_periodic_t, train_slot_ids_t)
-            train_loss = self._weighted_mse(pred_train, Y_tr_t, Y_tr_raw_t)
+            pred_train = self.model(
+                X_tr_t,
+                periodic_x=X_tr_periodic_t,
+                weekly_x=X_tr_weekly_t,
+                slot_ids=train_slot_ids_t,
+                weekday_ids=train_weekday_ids_t
+            )
+            train_grid_loss = self._weighted_mse(pred_train, Y_tr_t, Y_tr_raw_t)
+            train_center_loss = self._center_weighted_mse(pred_train, Y_tr_region_raw_t)
+            train_loss = train_grid_loss + self.center_loss_weight * train_center_loss
             train_loss.backward()
             optimizer.step()
 
             self.model.eval()
             with torch.no_grad():
-                pred_val = self.model(X_val_t, X_val_periodic_t, val_slot_ids_t)
-                val_loss = self._weighted_mse(pred_val, Y_val_t, Y_val_raw_t).item()
+                pred_val = self.model(
+                    X_val_t,
+                    periodic_x=X_val_periodic_t,
+                    weekly_x=X_val_weekly_t,
+                    slot_ids=val_slot_ids_t,
+                    weekday_ids=val_weekday_ids_t
+                )
+                val_grid_loss = self._weighted_mse(pred_val, Y_val_t, Y_val_raw_t)
+                val_center_loss = self._center_weighted_mse(pred_val, Y_val_region_raw_t)
+                val_loss = (val_grid_loss + self.center_loss_weight * val_center_loss).item()
 
             scheduler.step(val_loss)
 
@@ -321,7 +408,9 @@ class MCTGNetDispatchPredictor:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(
                     f"   [MCTGNet Dispatch] Epoch [{epoch:04d}/{self.max_epochs}], "
-                    f"Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}"
+                    f"Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss:.4f}, "
+                    f"Train Center: {train_center_loss.item():.2f}, Val Center: {val_center_loss.item():.2f}, "
+                    f"LR: {current_lr:.6f}"
                 )
 
             if patience_counter >= self.patience:
@@ -340,7 +429,13 @@ class MCTGNetDispatchPredictor:
         actual_region_totals = {rid: 0.0 for rid in self.centers.keys()}
 
         with torch.no_grad():
-            pred_val_np = self.model(X_val_t, X_val_periodic_t, val_slot_ids_t).detach().cpu().numpy()
+            pred_val_np = self.model(
+                X_val_t,
+                periodic_x=X_val_periodic_t,
+                weekly_x=X_val_weekly_t,
+                slot_ids=val_slot_ids_t,
+                weekday_ids=val_weekday_ids_t
+            ).detach().cpu().numpy()
 
         pred_val_np = self._inverse(pred_val_np)
         pred_val_np = np.clip(pred_val_np, 0.0, None)
@@ -382,6 +477,7 @@ class MCTGNetDispatchPredictor:
             pred_region_scaled=pred_region_scaled,
             actual_region=val_region_targets,
             periodic_region=val_region_periodic,
+            weekly_region=val_region_weekly,
             slot_ids=val_slot_ids
         )
 
@@ -396,32 +492,48 @@ class MCTGNetDispatchPredictor:
 
         window = self.target_tensor[target_idx - self.seq_len:target_idx]
         prev_day_idx = self.target_slot_to_idx.get(target_slot - pd.Timedelta(days=1))
+        prev_week_idx = self.target_slot_to_idx.get(target_slot - pd.Timedelta(days=7))
         if prev_day_idx is None:
             periodic_frame = np.zeros_like(self.target_tensor[0])
         else:
             periodic_frame = self.target_tensor[prev_day_idx]
+        if prev_week_idx is None:
+            weekly_frame = np.zeros_like(self.target_tensor[0])
+        else:
+            weekly_frame = self.target_tensor[prev_week_idx]
 
         slot_id = ((target_slot.hour * 60 + target_slot.minute) - self.history_start_hour * 60) // self.time_interval
         slot_id = int(np.clip(slot_id, 0, self.num_time_slots - 1))
+        weekday_id = int(target_slot.dayofweek)
 
         X_t = torch.FloatTensor(self._transform(window)).unsqueeze(0).to(self.device)
         X_periodic_t = torch.FloatTensor(self._transform(periodic_frame[None, ...])).unsqueeze(0).to(self.device)
+        X_weekly_t = torch.FloatTensor(self._transform(weekly_frame[None, ...])).unsqueeze(0).to(self.device)
         slot_ids_t = torch.LongTensor([slot_id]).to(self.device)
+        weekday_ids_t = torch.LongTensor([weekday_id]).to(self.device)
 
         with torch.no_grad():
-            pred_grid = self.model(X_t, X_periodic_t, slot_ids_t).detach().cpu().numpy()[0]
+            pred_grid = self.model(
+                X_t,
+                periodic_x=X_periodic_t,
+                weekly_x=X_weekly_t,
+                slot_ids=slot_ids_t,
+                weekday_ids=weekday_ids_t
+            ).detach().cpu().numpy()[0]
 
         pred_grid = self._inverse(pred_grid)
         pred_grid = np.clip(pred_grid, 0.0, None)
 
         raw_region_demand = self._aggregate_grid_to_regions(pred_grid)
         periodic_region_demand = self._aggregate_grid_to_regions(periodic_frame)
+        weekly_region_demand = self._aggregate_grid_to_regions(weekly_frame)
         region_demand = {}
         for rid, total in raw_region_demand.items():
             scale = self.region_scale_factors.get(rid, 1.0)
             scaled_total = total * scale
             slot_mean = self.region_slot_means.get(rid, {}).get(slot_id, scaled_total)
             periodic_total = periodic_region_demand.get(rid, 0.0)
+            weekly_total = weekly_region_demand.get(rid, 0.0)
             coef = self.region_linear_models.get(rid)
             if coef is None:
                 calibrated_total = scaled_total
@@ -430,7 +542,8 @@ class MCTGNetDispatchPredictor:
                     coef[0] * scaled_total
                     + coef[1] * slot_mean
                     + coef[2] * periodic_total
-                    + coef[3]
+                    + coef[3] * weekly_total
+                    + coef[4]
                 )
             region_demand[rid] = int(round(max(0.0, calibrated_total)))
         return region_demand

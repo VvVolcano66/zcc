@@ -55,7 +55,11 @@ def predispatch_workers_for_next_slot(
         min_buffer_workers: int = 3,
         reserve_ratio: float = 0.15,
         max_rebalance_share: float = 0.35,
-        max_distance_km: float = 8.0
+        max_distance_km: float = None,
+        idle_penalty: float = 0.8,
+        congestion_penalty: float = 0.35,
+        distance_penalty: float = 0.02,
+        remote_worker_bonus: float = 0.03
 ) -> Dict[str, Any]:
     """
     Reassign workers that are expected to be available in the next slot from
@@ -67,7 +71,11 @@ def predispatch_workers_for_next_slot(
     min_buffer_workers = max(0, int(min_buffer_workers))
     reserve_ratio = max(0.0, float(reserve_ratio))
     max_rebalance_share = min(1.0, max(0.0, float(max_rebalance_share)))
-    max_distance_m = max(0.0, float(max_distance_km)) * 1000.0
+    max_distance_m = float('inf') if max_distance_km is None else max(0.0, float(max_distance_km)) * 1000.0
+    idle_penalty = max(0.0, float(idle_penalty))
+    congestion_penalty = max(0.0, float(congestion_penalty))
+    distance_penalty = max(0.0, float(distance_penalty))
+    remote_worker_bonus = max(0.0, float(remote_worker_bonus))
     region_ids = sorted(centers.keys())
 
     movable_workers = {rid: [] for rid in region_ids}
@@ -107,11 +115,6 @@ def predispatch_workers_for_next_slot(
         rid: max(0, min(available_workers[rid] - required_workers[rid] - protected_supply[rid], max_outbound[rid]))
         for rid in region_ids
     }
-    shortage = {
-        rid: max(0, required_workers[rid] - available_workers[rid])
-        for rid in region_ids
-    }
-
     distance_cache: Dict[Tuple[Any, Any], float] = {}
 
     def get_dist(n1: Any, n2: Any) -> float:
@@ -125,45 +128,97 @@ def predispatch_workers_for_next_slot(
                 distance_cache[pair] = float('inf')
         return distance_cache[pair]
 
-    moves = []
-    for target_region in sorted(region_ids, key=lambda rid: shortage[rid], reverse=True):
-        while shortage[target_region] > 0:
-            best_choice = None
-            best_distance = float('inf')
-            target_center_node = centers[target_region]
+    worker_counts = available_workers.copy()
+    outbound_counts = {rid: 0 for rid in region_ids}
 
+    def center_utility(region_id: int, worker_count: int) -> float:
+        demand = float(max(0, effective_demand.get(region_id, 0)))
+        covered_tasks = min(demand, worker_count * max_tasks_per_worker)
+        desired_workers = demand / max_tasks_per_worker if demand > 0 else 0.0
+        idle_workers = max(0.0, worker_count - desired_workers)
+        congestion_workers = max(0.0, worker_count - desired_workers * 1.1)
+        return (
+            covered_tasks
+            - idle_penalty * idle_workers * max_tasks_per_worker
+            - congestion_penalty * (congestion_workers ** 2) * max_tasks_per_worker
+        )
+
+    def current_shortage(region_id: int) -> int:
+        return max(0, required_workers[region_id] - worker_counts[region_id])
+
+    def current_surplus(region_id: int) -> int:
+        allowed_outbound = int(math.floor(available_workers[region_id] * max_rebalance_share))
+        keep_floor = required_workers[region_id] + protected_supply[region_id]
+        return max(0, min(worker_counts[region_id] - keep_floor, allowed_outbound - outbound_counts[region_id]))
+
+    moves = []
+    while True:
+        best_move = None
+        best_net_gain = 0.0
+
+        target_regions = sorted(
+            region_ids,
+            key=lambda rid: (current_shortage(rid), effective_demand[rid]),
+            reverse=True
+        )
+        for target_region in target_regions:
+            if current_shortage(target_region) <= 0:
+                continue
+
+            receiver_gain = center_utility(target_region, worker_counts[target_region] + 1) - center_utility(
+                target_region, worker_counts[target_region]
+            )
+            if receiver_gain <= 0.0:
+                continue
+
+            target_center_node = centers[target_region]
             donor_regions = sorted(
-                [rid for rid in region_ids if surplus[rid] > 0 and rid != target_region],
-                key=lambda rid: surplus[rid],
+                [rid for rid in region_ids if rid != target_region and current_surplus(rid) > 0],
+                key=lambda rid: current_surplus(rid),
                 reverse=True
             )
-            if not donor_regions:
-                break
-
             for donor_region in donor_regions:
+                donor_loss = center_utility(donor_region, worker_counts[donor_region]) - center_utility(
+                    donor_region, worker_counts[donor_region] - 1
+                )
+                donor_center_node = centers[donor_region]
                 for wid in movable_workers[donor_region]:
                     worker_node = worker_sim.worker_positions[wid][0]
                     dist = get_dist(worker_node, target_center_node)
-                    if dist <= max_distance_m and dist < best_distance:
-                        best_distance = dist
-                        best_choice = (wid, donor_region)
+                    if dist > max_distance_m or dist == float('inf'):
+                        continue
 
-            if best_choice is None or best_distance == float('inf'):
-                break
+                    donor_center_dist = get_dist(worker_node, donor_center_node)
+                    move_cost = distance_penalty * (dist / 1000.0)
+                    remote_bonus = remote_worker_bonus * (donor_center_dist / 1000.0)
+                    net_gain = receiver_gain - donor_loss - move_cost + remote_bonus
+                    if net_gain > best_net_gain:
+                        best_net_gain = net_gain
+                        best_move = {
+                            'wid': wid,
+                            'from_region': donor_region,
+                            'to_region': target_region,
+                            'distance_to_target_center': dist,
+                            'distance_from_donor_center': donor_center_dist,
+                            'net_gain': net_gain,
+                            'receiver_gain': receiver_gain,
+                            'donor_loss': donor_loss,
+                            'remote_bonus': remote_bonus
+                        }
 
-            wid, donor_region = best_choice
-            movable_workers[donor_region].remove(wid)
-            worker_sim.worker_center_map[wid] = target_region
-            movable_workers[target_region].append(wid)
+        if best_move is None:
+            break
 
-            surplus[donor_region] -= 1
-            shortage[target_region] -= 1
-            moves.append({
-                'wid': wid,
-                'from_region': donor_region,
-                'to_region': target_region,
-                'distance_to_target_center': best_distance
-            })
+        wid = best_move['wid']
+        donor_region = best_move['from_region']
+        target_region = best_move['to_region']
+        movable_workers[donor_region].remove(wid)
+        worker_sim.worker_center_map[wid] = target_region
+        movable_workers[target_region].append(wid)
+        worker_counts[donor_region] -= 1
+        worker_counts[target_region] += 1
+        outbound_counts[donor_region] += 1
+        moves.append(best_move)
 
     return {
         'predicted_demand': predicted_demand,
@@ -171,5 +226,6 @@ def predispatch_workers_for_next_slot(
         'available_workers': available_workers,
         'required_workers': required_workers,
         'protected_supply': protected_supply,
+        'final_worker_counts': worker_counts,
         'moves': moves
     }

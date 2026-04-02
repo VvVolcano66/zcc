@@ -2,6 +2,8 @@ import math
 from typing import Any, Dict, List, Tuple
 
 import networkx as nx
+import numpy as np
+from scipy.spatial import KDTree
 
 
 def _pairwise_unfairness(service_ratio: Dict[int, float]) -> float:
@@ -38,36 +40,79 @@ def _compute_center_utility(
         effective_demand: Dict[int, int],
         max_tasks_per_worker: int,
         service_ratio: Dict[int, float],
-        fairness_weight: float
+        fairness_weight: float,
+        idle_penalty: float,
+        congestion_penalty: float
 ) -> float:
     other_ids = [rid for rid in service_ratio.keys() if rid != region_id]
-    demand = max(0, effective_demand.get(region_id, 0))
+    demand = float(max(0, effective_demand.get(region_id, 0)))
     covered_tasks = min(demand, worker_counts.get(region_id, 0) * max_tasks_per_worker)
     total_demand = max(1.0, float(sum(effective_demand.values())))
-    local_task_share = covered_tasks / total_demand
+    desired_workers = demand / max_tasks_per_worker if demand > 0 else 0.0
+    idle_workers = max(0.0, worker_counts.get(region_id, 0) - desired_workers)
+    congestion_workers = max(0.0, worker_counts.get(region_id, 0) - desired_workers * 1.1)
+    local_task_share = (
+        covered_tasks / total_demand
+        - idle_penalty * idle_workers * max_tasks_per_worker / total_demand
+        - congestion_penalty * (congestion_workers ** 2) * max_tasks_per_worker / total_demand
+    )
 
     if not other_ids:
-        return service_ratio[region_id] + local_task_share
+        return local_task_share
 
     disparity = sum(abs(service_ratio[region_id] - service_ratio[rid]) for rid in other_ids) / len(other_ids)
-    # Favor moves that unlock more covered tasks in high-demand regions while still
-    # keeping a light fairness regularizer to avoid extreme imbalance.
-    return service_ratio[region_id] + local_task_share - fairness_weight * disparity
+    return local_task_share - fairness_weight * disparity
+
+
+def _compute_adaptive_fairness_weight(
+        base_weight: float,
+        worker_counts: Dict[int, int],
+        effective_demand: Dict[int, int],
+        max_tasks_per_worker: int
+) -> float:
+    if base_weight <= 0.0:
+        return 0.0
+
+    total_demand = max(1.0, float(sum(effective_demand.values())))
+    total_capacity = float(sum(worker_counts.values()) * max_tasks_per_worker)
+    unmet_ratio = max(0.0, total_demand - total_capacity) / total_demand
+
+    regional_gap = 0.0
+    for rid, demand in effective_demand.items():
+        if demand <= 0:
+            continue
+        covered = min(demand, worker_counts.get(rid, 0) * max_tasks_per_worker)
+        regional_gap = max(regional_gap, max(0.0, demand - covered) / demand)
+
+    pressure = max(unmet_ratio, regional_gap)
+    attenuation = max(0.1, 1.0 - min(0.9, pressure * 1.5))
+    return base_weight * attenuation
 
 
 def _compute_potential(
         worker_counts: Dict[int, int],
         effective_demand: Dict[int, int],
         max_tasks_per_worker: int,
-        fairness_weight: float
+        fairness_weight: float,
+        idle_penalty: float,
+        congestion_penalty: float,
+        distance_cost: float = 0.0
 ) -> float:
     service_ratio = _compute_service_ratio(worker_counts, effective_demand, max_tasks_per_worker)
     covered_tasks = 0.0
-    for rid, demand in effective_demand.items():
-        covered_tasks += min(demand, worker_counts.get(rid, 0) * max_tasks_per_worker)
+    for rid in effective_demand.keys():
+        covered_tasks += _compute_center_utility(
+            rid,
+            worker_counts,
+            effective_demand,
+            max_tasks_per_worker,
+            service_ratio,
+            0.0,
+            idle_penalty,
+            congestion_penalty
+        )
     unfairness = _pairwise_unfairness(service_ratio)
-    total_demand = max(1.0, float(sum(effective_demand.values())))
-    return covered_tasks / total_demand - fairness_weight * unfairness
+    return covered_tasks - fairness_weight * unfairness - distance_cost
 
 
 def game_theoretic_predispatch_workers(
@@ -82,12 +127,20 @@ def game_theoretic_predispatch_workers(
         min_buffer_workers: int = 3,
         reserve_ratio: float = 0.15,
         max_rebalance_share: float = 0.35,
-        max_distance_km: float = 8.0,
+        max_distance_km: float = None,
         fairness_weight: float = 0.5,
         distance_penalty: float = 0.015,
+        idle_penalty: float = 0.8,
+        congestion_penalty: float = 0.35,
+        remote_worker_bonus: float = 0.03,
         donor_max_utility_drop: float = 0.04,
         receiver_min_utility_gain: float = 0.01,
-        max_iterations: int = 120
+        max_iterations: int = 120,
+        burst_outbound_share: float = 0.6,
+        high_demand_multiplier: float = 1.25,
+        high_demand_shortage_ratio: float = 0.3,
+        candidate_k: int = 12,
+        potential_gain_epsilon: float = 1e-4
 ) -> Dict[str, Any]:
     """
     Potential-game style pre-dispatch.
@@ -103,8 +156,14 @@ def game_theoretic_predispatch_workers(
     min_buffer_workers = max(0, int(min_buffer_workers))
     reserve_ratio = max(0.0, float(reserve_ratio))
     max_rebalance_share = min(1.0, max(0.0, float(max_rebalance_share)))
-    max_distance_m = max(0.0, float(max_distance_km)) * 1000.0
+    burst_outbound_share = max(max_rebalance_share, min(1.0, float(burst_outbound_share)))
+    max_distance_m = float('inf') if max_distance_km is None else max(0.0, float(max_distance_km)) * 1000.0
+    idle_penalty = max(0.0, float(idle_penalty))
+    congestion_penalty = max(0.0, float(congestion_penalty))
+    remote_worker_bonus = max(0.0, float(remote_worker_bonus))
     max_iterations = max(1, int(max_iterations))
+    candidate_k = max(1, int(candidate_k))
+    potential_gain_epsilon = max(0.0, float(potential_gain_epsilon))
 
     region_ids = sorted(centers.keys())
     movable_workers = {rid: [] for rid in region_ids}
@@ -137,11 +196,17 @@ def game_theoretic_predispatch_workers(
         rid: int(math.floor(available_workers[rid] * max_rebalance_share))
         for rid in region_ids
     }
+    burst_outbound = {
+        rid: int(math.floor(available_workers[rid] * burst_outbound_share))
+        for rid in region_ids
+    }
 
     worker_counts = available_workers.copy()
     outbound_counts = {rid: 0 for rid in region_ids}
     distance_cache: Dict[Tuple[Any, Any], float] = {}
     moves = []
+    positive_demands = [effective_demand[rid] for rid in region_ids if effective_demand[rid] > 0]
+    mean_demand = float(np.mean(positive_demands)) if positive_demands else 0.0
 
     def get_dist(n1: Any, n2: Any) -> float:
         if n1 == n2:
@@ -154,15 +219,82 @@ def game_theoretic_predispatch_workers(
                 distance_cache[pair] = float('inf')
         return distance_cache[pair]
 
-    def donor_can_send(region_id: int) -> bool:
+    def is_high_demand_receiver(region_id: int) -> bool:
+        demand = effective_demand.get(region_id, 0)
+        if demand <= 0:
+            return False
+        shortage_tasks = max(0, demand - worker_counts.get(region_id, 0) * max_tasks_per_worker)
+        shortage_ratio = shortage_tasks / max(demand, 1)
+        return demand >= mean_demand * high_demand_multiplier or shortage_ratio >= high_demand_shortage_ratio
+
+    def donor_can_send(region_id: int, receiver_id: int) -> bool:
         keep_floor = required_workers[region_id] + protected_supply[region_id]
         if worker_counts[region_id] - 1 < keep_floor:
             return False
-        if outbound_counts[region_id] >= max_outbound[region_id]:
+        allowed_outbound = burst_outbound[region_id] if is_high_demand_receiver(receiver_id) else max_outbound[region_id]
+        if outbound_counts[region_id] >= allowed_outbound:
             return False
         return True
 
+    def get_candidate_workers(donor_region: int, receiver_region: int) -> List[Tuple[str, float, float]]:
+        donor_workers = movable_workers[donor_region]
+        if not donor_workers:
+            return []
+
+        receiver_center_node = centers[receiver_region]
+        donor_center_node = centers[donor_region]
+        center_lon = G.nodes[receiver_center_node].get('x', G.nodes[receiver_center_node].get('lon'))
+        center_lat = G.nodes[receiver_center_node].get('y', G.nodes[receiver_center_node].get('lat'))
+
+        coords = []
+        valid_worker_ids = []
+        for wid in donor_workers:
+            worker_info = worker_sim.worker_positions.get(wid)
+            if worker_info is None:
+                continue
+            coords.append((worker_info[1], worker_info[2]))
+            valid_worker_ids.append(wid)
+
+        if not valid_worker_ids:
+            return []
+
+        if len(valid_worker_ids) <= candidate_k:
+            query_indices = list(range(len(valid_worker_ids)))
+        else:
+            tree = KDTree(np.asarray(coords, dtype=np.float32))
+            _, query_indices = tree.query([center_lon, center_lat], k=min(candidate_k, len(valid_worker_ids)))
+            query_indices = np.atleast_1d(query_indices).tolist()
+
+        candidate_pairs = []
+        for idx in query_indices:
+            wid = valid_worker_ids[int(idx)]
+            worker_node = worker_sim.worker_positions[wid][0]
+            dist = get_dist(worker_node, receiver_center_node)
+            if dist <= max_distance_m:
+                donor_center_dist = get_dist(worker_node, donor_center_node)
+                candidate_pairs.append((wid, dist, donor_center_dist))
+
+        if candidate_pairs:
+            candidate_pairs.sort(key=lambda item: (-item[2], item[1]))
+            return candidate_pairs
+
+        fallback_pairs = []
+        for wid in valid_worker_ids:
+            worker_node = worker_sim.worker_positions[wid][0]
+            dist = get_dist(worker_node, receiver_center_node)
+            if dist <= max_distance_m:
+                donor_center_dist = get_dist(worker_node, donor_center_node)
+                fallback_pairs.append((wid, dist, donor_center_dist))
+        fallback_pairs.sort(key=lambda item: (-item[2], item[1]))
+        return fallback_pairs[:candidate_k]
+
     for _ in range(max_iterations):
+        current_fairness_weight = _compute_adaptive_fairness_weight(
+            fairness_weight,
+            worker_counts,
+            effective_demand,
+            max_tasks_per_worker
+        )
         current_service = _compute_service_ratio(worker_counts, effective_demand, max_tasks_per_worker)
         current_utilities = {
             rid: _compute_center_utility(
@@ -171,14 +303,23 @@ def game_theoretic_predispatch_workers(
                 effective_demand,
                 max_tasks_per_worker,
                 current_service,
-                fairness_weight
+                current_fairness_weight,
+                idle_penalty,
+                congestion_penalty
             )
             for rid in region_ids
         }
-        current_potential = _compute_potential(worker_counts, effective_demand, max_tasks_per_worker, fairness_weight)
+        current_potential = _compute_potential(
+            worker_counts,
+            effective_demand,
+            max_tasks_per_worker,
+            current_fairness_weight,
+            idle_penalty,
+            congestion_penalty
+        )
 
         best_move = None
-        best_gain = 0.0
+        best_gain = potential_gain_epsilon
 
         shortage_regions = sorted(
             region_ids,
@@ -195,69 +336,84 @@ def game_theoretic_predispatch_workers(
 
             receiver_center = centers[receiver]
             for donor in region_ids:
-                if donor == receiver or not donor_can_send(donor):
+                if donor == receiver or not donor_can_send(donor, receiver):
                     continue
 
-                best_worker_for_pair = None
-                best_distance_for_pair = float('inf')
-                for wid in movable_workers[donor]:
-                    worker_node = worker_sim.worker_positions[wid][0]
-                    dist = get_dist(worker_node, receiver_center)
-                    if dist <= max_distance_m and dist < best_distance_for_pair:
-                        best_distance_for_pair = dist
-                        best_worker_for_pair = wid
-
-                if best_worker_for_pair is None:
+                candidate_workers = get_candidate_workers(donor, receiver)
+                if not candidate_workers:
                     continue
 
-                simulated_counts = worker_counts.copy()
-                simulated_counts[donor] -= 1
-                simulated_counts[receiver] += 1
+                for best_worker_for_pair, best_distance_for_pair, donor_center_dist_for_pair in candidate_workers:
+                    simulated_counts = worker_counts.copy()
+                    simulated_counts[donor] -= 1
+                    simulated_counts[receiver] += 1
 
-                new_service = _compute_service_ratio(simulated_counts, effective_demand, max_tasks_per_worker)
-                donor_old_utility = current_utilities[donor]
-                receiver_old_utility = current_utilities[receiver]
-                donor_new_utility = _compute_center_utility(
-                    donor,
-                    simulated_counts,
-                    effective_demand,
-                    max_tasks_per_worker,
-                    new_service,
-                    fairness_weight
-                )
-                receiver_new_utility = _compute_center_utility(
-                    receiver,
-                    simulated_counts,
-                    effective_demand,
-                    max_tasks_per_worker,
-                    new_service,
-                    fairness_weight
-                )
+                    simulated_fairness_weight = _compute_adaptive_fairness_weight(
+                        fairness_weight,
+                        simulated_counts,
+                        effective_demand,
+                        max_tasks_per_worker
+                    )
+                    new_service = _compute_service_ratio(simulated_counts, effective_demand, max_tasks_per_worker)
+                    donor_old_utility = current_utilities[donor]
+                    receiver_old_utility = current_utilities[receiver]
+                    donor_new_utility = _compute_center_utility(
+                        donor,
+                        simulated_counts,
+                        effective_demand,
+                        max_tasks_per_worker,
+                        new_service,
+                        simulated_fairness_weight,
+                        idle_penalty,
+                        congestion_penalty
+                    )
+                    receiver_new_utility = _compute_center_utility(
+                        receiver,
+                        simulated_counts,
+                        effective_demand,
+                        max_tasks_per_worker,
+                        new_service,
+                        simulated_fairness_weight,
+                        idle_penalty,
+                        congestion_penalty
+                    )
 
-                receiver_gain = receiver_new_utility - receiver_old_utility
-                donor_drop = donor_old_utility - donor_new_utility
-                if receiver_gain < receiver_min_utility_gain:
-                    continue
-                if donor_drop > donor_max_utility_drop:
-                    continue
+                    receiver_gain = receiver_new_utility - receiver_old_utility
+                    donor_drop = donor_old_utility - donor_new_utility
+                    if receiver_gain < receiver_min_utility_gain:
+                        continue
+                    if donor_drop > donor_max_utility_drop:
+                        continue
 
-                move_cost = distance_penalty * (best_distance_for_pair / 1000.0)
-                new_potential = _compute_potential(simulated_counts, effective_demand, max_tasks_per_worker, fairness_weight)
-                potential_gain = new_potential - current_potential - move_cost
+                    move_cost = distance_penalty * (best_distance_for_pair / 1000.0)
+                    remote_bonus = remote_worker_bonus * (donor_center_dist_for_pair / 1000.0)
+                    new_potential = _compute_potential(
+                        simulated_counts,
+                        effective_demand,
+                        max_tasks_per_worker,
+                        simulated_fairness_weight,
+                        idle_penalty,
+                        congestion_penalty,
+                        distance_cost=max(0.0, move_cost - remote_bonus)
+                    )
+                    potential_gain = new_potential - current_potential
 
-                if potential_gain > best_gain:
-                    best_gain = potential_gain
-                    best_move = {
-                        'wid': best_worker_for_pair,
-                        'from_region': donor,
-                        'to_region': receiver,
-                        'distance_to_target_center': best_distance_for_pair,
-                        'receiver_gain': receiver_gain,
-                        'donor_drop': donor_drop,
-                        'potential_gain': potential_gain
-                    }
+                    if potential_gain > best_gain:
+                        best_gain = potential_gain
+                        best_move = {
+                            'wid': best_worker_for_pair,
+                            'from_region': donor,
+                            'to_region': receiver,
+                            'distance_to_target_center': best_distance_for_pair,
+                            'distance_from_donor_center': donor_center_dist_for_pair,
+                            'receiver_gain': receiver_gain,
+                            'donor_drop': donor_drop,
+                            'potential_gain': potential_gain,
+                            'adaptive_fairness_weight': simulated_fairness_weight,
+                            'remote_bonus': remote_bonus
+                        }
 
-        if best_move is None or best_gain <= 1e-9:
+        if best_move is None or best_gain <= potential_gain_epsilon:
             break
 
         wid = best_move['wid']
@@ -280,7 +436,9 @@ def game_theoretic_predispatch_workers(
             effective_demand,
             max_tasks_per_worker,
             final_service,
-            fairness_weight
+            fairness_weight,
+            idle_penalty,
+            congestion_penalty
         )
         for rid in region_ids
     }

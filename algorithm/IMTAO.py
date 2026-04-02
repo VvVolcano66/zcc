@@ -1,58 +1,98 @@
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
-import copy
-from typing import List, Dict
 
 import config
 
 
+IMTAO_MODE_BDC = "bdc"
+IMTAO_MODE_DC = "dc"
+IMTAO_MODE_WO_C = "wo_c"
+IMTAO_SUPPORTED_MODES = {IMTAO_MODE_BDC, IMTAO_MODE_DC, IMTAO_MODE_WO_C}
+
+IMTAO_SELECT_LOWEST_RHO = "lowest_rho"
+IMTAO_SELECT_RANDOM = "random"
+IMTAO_SUPPORTED_SELECTIONS = {IMTAO_SELECT_LOWEST_RHO, IMTAO_SELECT_RANDOM}
+
+
+@dataclass(eq=False)
 class Task:
-    def __init__(self, t_id, lon, lat, expire_time, release_time=0, node=None):
+    id: str
+    lon: float
+    lat: float
+    e: float
+    r: float = 0.0
+    node: Optional[object] = None
+
+    def __init__(
+        self,
+        t_id,
+        lon,
+        lat,
+        expire_time=None,
+        release_time=0.0,
+        node=None,
+        e=None,
+        r=None,
+    ):
         self.id = t_id
         self.lon = lon
         self.lat = lat
-        self.e = expire_time  # 论文中的 s.e (expiration time)
-        self.r = release_time
+        self.e = expire_time if expire_time is not None else e
+        if self.e is None:
+            raise ValueError("Task requires expire_time or e")
+        self.r = release_time if r is None else r
         self.node = node
 
 
+@dataclass(eq=False)
 class Worker:
-    def __init__(self, w_id, lon, lat, max_t=4, node=None):
+    id: str
+    lon: float
+    lat: float
+    maxT: int = 4
+    node: Optional[object] = None
+
+    def __init__(
+        self,
+        w_id,
+        lon,
+        lat,
+        max_t=None,
+        node=None,
+        maxT=None,
+    ):
         self.id = w_id
         self.lon = lon
         self.lat = lat
-        self.maxT = max_t  # 论文中的 w.maxT (task capacity)
+        self.maxT = max_t if max_t is not None else (maxT if maxT is not None else 4)
         self.node = node
 
 
+@dataclass(eq=False)
 class Center:
-    def __init__(self, c_id, lon, lat, node=None):
-        self.id = c_id
-        self.lon = lon
-        self.lat = lat
-        self.node = node
-        self.S = []  # 分配给该中心的任务 c.S
-        self.W = []  # 该中心的原始工人 c.W
-
-        # 算法运行过程中的状态
-        self.S_left = []  # 未分配的任务 c.S_left
-        self.W_left = []  # 未使用的工人 c.W_left
-        self.A = []  # 任务分配结果 A(c) -> [(worker, [task1, task2...])]
-        self.rho = 0.0  # 任务分配率 \rho_i
+    id: int
+    lon: float
+    lat: float
+    node: Optional[object] = None
+    S: List[Task] = field(default_factory=list)
+    W: List[Worker] = field(default_factory=list)
+    S_left: List[Task] = field(default_factory=list)
+    W_left: List[Worker] = field(default_factory=list)
+    A: List[Tuple[Worker, List[Task]]] = field(default_factory=list)
+    rho: float = 0.0
+    borrowed_workers: List[Worker] = field(default_factory=list)
 
 
 def calculate_travel_time(lon1, lat1, lon2, lat2, speed=None):
-    """
-    计算两点间的行驶时间
-    💡 核心修复：坐标系投影自适应！
-    """
     if speed is None:
         speed = config.WORKER_SPEED_MS
 
-    # 如果坐标绝对值大于 180，说明传入的已经是投影后的米制坐标 (如 UTM)，无需经纬度换算
     if abs(lon1) > 180 or abs(lat1) > 90:
         dist_m = np.sqrt((lon1 - lon2) ** 2 + (lat1 - lat2) ** 2)
     else:
-        # 传入的是标准 GPS 经纬度 (EPSG:4326)，需要乘以地球赤道常数换算成米
         mean_lat_rad = np.radians((lat1 + lat2) / 2.0)
         dx = (lon1 - lon2) * 111320.0 * np.cos(mean_lat_rad)
         dy = (lat1 - lat2) * 111320.0
@@ -62,15 +102,34 @@ def calculate_travel_time(lon1, lat1, lon2, lat2, speed=None):
 
 
 class IMTAO_Framework:
-    def __init__(self, centers: List[Center], tasks: List[Task], workers: List[Worker], travel_time_func=None):
+    """
+    IMTAO task-assignment framework.
+
+    The paper includes a Voronoi-style initial partition. In this project we keep the
+    repository's existing region partition and only reuse the paper's assignment and
+    collaboration stages unless repartition=True is explicitly requested.
+    """
+
+    def __init__(
+        self,
+        centers: List[Center],
+        tasks: List[Task],
+        workers: List[Worker],
+        travel_time_func=None,
+        slot_duration_seconds: float = float("inf"),
+        random_seed: int = 42,
+    ):
         self.centers = centers
         self.tasks = tasks
         self.workers = workers
         self.travel_time_func = travel_time_func
+        self.slot_duration_seconds = slot_duration_seconds
+        self.rng = random.Random(random_seed)
+        self.worker_home_center: Dict[str, Center] = {}
 
     def _travel_time(self, src, dst) -> float:
-        src_node = getattr(src, 'node', None)
-        dst_node = getattr(dst, 'node', None)
+        src_node = getattr(src, "node", None)
+        dst_node = getattr(dst, "node", None)
         if self.travel_time_func is not None and src_node is not None and dst_node is not None:
             travel_t = self.travel_time_func(src_node, dst_node)
             if travel_t is not None:
@@ -89,162 +148,286 @@ class IMTAO_Framework:
                     u_rho += abs(rhos[i] - rhos[j])
         return u_rho / (len(self.centers) * (len(self.centers) - 1))
 
-    def _calculate_center_utility(self, center: Center) -> float:
-        """
-        Paper Eq. (5): UUP(ci, BWS(ci)) = rho_i - average_{j != i} rho_j
-        """
+    def _calculate_center_utility_from_rho(self, center_id: int, rho_value: float) -> float:
         if len(self.centers) <= 1:
-            return center.rho
+            return rho_value
 
-        other_rhos = [c.rho for c in self.centers if c.id != center.id]
-        return center.rho - sum(other_rhos) / len(other_rhos)
+        other_rhos = [c.rho for c in self.centers if c.id != center_id]
+        if not other_rhos:
+            return rho_value
+        return rho_value - sum(other_rhos) / len(other_rhos)
 
-    def _select_best_worker_for_center(self, center: Center, available_workers: List[Worker]):
-        """
-        Best-response step in the paper:
-        evaluate each candidate borrowed worker, re-run the sequential
-        assignment for the recipient center, and keep the worker that
-        maximizes the recipient center's utility.
-        """
+    def _calculate_center_utility(self, center: Center) -> float:
+        return self._calculate_center_utility_from_rho(center.id, center.rho)
+
+    def _compute_rho(self, center: Center, assignments: Sequence[Tuple[Worker, List[Task]]]) -> float:
+        if not center.S:
+            return 1.0
+        assigned_tasks = sum(len(task_seq) for _, task_seq in assignments)
+        return assigned_tasks / len(center.S)
+
+    def _clone_assignment_state(self, center: Center, borrowed_workers: Optional[List[Worker]] = None):
+        return {
+            "rho": center.rho,
+            "A": [(worker, list(task_seq)) for worker, task_seq in center.A],
+            "S_left": list(center.S_left),
+            "W_left": list(center.W_left),
+            "borrowed_workers": list(center.borrowed_workers if borrowed_workers is None else borrowed_workers),
+        }
+
+    def _apply_assignment_state(self, center: Center, state) -> None:
+        center.rho = state["rho"]
+        center.A = [(worker, list(task_seq)) for worker, task_seq in state["A"]]
+        center.S_left = list(state["S_left"])
+        center.W_left = list(state["W_left"])
+        center.borrowed_workers = list(state["borrowed_workers"])
+
+    def _find_nearest_feasible_task(
+        self,
+        center: Center,
+        current_ref,
+        current_time: float,
+        remaining_tasks: Sequence[Task],
+    ) -> Tuple[Optional[Task], Optional[float]]:
+        nearest_task = None
+        nearest_travel = None
+        nearest_finish = None
+        hard_deadline = self.slot_duration_seconds
+
+        for task in remaining_tasks:
+            travel_t = self._travel_time(current_ref, task)
+            if not np.isfinite(travel_t):
+                continue
+
+            finish_time = max(current_time + travel_t, task.r)
+            deadline = min(task.e, hard_deadline)
+            if finish_time > deadline:
+                continue
+
+            if nearest_task is None or travel_t < nearest_travel:
+                nearest_task = task
+                nearest_travel = travel_t
+                nearest_finish = finish_time
+
+        return nearest_task, nearest_finish
+
+    def _build_task_sequence(
+        self,
+        center: Center,
+        worker: Worker,
+        candidate_tasks: Sequence[Task],
+    ) -> Tuple[List[Task], float]:
+        current_time = self._travel_time(worker, center)
+        if not np.isfinite(current_time) or current_time > self.slot_duration_seconds:
+            return [], current_time
+
+        current_ref = center
+        remaining_tasks = list(candidate_tasks)
+        selected_tasks: List[Task] = []
+        round_load = 0
+
+        while remaining_tasks:
+            if round_load >= worker.maxT:
+                return_time = self._travel_time(current_ref, center)
+                if not np.isfinite(return_time) or current_time + return_time > self.slot_duration_seconds:
+                    break
+                current_time += return_time
+                current_ref = center
+                round_load = 0
+
+            nearest_task, next_finish_time = self._find_nearest_feasible_task(
+                center=center,
+                current_ref=current_ref,
+                current_time=current_time,
+                remaining_tasks=remaining_tasks,
+            )
+            if nearest_task is None:
+                break
+
+            selected_tasks.append(nearest_task)
+            remaining_tasks = [task for task in remaining_tasks if task.id != nearest_task.id]
+            current_time = next_finish_time
+            current_ref = nearest_task
+            round_load += 1
+
+        return selected_tasks, current_time
+
+    def _run_sequential_assignment(self, center: Center, workers_to_assign: Sequence[Worker]):
+        assignments: List[Tuple[Worker, List[Task]]] = []
+        remaining_tasks = list(center.S)
+        unused_workers: List[Worker] = []
+
+        workers_sorted = sorted(
+            workers_to_assign,
+            key=lambda worker: self._travel_time(worker, center),
+            reverse=True,
+        )
+
+        for worker in workers_sorted:
+            task_seq, _ = self._build_task_sequence(center, worker, remaining_tasks)
+            if task_seq:
+                assigned_ids = {task.id for task in task_seq}
+                remaining_tasks = [task for task in remaining_tasks if task.id not in assigned_ids]
+            else:
+                unused_workers.append(worker)
+            assignments.append((worker, task_seq))
+
+        rho = self._compute_rho(center, assignments)
+        return {
+            "rho": rho,
+            "A": assignments,
+            "S_left": remaining_tasks,
+            "W_left": unused_workers,
+        }
+
+    def _run_decomposed_assignment(self, center: Center, dispatched_worker: Worker):
+        remaining_tasks = list(center.S_left)
+        task_seq, _ = self._build_task_sequence(center, dispatched_worker, remaining_tasks)
+        if task_seq:
+            assigned_ids = {task.id for task in task_seq}
+            remaining_tasks = [task for task in remaining_tasks if task.id not in assigned_ids]
+
+        assignments = [(worker, list(task_seq_existing)) for worker, task_seq_existing in center.A]
+        assignments.append((dispatched_worker, task_seq))
+
+        unused_workers = [worker for worker in center.W_left if worker.id != dispatched_worker.id]
+        if not task_seq:
+            unused_workers.append(dispatched_worker)
+
+        rho = self._compute_rho(center, assignments)
+        return {
+            "rho": rho,
+            "A": assignments,
+            "S_left": remaining_tasks,
+            "W_left": unused_workers,
+        }
+
+    def _select_best_worker_for_center(
+        self,
+        center: Center,
+        available_workers: Sequence[Worker],
+        collaboration_mode: str,
+    ):
         best_worker = None
+        best_state = None
         best_utility = self._calculate_center_utility(center)
-        best_snapshot = None
-
-        original_state = (center.rho, copy.deepcopy(center.A), copy.deepcopy(center.S_left), copy.deepcopy(center.W_left))
 
         for worker in available_workers:
-            combined_workers = center.W + [worker]
-            self.algo2_sequential_assignment(center, combined_workers)
-            candidate_utility = self._calculate_center_utility(center)
+            if collaboration_mode == IMTAO_MODE_DC:
+                candidate_state = self._run_decomposed_assignment(center, worker)
+            else:
+                candidate_workers = list(center.W) + list(center.borrowed_workers) + [worker]
+                candidate_state = self._run_sequential_assignment(center, candidate_workers)
 
+            candidate_utility = self._calculate_center_utility_from_rho(center.id, candidate_state["rho"])
             if candidate_utility > best_utility:
                 best_worker = worker
                 best_utility = candidate_utility
-                best_snapshot = (
-                    center.rho,
-                    copy.deepcopy(center.A),
-                    copy.deepcopy(center.S_left),
-                    copy.deepcopy(center.W_left)
-                )
+                best_state = {
+                    **candidate_state,
+                    "borrowed_workers": list(center.borrowed_workers) + [worker],
+                }
 
-        center.rho, center.A, center.S_left, center.W_left = original_state
-        return best_worker, best_snapshot
+        return best_worker, best_state
 
-    # =====================================================================
-    # Algorithm 1: Voronoi-based Service Area Partition
-    # =====================================================================
     def algo1_voronoi_partition(self):
-        for c in self.centers:
-            c.S = []
-            c.W = []
+        for center in self.centers:
+            center.S = []
+            center.W = []
 
-        for s in self.tasks:
-            nearest_c = min(self.centers, key=lambda c: self._travel_time(s, c))
-            nearest_c.S.append(s)
+        for task in self.tasks:
+            nearest_center = min(self.centers, key=lambda center: self._travel_time(task, center))
+            nearest_center.S.append(task)
 
-        for w in self.workers:
-            nearest_c = min(self.centers, key=lambda c: self._travel_time(w, c))
-            nearest_c.W.append(w)
+        for worker in self.workers:
+            nearest_center = min(self.centers, key=lambda center: self._travel_time(worker, center))
+            nearest_center.W.append(worker)
+            self.worker_home_center[worker.id] = nearest_center
 
-        for c in self.centers:
-            c.S_left = c.S.copy()
-            c.W_left = c.W.copy()
-            c.A = []
-            c.rho = 0.0
+        for center in self.centers:
+            center.S_left = list(center.S)
+            center.W_left = list(center.W)
+            center.A = []
+            center.rho = 0.0
+            center.borrowed_workers = []
 
-    def initialize_existing_partition(self, center_to_tasks: Dict[int, List[Task]], center_to_workers: Dict[int, List[Worker]]):
-        for c in self.centers:
-            c.S = list(center_to_tasks.get(c.id, []))
-            c.W = list(center_to_workers.get(c.id, []))
-            c.S_left = c.S.copy()
-            c.W_left = c.W.copy()
-            c.A = []
-            c.rho = 0.0
+    def initialize_existing_partition(
+        self,
+        center_to_tasks: Dict[int, List[Task]],
+        center_to_workers: Dict[int, List[Worker]],
+    ):
+        self.worker_home_center = {}
+        for center in self.centers:
+            center.S = list(center_to_tasks.get(center.id, []))
+            center.W = list(center_to_workers.get(center.id, []))
+            center.S_left = list(center.S)
+            center.W_left = list(center.W)
+            center.A = []
+            center.rho = 0.0
+            center.borrowed_workers = []
+            for worker in center.W:
+                self.worker_home_center[worker.id] = center
 
-    # =====================================================================
-    # Algorithm 2: Sequential Task Assignment Algorithm
-    # =====================================================================
-    def algo2_sequential_assignment(self, center: Center, workers_to_assign: List[Worker]):
-        center.A = []
-        center.S_left = center.S.copy()
-        used_workers = []
-
-        # 按照工人到中心的距离降序排列 (优先分配边缘工人)
-        workers_sorted = sorted(
-            workers_to_assign,
-            key=lambda w: self._travel_time(w, center),
-            reverse=True
+    def algo2_sequential_assignment(self, center: Center, workers_to_assign: Optional[Sequence[Worker]] = None):
+        candidate_workers = center.W if workers_to_assign is None else list(workers_to_assign)
+        assignment_state = self._run_sequential_assignment(center, candidate_workers)
+        self._apply_assignment_state(
+            center,
+            {
+                **assignment_state,
+                "borrowed_workers": list(center.borrowed_workers),
+            },
         )
 
-        for w in workers_sorted:
-            S_w = []
-            current_time = self._travel_time(w, center)
-            current_ref = center
+    def algo3_game_theoretic_collaboration(
+        self,
+        repartition: bool = False,
+        collaboration_mode: str = IMTAO_MODE_BDC,
+        center_selection: str = IMTAO_SELECT_LOWEST_RHO,
+    ):
+        if collaboration_mode not in IMTAO_SUPPORTED_MODES:
+            raise ValueError(f"Unsupported IMTAO collaboration mode: {collaboration_mode}")
+        if center_selection not in IMTAO_SUPPORTED_SELECTIONS:
+            raise ValueError(f"Unsupported IMTAO center selection mode: {center_selection}")
 
-            while len(S_w) < w.maxT and len(center.S_left) > 0:
-                valid_tasks = []
-                for s in center.S_left:
-                    travel_t = self._travel_time(current_ref, s)
-                    finish_time = max(current_time + travel_t, s.r)
-                    if finish_time <= s.e:
-                        valid_tasks.append((s, travel_t, finish_time))
-
-                if not valid_tasks:
-                    break
-
-                nearest_task, best_travel_time, best_finish_time = min(valid_tasks, key=lambda x: x[1])
-
-                center.S_left.remove(nearest_task)
-                S_w.append(nearest_task)
-                current_time = best_finish_time
-                current_ref = nearest_task
-
-            if len(S_w) > 0:
-                center.A.append((w, S_w))
-                used_workers.append(w)
-
-        center.W_left = [w for w in workers_to_assign if w not in used_workers]
-
-        assigned_tasks_count = sum(len(tasks) for worker, tasks in center.A)
-        if len(center.S) > 0:
-            center.rho = assigned_tasks_count / len(center.S)
-        else:
-            center.rho = 1.0
-
-    # =====================================================================
-    # Algorithm 3: Game-Theoretic Multi-Center Collaboration
-    # =====================================================================
-    def algo3_game_theoretic_collaboration(self, repartition: bool = True):
         if repartition:
             self.algo1_voronoi_partition()
-        for c in self.centers:
-            self.algo2_sequential_assignment(c, c.W)
 
-        C_prime = [c for c in self.centers if c.rho < 1.0]
-        worker_owner = {w.id: c for c in self.centers for w in c.W}
+        for center in self.centers:
+            center.borrowed_workers = []
+            self.algo2_sequential_assignment(center, center.W)
 
-        iteration = 1
-        while True:
-            global_W_left = [w for c in self.centers for w in c.W_left]
-            if len(C_prime) == 0 or len(global_W_left) == 0:
-                break
+        if collaboration_mode == IMTAO_MODE_WO_C:
+            total_assigned = sum(sum(len(task_seq) for _, task_seq in center.A) for center in self.centers)
+            return total_assigned, self._calculate_collaboration_unfairness()
 
-            c_i = min(C_prime, key=lambda c: c.rho)
+        pending_centers = [center for center in self.centers if center.rho < 1.0]
+        global_w_left = [worker for center in self.centers for worker in center.W_left]
 
-            w_move, best_snapshot = self._select_best_worker_for_center(c_i, global_W_left)
-
-            if w_move is not None and best_snapshot is not None:
-                c_i.rho, c_i.A, c_i.S_left, c_i.W_left = best_snapshot
-                if all(existing.id != w_move.id for existing in c_i.W):
-                    c_i.W.append(w_move)
-                donor_center = worker_owner.get(w_move.id)
-                if donor_center is not None:
-                    donor_center.W_left = [w for w in donor_center.W_left if w.id != w_move.id]
+        while pending_centers and global_w_left:
+            if center_selection == IMTAO_SELECT_RANDOM:
+                current_center = self.rng.choice(pending_centers)
             else:
-                C_prime.remove(c_i)
+                current_center = min(pending_centers, key=lambda center: (center.rho, center.id))
 
-            iteration += 1
+            worker_to_move, best_state = self._select_best_worker_for_center(
+                current_center,
+                global_w_left,
+                collaboration_mode=collaboration_mode,
+            )
 
-        u_rho = self._calculate_collaboration_unfairness()
-        total_assigned = sum(sum(len(tasks) for w, tasks in c.A) for c in self.centers)
-        return total_assigned, u_rho
+            if worker_to_move is None or best_state is None or best_state["rho"] <= current_center.rho:
+                pending_centers = [center for center in pending_centers if center.id != current_center.id]
+                continue
+
+            self._apply_assignment_state(current_center, best_state)
+            global_w_left = [worker for worker in global_w_left if worker.id != worker_to_move.id]
+
+            donor_center = self.worker_home_center.get(worker_to_move.id)
+            if donor_center is not None:
+                donor_center.W_left = [worker for worker in donor_center.W_left if worker.id != worker_to_move.id]
+
+            pending_centers = [center for center in self.centers if center.rho < 1.0]
+
+        total_assigned = sum(sum(len(task_seq) for _, task_seq in center.A) for center in self.centers)
+        return total_assigned, self._calculate_collaboration_unfairness()

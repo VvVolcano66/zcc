@@ -35,18 +35,21 @@ class MCTGNet(nn.Module):
     3. Residual delta prediction and recent-trend gating preserve local bursts.
     """
 
-    def __init__(self, seq_len, grid_size=(5, 5), hidden_dim=64, num_centers=5, num_time_slots=8):
+    def __init__(self, seq_len, grid_size=(5, 5), hidden_dim=64, num_centers=5, num_time_slots=8, num_weekdays=7):
         super().__init__()
         self.seq_len = seq_len
         self.grid_size = grid_size
         self.hidden_dim = hidden_dim
         self.num_centers = num_centers
         self.num_time_slots = num_time_slots
+        self.num_weekdays = num_weekdays
 
         self.spatial_encoder = nn.Sequential(
             nn.Conv2d(1, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
             nn.ReLU(),
             nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU()
         )
 
@@ -69,26 +72,43 @@ class MCTGNet(nn.Module):
         self.center_key = nn.Linear(hidden_dim, hidden_dim)
         self.center_value = nn.Linear(hidden_dim, hidden_dim)
         self.time_embedding = nn.Embedding(num_time_slots, hidden_dim)
+        self.weekday_embedding = nn.Embedding(num_weekdays, hidden_dim)
 
         self.periodic_encoder = nn.Sequential(
             nn.Conv2d(1, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
             nn.ReLU(),
             nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU()
         )
 
         self.trend_encoder = nn.Sequential(
             nn.Conv2d(1, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
             nn.ReLU(),
-            nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1)
+            nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim)
         )
 
         self.token_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.Linear(hidden_dim * 5, hidden_dim * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1)
+        )
+        self.periodic_token_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+        self.periodic_global_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+        self.temporal_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU()
         )
 
         self.delta_head = nn.Linear(hidden_dim, 1)
@@ -99,7 +119,7 @@ class MCTGNet(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, periodic_x=None, slot_ids=None):
+    def forward(self, x, periodic_x=None, weekly_x=None, slot_ids=None, weekday_ids=None):
         # x: (B, T, H, W)
         batch_size, seq_len, height, width = x.shape
 
@@ -133,11 +153,13 @@ class MCTGNet(nn.Module):
         last_frame = x[:, -1]
         grid_tokens = last_feat.flatten(2).transpose(1, 2)  # (B, N, C)
 
+        periodic_count = 0
         if periodic_x is None:
             periodic_frame = torch.zeros_like(last_frame)
             periodic_tokens = torch.zeros_like(grid_tokens)
             periodic_global = torch.zeros(batch_size, self.hidden_dim, device=x.device)
         else:
+            periodic_count += 1
             if periodic_x.dim() == 4:
                 periodic_frame = periodic_x[:, 0]
             elif periodic_x.dim() == 3:
@@ -147,6 +169,22 @@ class MCTGNet(nn.Module):
             periodic_feat = self.periodic_encoder(periodic_frame.unsqueeze(1))
             periodic_tokens = periodic_feat.flatten(2).transpose(1, 2)
             periodic_global = F.adaptive_avg_pool2d(periodic_feat, 1).view(batch_size, self.hidden_dim)
+
+        if weekly_x is None:
+            weekly_frame = torch.zeros_like(last_frame)
+            weekly_tokens = torch.zeros_like(grid_tokens)
+            weekly_global = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+        else:
+            periodic_count += 1
+            if weekly_x.dim() == 4:
+                weekly_frame = weekly_x[:, 0]
+            elif weekly_x.dim() == 3:
+                weekly_frame = weekly_x
+            else:
+                raise ValueError("weekly_x must have shape (B, 1, H, W) or (B, H, W)")
+            weekly_feat = self.periodic_encoder(weekly_frame.unsqueeze(1))
+            weekly_tokens = weekly_feat.flatten(2).transpose(1, 2)
+            weekly_global = F.adaptive_avg_pool2d(weekly_feat, 1).view(batch_size, self.hidden_dim)
 
         if seq_len >= 2:
             trend_input = (x[:, -1] - x[:, -2]).unsqueeze(1)
@@ -162,20 +200,33 @@ class MCTGNet(nn.Module):
         center_message = torch.matmul(attn_weights, values)  # (B, N, C)
 
         global_message = global_context.view(batch_size, 1, self.hidden_dim).expand_as(grid_tokens)
+        periodic_message = self.periodic_token_fusion(torch.cat([periodic_tokens, weekly_tokens], dim=-1))
+        periodic_global_message = self.periodic_global_fusion(torch.cat([periodic_global, weekly_global], dim=-1))
+
         if slot_ids is None:
-            time_message = torch.zeros_like(grid_tokens)
+            time_embed = torch.zeros(batch_size, 1, self.hidden_dim, device=x.device)
         else:
             time_embed = self.time_embedding(slot_ids).view(batch_size, 1, self.hidden_dim)
-            time_message = time_embed.expand_as(grid_tokens)
+        if weekday_ids is None:
+            weekday_embed = torch.zeros(batch_size, 1, self.hidden_dim, device=x.device)
+        else:
+            weekday_embed = self.weekday_embedding(weekday_ids).view(batch_size, 1, self.hidden_dim)
+        time_message = self.temporal_fusion(torch.cat([time_embed, weekday_embed], dim=-1)).expand_as(grid_tokens)
         trend_gate = torch.sigmoid(trend_feat)
 
-        fused_tokens = torch.cat([grid_tokens, center_message, global_message, periodic_tokens, time_message], dim=-1)
+        fused_tokens = torch.cat([grid_tokens, center_message, global_message, periodic_message, time_message], dim=-1)
         fused_tokens = self.token_fusion(fused_tokens)
         fused_tokens = fused_tokens * (1.0 + trend_gate)
 
         delta = self.delta_head(fused_tokens).squeeze(-1).view(batch_size, height, width)
         global_flat = global_context.view(batch_size, self.hidden_dim)
-        periodic_alpha = self.periodic_gate(torch.cat([global_flat, periodic_global], dim=-1)).view(batch_size, 1, 1)
-        base = last_frame + periodic_alpha * (periodic_frame - last_frame)
+        periodic_alpha = self.periodic_gate(torch.cat([global_flat, periodic_global_message], dim=-1)).view(batch_size, 1, 1)
+        if periodic_count == 0:
+            reference_frame = last_frame
+        elif periodic_count == 1:
+            reference_frame = periodic_frame if periodic_x is not None else weekly_frame
+        else:
+            reference_frame = 0.5 * (periodic_frame + weekly_frame)
+        base = last_frame + periodic_alpha * (reference_frame - last_frame)
         pred = base + delta
         return pred
