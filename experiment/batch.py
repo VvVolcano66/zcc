@@ -11,6 +11,7 @@ from algorithm.Greedy import greedy_assignment_with_center_pickup
 from algorithm.PredictiveDispatch import predict_next_slot_demand, predispatch_workers_for_next_slot
 from algorithm.GameTheoreticPredictiveDispatch import game_theoretic_predispatch_workers
 from predicate.MCTGNetDispatchPredictor import MCTGNetDispatchPredictor
+from predicate.CenterPatternLSTMDispatchPredictor import CenterPatternLSTMDispatchPredictor
 from tool.TaskWorkerToMap import WorkerSimulator
 from tool.data_loader import get_real_road_network
 from tool.map_algorithms import run_kmeans_baseline, run_rcc_algorithm, find_region_centers
@@ -43,6 +44,7 @@ DEFAULT_WORKER_SAMPLE_SEED = int(getattr(config, 'EXPERIMENT_WORKER_SAMPLE_SEED'
 
 _SIMULATION_CONTEXT_CACHE = {}
 _MCTG_PREDICTOR_CACHE = {}
+_CENTER_LSTM_PREDICTOR_CACHE = {}
 
 
 def build_prediction_date_split(test_date: str, data_dir: str):
@@ -205,6 +207,9 @@ def _get_or_train_mctg_predictor(
         getattr(config, 'MCTGNET_DISPATCH_MAX_EPOCHS', 300),
         getattr(config, 'MCTGNET_DISPATCH_PATIENCE', 50),
         getattr(config, 'MCTGNET_DISPATCH_LR', 0.0005),
+        getattr(config, 'MCTGNET_DISPATCH_USE_LSTM', True),
+        getattr(config, 'MCTGNET_DISPATCH_LSTM_LAYERS', 1),
+        getattr(config, 'MCTGNET_DISPATCH_LSTM_DROPOUT', 0.1),
     )
     if predictor_key in _MCTG_PREDICTOR_CACHE:
         print("   - Reusing cached MCTGNet predictor")
@@ -237,7 +242,15 @@ def _get_or_train_mctg_predictor(
         center_loss_weight=getattr(config, 'MCTGNET_DISPATCH_CENTER_LOSS_WEIGHT', 0.35),
         center_hotspot_alpha=getattr(config, 'MCTGNET_DISPATCH_CENTER_HOTSPOT_ALPHA', 1.5),
         center_underpredict_alpha=getattr(config, 'MCTGNET_DISPATCH_CENTER_UNDERPREDICT_ALPHA', 2.0),
-        center_underpredict_power=getattr(config, 'MCTGNET_DISPATCH_CENTER_UNDERPREDICT_POWER', 1.0)
+        center_underpredict_power=getattr(config, 'MCTGNET_DISPATCH_CENTER_UNDERPREDICT_POWER', 1.0),
+        use_lstm_branch=getattr(config, 'MCTGNET_DISPATCH_USE_LSTM', True),
+        lstm_layers=getattr(config, 'MCTGNET_DISPATCH_LSTM_LAYERS', 1),
+        lstm_dropout=getattr(config, 'MCTGNET_DISPATCH_LSTM_DROPOUT', 0.1),
+        refit_on_all_pretarget=getattr(config, 'MCTGNET_DISPATCH_REFIT_ON_ALL_PRETARGET', True),
+        use_online_adaptation=getattr(config, 'MCTGNET_DISPATCH_USE_ONLINE_ADAPTATION', True),
+        online_bias_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_BIAS_ALPHA', 0.30),
+        online_slot_bias_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_SLOT_BIAS_ALPHA', 0.40),
+        online_scale_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_SCALE_ALPHA', 0.15),
     )
     predictor.fit(
         train_dates=train_dates,
@@ -248,6 +261,81 @@ def _get_or_train_mctg_predictor(
     )
     print("   - MCTGNet predictor ready")
     _MCTG_PREDICTOR_CACHE[predictor_key] = predictor
+    return predictor
+
+
+def _get_or_train_center_lstm_predictor(
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        coords,
+        nodes,
+        rcc_partition,
+        centers
+):
+    predictor_key = (
+        test_date,
+        time_slot_minutes,
+        getattr(config, 'CENTER_LSTM_DISPATCH_SEQ_LEN', 32),
+        getattr(config, 'CENTER_LSTM_DISPATCH_PRE_LEN', 1),
+        getattr(config, 'CENTER_LSTM_DISPATCH_MAX_EPOCHS', 400),
+        getattr(config, 'CENTER_LSTM_DISPATCH_PATIENCE', 60),
+        getattr(config, 'CENTER_LSTM_DISPATCH_LR', 0.0005),
+        getattr(config, 'CENTER_LSTM_DISPATCH_HIDDEN_DIM', 128),
+        getattr(config, 'CENTER_LSTM_DISPATCH_LSTM_LAYERS', 2),
+        getattr(config, 'CENTER_LSTM_DISPATCH_DROPOUT', 0.15),
+        getattr(config, 'CENTER_LSTM_DISPATCH_HOTSPOT_ALPHA', 2.5),
+        getattr(config, 'CENTER_LSTM_DISPATCH_UNDERPREDICT_ALPHA', 3.0),
+        getattr(config, 'CENTER_LSTM_DISPATCH_UNDERPREDICT_POWER', 1.0),
+    )
+    if predictor_key in _CENTER_LSTM_PREDICTOR_CACHE:
+        print("   - Reusing cached CenterPatternLSTM predictor")
+        return _CENTER_LSTM_PREDICTOR_CACHE[predictor_key]
+
+    dispatch_data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'task')
+    train_dates, val_dates = build_prediction_date_split(test_date, dispatch_data_dir)
+    print(f"\n[Phase 4.5] Training CenterPatternLSTM dispatch predictor for {test_date} ...")
+    print(f"   - Train Dates: {train_dates[0]} ~ {train_dates[-1]}")
+    print(f"   - Val Dates:   {val_dates[0]} ~ {val_dates[-1]}")
+    print(f"   - Train Days:  {len(train_dates)} | Val Days: {len(val_dates)}")
+    print(f"   - Target Date: {test_date}")
+    print("   - Context Window: full-day center demand patterns with short-term autoregression")
+
+    predictor = CenterPatternLSTMDispatchPredictor(
+        data_dir=dispatch_data_dir,
+        coords=coords,
+        nodes=nodes,
+        partition=rcc_partition,
+        centers=centers,
+        time_interval=time_slot_minutes,
+        seq_len=getattr(config, 'CENTER_LSTM_DISPATCH_SEQ_LEN', 32),
+        pre_len=getattr(config, 'CENTER_LSTM_DISPATCH_PRE_LEN', 1),
+        max_epochs=getattr(config, 'CENTER_LSTM_DISPATCH_MAX_EPOCHS', 400),
+        patience=getattr(config, 'CENTER_LSTM_DISPATCH_PATIENCE', 60),
+        lr=getattr(config, 'CENTER_LSTM_DISPATCH_LR', 0.0005),
+        hidden_dim=getattr(config, 'CENTER_LSTM_DISPATCH_HIDDEN_DIM', 128),
+        lstm_layers=getattr(config, 'CENTER_LSTM_DISPATCH_LSTM_LAYERS', 2),
+        dropout=getattr(config, 'CENTER_LSTM_DISPATCH_DROPOUT', 0.15),
+        log_interval=getattr(config, 'CENTER_LSTM_DISPATCH_LOG_INTERVAL', 20),
+        hotspot_alpha=getattr(config, 'CENTER_LSTM_DISPATCH_HOTSPOT_ALPHA', 2.5),
+        underpredict_alpha=getattr(config, 'CENTER_LSTM_DISPATCH_UNDERPREDICT_ALPHA', 3.0),
+        underpredict_power=getattr(config, 'CENTER_LSTM_DISPATCH_UNDERPREDICT_POWER', 1.0),
+        refit_on_all_pretarget=getattr(config, 'CENTER_LSTM_DISPATCH_REFIT_ON_ALL_PRETARGET', True),
+        use_online_adaptation=getattr(config, 'CENTER_LSTM_DISPATCH_USE_ONLINE_ADAPTATION', True),
+        online_bias_alpha=getattr(config, 'CENTER_LSTM_DISPATCH_ONLINE_BIAS_ALPHA', 0.30),
+        online_slot_bias_alpha=getattr(config, 'CENTER_LSTM_DISPATCH_ONLINE_SLOT_BIAS_ALPHA', 0.40),
+        online_scale_alpha=getattr(config, 'CENTER_LSTM_DISPATCH_ONLINE_SCALE_ALPHA', 0.15),
+    )
+    predictor.fit(
+        train_dates=train_dates,
+        val_dates=val_dates,
+        target_date=test_date,
+        history_start_hour=test_start_hour,
+        end_hour=test_end_hour
+    )
+    print("   - CenterPatternLSTM predictor ready")
+    _CENTER_LSTM_PREDICTOR_CACHE[predictor_key] = predictor
     return predictor
 
 
@@ -566,12 +654,12 @@ def run_online_simulation_with_center_pickup(
 
     num_slots = compare_slots
     observed_arrivals_history = []
-    mctg_dispatch_predictor = None
+    dispatch_predictor = None
     prediction_abs_errors = []
     prediction_sq_errors = []
 
     if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet']:
-        mctg_dispatch_predictor = _get_or_train_mctg_predictor(
+        dispatch_predictor = _get_or_train_mctg_predictor(
             test_date=test_date,
             test_start_hour=test_start_hour,
             test_end_hour=test_end_hour,
@@ -581,6 +669,20 @@ def run_online_simulation_with_center_pickup(
             rcc_partition=rcc_partition,
             centers=centers
         )
+    elif algo_name.lower() in ['predictive_center_lstm', 'predictive_game_center_lstm']:
+        dispatch_predictor = _get_or_train_center_lstm_predictor(
+            test_date=test_date,
+            test_start_hour=test_start_hour,
+            test_end_hour=test_end_hour,
+            time_slot_minutes=time_slot_minutes,
+            coords=context['coords'],
+            nodes=context['nodes'],
+            rcc_partition=rcc_partition,
+            centers=centers
+        )
+
+    if dispatch_predictor is not None and hasattr(dispatch_predictor, 'reset_online_state'):
+        dispatch_predictor.reset_online_state()
 
     for slot_idx in range(num_slots):
         slot_start_minute = slot_idx * time_slot_minutes
@@ -599,28 +701,20 @@ def run_online_simulation_with_center_pickup(
         current_slot_predicted_demand = None
         current_predict_label = None
 
-        if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet']:
+        if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm']:
             slot_timestamp = pd.Timestamp(test_date) + pd.Timedelta(seconds=slot_start_seconds)
-            one_step_predicted_demand = mctg_dispatch_predictor.predict_region_demand(slot_timestamp)
-            planning_demand, forecast_trace = _build_lookahead_demand(
-                predictor=mctg_dispatch_predictor,
-                slot_timestamp=slot_timestamp,
-                time_slot_minutes=time_slot_minutes,
-                centers=centers,
-                lookahead_slots=DEFAULT_LOOKAHEAD_SLOTS,
-                decay=DEFAULT_LOOKAHEAD_DECAY
-            )
+            one_step_predicted_demand = dispatch_predictor.predict_region_demand(slot_timestamp)
             if one_step_predicted_demand is not None:
                 current_slot_predicted_demand = one_step_predicted_demand
-            if planning_demand is not None:
+            if one_step_predicted_demand is not None:
                 backlog_counts = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
-                displayed_plan_demand = planning_demand
-                if algo_name.lower() == 'predictive_game_mctgnet':
+                displayed_plan_demand = dict(one_step_predicted_demand)
+                if algo_name.lower() in ['predictive_game_mctgnet', 'predictive_game_center_lstm']:
                     predispatch_result = game_theoretic_predispatch_workers(
                         G=G,
                         worker_sim=worker_sim,
                         centers=centers,
-                        predicted_demand=planning_demand,
+                        predicted_demand=displayed_plan_demand,
                         next_slot_start_seconds=slot_start_seconds,
                         max_tasks_per_worker=getattr(config, 'MAX_TASKS_PER_WORKER', 4),
                         backlog_counts=backlog_counts,
@@ -643,27 +737,13 @@ def run_online_simulation_with_center_pickup(
                         candidate_k=getattr(config, 'GAME_DISPATCH_CANDIDATE_K', 12),
                         potential_gain_epsilon=getattr(config, 'GAME_DISPATCH_POTENTIAL_EPSILON', 1e-4)
                     )
-                    predict_label = 'Game-MCTGNet Predict'
+                    predict_label = 'Game-CenterLSTM Predict' if algo_name.lower() == 'predictive_game_center_lstm' else 'Game-MCTGNet Predict'
                 else:
-                    predictive_peak_weight = float(getattr(config, 'PREDICTIVE_PREDISPATCH_PEAK_WEIGHT', DEFAULT_LOOKAHEAD_PEAK_WEIGHT))
-                    predictive_demand_margin = float(getattr(config, 'PREDICTIVE_PREDISPATCH_DEMAND_MARGIN', DEFAULT_PREDISPATCH_DEMAND_MARGIN))
-                    predictive_plan = {
-                        rid: int(round(planning_demand.get(rid, 0) * (1.0 + predictive_demand_margin)))
-                        for rid in centers.keys()
-                    }
-                    if forecast_trace:
-                        for rid in centers.keys():
-                            future_peak = max(item[1].get(rid, 0) for item in forecast_trace)
-                            predictive_plan[rid] = max(
-                                predictive_plan[rid],
-                                int(round(future_peak * (1.0 + predictive_peak_weight * predictive_demand_margin)))
-                            )
-                    displayed_plan_demand = predictive_plan
                     predispatch_result = predispatch_workers_for_next_slot(
                         G=G,
                         worker_sim=worker_sim,
                         centers=centers,
-                        predicted_demand=predictive_plan,
+                        predicted_demand=displayed_plan_demand,
                         next_slot_start_seconds=slot_start_seconds,
                         max_tasks_per_worker=getattr(config, 'MAX_TASKS_PER_WORKER', 4),
                         backlog_counts=backlog_counts,
@@ -677,7 +757,7 @@ def run_online_simulation_with_center_pickup(
                         distance_penalty=getattr(config, 'PREDICTIVE_PREDISPATCH_DISTANCE_PENALTY', getattr(config, 'GAME_DISPATCH_DISTANCE_PENALTY', 0.015)),
                         remote_worker_bonus=getattr(config, 'PREDICTIVE_PREDISPATCH_REMOTE_WORKER_BONUS', getattr(config, 'PREDISPATCH_REMOTE_WORKER_BONUS', 0.03))
                     )
-                    predict_label = 'MCTGNet Predict'
+                    predict_label = 'CenterLSTM Predict' if algo_name.lower() == 'predictive_center_lstm' else 'MCTGNet Predict'
                 current_predict_label = predict_label
                 prediction_text = ", ".join(
                     [
@@ -688,15 +768,6 @@ def run_online_simulation_with_center_pickup(
                     ]
                 )
                 print(f"   [{predict_label}] current-slot forecast: {prediction_text}")
-                if len(forecast_trace) > 1:
-                    horizon_text = ", ".join(
-                        [
-                            f"{trace_ts.strftime('%H:%M')}=>"
-                            + "/".join([f"R{rid}:{trace_pred.get(rid, 0)}" for rid in sorted(centers.keys())])
-                            for trace_ts, trace_pred in forecast_trace
-                        ]
-                    )
-                    print(f"   [{predict_label}] lookahead horizon: {horizon_text}")
                 if predispatch_result['moves']:
                     move_summary = ", ".join(
                         [f"{m['wid']}:{m['from_region']}->{m['to_region']}" for m in predispatch_result['moves'][:8]]
@@ -738,6 +809,10 @@ def run_online_simulation_with_center_pickup(
                     new_tasks_count += 1
 
         if current_slot_predicted_demand is not None:
+            actual_region_demand = {
+                rid: int(slot_new_tasks_per_center[rid])
+                for rid in centers.keys()
+            }
             actual_text = ", ".join(
                 [
                     f"R{rid}: actual={slot_new_tasks_per_center[rid]}, "
@@ -746,10 +821,66 @@ def run_online_simulation_with_center_pickup(
                 ]
             )
             print(f"   [{current_predict_label}] actual arrivals: {actual_text}")
+            if hasattr(dispatch_predictor, 'update_online'):
+                dispatch_predictor.update_online(
+                    slot_timestamp=slot_timestamp,
+                    actual_region_demand=actual_region_demand,
+                    predicted_region_demand=current_slot_predicted_demand
+                )
             for rid in centers.keys():
                 err = float(current_slot_predicted_demand.get(rid, 0) - slot_new_tasks_per_center[rid])
                 prediction_abs_errors.append(abs(err))
                 prediction_sq_errors.append(err * err)
+
+        if algo_name.lower() in ['game_only_dispatch', 'game_only', 'no_pred_game']:
+            backlog_counts = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
+            displayed_plan_demand = {
+                rid: int(slot_new_tasks_per_center[rid])
+                for rid in centers.keys()
+            }
+            game_only_result = game_theoretic_predispatch_workers(
+                G=G,
+                worker_sim=worker_sim,
+                centers=centers,
+                predicted_demand=displayed_plan_demand,
+                next_slot_start_seconds=slot_start_seconds,
+                max_tasks_per_worker=getattr(config, 'MAX_TASKS_PER_WORKER', 4),
+                backlog_counts=backlog_counts,
+                backlog_weight=getattr(config, 'PREDISPATCH_BACKLOG_WEIGHT', 1.0),
+                min_buffer_workers=getattr(config, 'PREDISPATCH_MIN_BUFFER_WORKERS', 3),
+                reserve_ratio=getattr(config, 'PREDISPATCH_RESERVE_RATIO', 0.15),
+                max_rebalance_share=getattr(config, 'PREDISPATCH_MAX_SHARE_PER_DONOR', 0.35),
+                max_distance_km=getattr(config, 'PREDISPATCH_MAX_DISTANCE_KM', None),
+                fairness_weight=getattr(config, 'GAME_DISPATCH_FAIRNESS_WEIGHT', 0.5),
+                distance_penalty=getattr(config, 'GAME_DISPATCH_DISTANCE_PENALTY', 0.015),
+                idle_penalty=getattr(config, 'PREDISPATCH_IDLE_PENALTY', 0.8),
+                congestion_penalty=getattr(config, 'PREDISPATCH_CONGESTION_PENALTY', 0.35),
+                remote_worker_bonus=getattr(config, 'PREDISPATCH_REMOTE_WORKER_BONUS', 0.03),
+                donor_max_utility_drop=getattr(config, 'GAME_DISPATCH_DONOR_MAX_UTILITY_DROP', 0.04),
+                receiver_min_utility_gain=getattr(config, 'GAME_DISPATCH_RECEIVER_MIN_GAIN', 0.01),
+                max_iterations=getattr(config, 'GAME_DISPATCH_MAX_ITERATIONS', 120),
+                burst_outbound_share=getattr(config, 'GAME_DISPATCH_BURST_OUTBOUND_SHARE', 0.6),
+                high_demand_multiplier=getattr(config, 'GAME_DISPATCH_HIGH_DEMAND_MULTIPLIER', 1.25),
+                high_demand_shortage_ratio=getattr(config, 'GAME_DISPATCH_HIGH_DEMAND_SHORTAGE_RATIO', 0.3),
+                candidate_k=getattr(config, 'GAME_DISPATCH_CANDIDATE_K', 12),
+                potential_gain_epsilon=getattr(config, 'GAME_DISPATCH_POTENTIAL_EPSILON', 1e-4)
+            )
+            game_only_text = ", ".join(
+                [
+                    f"R{rid}: current={displayed_plan_demand.get(rid, 0)}, eff={game_only_result['effective_demand'].get(rid, 0)}"
+                    for rid in sorted(centers.keys())
+                ]
+            )
+            print(f"   [Game-Only Dispatch] current-slot demand: {game_only_text}")
+            if game_only_result['moves']:
+                move_summary = ", ".join(
+                    [f"{m['wid']}:{m['from_region']}->{m['to_region']}" for m in game_only_result['moves'][:8]]
+                )
+                if len(game_only_result['moves']) > 8:
+                    move_summary += f", ... (+{len(game_only_result['moves']) - 8} more)"
+                print(f"   [Game-Only Dispatch] pre-dispatched {len(game_only_result['moves'])} workers: {move_summary}")
+            else:
+                print("   [Game-Only Dispatch] no worker rebalancing needed")
 
         # 4.2 获取可用工人
         workers_per_center = {}
@@ -769,7 +900,7 @@ def run_online_simulation_with_center_pickup(
             continue
 
         # 4.3 执行调度分配算法
-        if algo_name.lower() in ['greedy', 'predictive_greedy', 'predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet']:
+        if algo_name.lower() in ['greedy', 'predictive_greedy', 'predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', 'game_only_dispatch', 'game_only', 'no_pred_game']:
             slot_assignments, slot_profit, slot_details = greedy_assignment_with_center_pickup(
                 G=G, config=config, centers=centers, partition=rcc_partition,
                 workers_per_center=workers_per_center, tasks_per_center=tasks_per_center,
@@ -959,6 +1090,14 @@ if __name__ == "__main__":
         time_slot_minutes=DEFAULT_TIME_SLOT_MINUTES
     )
 
+    game_only_assignments, game_only_details, game_only_metrics = run_online_simulation_with_center_pickup(
+        algo_name='game_only_dispatch',
+        test_date=DEFAULT_TEST_DATE,
+        test_start_hour=DEFAULT_START_HOUR,
+        test_end_hour=DEFAULT_END_HOUR,
+        time_slot_minutes=DEFAULT_TIME_SLOT_MINUTES
+    )
+
     predictive_assignments, predictive_details, predictive_metrics = run_online_simulation_with_center_pickup(
         algo_name='predictive_mctgnet',
         test_date=DEFAULT_TEST_DATE,
@@ -982,34 +1121,34 @@ if __name__ == "__main__":
         return f"{value:.4f}" if value is not None else "-"
 
     print(
-        f"{'指标':<25} | {'Greedy':<12} | {'IMTAO':<12} | "
+        f"{'指标':<25} | {'Greedy':<12} | {'IMTAO':<12} | {'Game-Only':<12} | "
         f"{'Predictive-MCTGNet':<20} | {'Game-MCTGNet':<16}"
     )
     print("-" * 110)
     print(
         f"{'#Assigned Tasks':<25} | {greedy_metrics['assigned_tasks']:<12} | "
-        f"{imtao_metrics['assigned_tasks']:<12} | {predictive_metrics['assigned_tasks']:<20} | "
+        f"{imtao_metrics['assigned_tasks']:<12} | {game_only_metrics['assigned_tasks']:<12} | {predictive_metrics['assigned_tasks']:<20} | "
         f"{game_predictive_metrics['assigned_tasks']:<16}"
     )
     print(
         f"{'Collaboration Unfairness':<25} | {greedy_metrics['u_rho']:<12.4f} | "
-        f"{imtao_metrics['u_rho']:<12.4f} | {predictive_metrics['u_rho']:<20.4f} | "
+        f"{imtao_metrics['u_rho']:<12.4f} | {game_only_metrics['u_rho']:<12.4f} | {predictive_metrics['u_rho']:<20.4f} | "
         f"{game_predictive_metrics['u_rho']:<16.4f}"
     )
     print(
         f"{'CPU Time (s)':<25} | {greedy_metrics['cpu_time']:<12.4f} | "
-        f"{imtao_metrics['cpu_time']:<12.4f} | {predictive_metrics['cpu_time']:<20.4f} | "
+        f"{imtao_metrics['cpu_time']:<12.4f} | {game_only_metrics['cpu_time']:<12.4f} | {predictive_metrics['cpu_time']:<20.4f} | "
         f"{game_predictive_metrics['cpu_time']:<16.4f}"
     )
     print(
         f"{'Prediction MAE':<25} | {_fmt_optional_metric(greedy_metrics.get('pred_mae')):<12} | "
-        f"{_fmt_optional_metric(imtao_metrics.get('pred_mae')):<12} | "
+        f"{_fmt_optional_metric(imtao_metrics.get('pred_mae')):<12} | {_fmt_optional_metric(game_only_metrics.get('pred_mae')):<12} | "
         f"{_fmt_optional_metric(predictive_metrics.get('pred_mae')):<20} | "
         f"{_fmt_optional_metric(game_predictive_metrics.get('pred_mae')):<16}"
     )
     print(
         f"{'Prediction RMSE':<25} | {_fmt_optional_metric(greedy_metrics.get('pred_rmse')):<12} | "
-        f"{_fmt_optional_metric(imtao_metrics.get('pred_rmse')):<12} | "
+        f"{_fmt_optional_metric(imtao_metrics.get('pred_rmse')):<12} | {_fmt_optional_metric(game_only_metrics.get('pred_rmse')):<12} | "
         f"{_fmt_optional_metric(predictive_metrics.get('pred_rmse')):<20} | "
         f"{_fmt_optional_metric(game_predictive_metrics.get('pred_rmse')):<16}"
     )

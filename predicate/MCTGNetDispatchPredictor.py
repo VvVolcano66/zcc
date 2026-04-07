@@ -31,6 +31,14 @@ class MCTGNetDispatchPredictor:
             center_hotspot_alpha: float = 1.5,
             center_underpredict_alpha: float = 2.0,
             center_underpredict_power: float = 1.0,
+            use_lstm_branch: bool = True,
+            lstm_layers: int = 1,
+            lstm_dropout: float = 0.1,
+            refit_on_all_pretarget: bool = True,
+            use_online_adaptation: bool = True,
+            online_bias_alpha: float = 0.30,
+            online_slot_bias_alpha: float = 0.40,
+            online_scale_alpha: float = 0.15,
             use_log1p: bool = True,
             device: Optional[str] = None
     ):
@@ -52,6 +60,14 @@ class MCTGNetDispatchPredictor:
         self.center_hotspot_alpha = center_hotspot_alpha
         self.center_underpredict_alpha = center_underpredict_alpha
         self.center_underpredict_power = center_underpredict_power
+        self.use_lstm_branch = use_lstm_branch
+        self.lstm_layers = max(1, int(lstm_layers))
+        self.lstm_dropout = float(lstm_dropout)
+        self.refit_on_all_pretarget = refit_on_all_pretarget
+        self.use_online_adaptation = use_online_adaptation
+        self.online_bias_alpha = float(online_bias_alpha)
+        self.online_slot_bias_alpha = float(online_slot_bias_alpha)
+        self.online_scale_alpha = float(online_scale_alpha)
         self.use_log1p = use_log1p
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -73,6 +89,7 @@ class MCTGNetDispatchPredictor:
             for rid in centers.keys()
         }
         self.region_masks_t = None
+        self.reset_online_state()
 
     @staticmethod
     def _clone_state(model):
@@ -115,6 +132,58 @@ class MCTGNetDispatchPredictor:
             self.center_underpredict_power
         )
         return ((residual ** 2) * weights * under_weights).mean()
+
+    def _build_model(self):
+        return MCTGNet(
+            seq_len=self.seq_len,
+            grid_size=self.grid_size,
+            hidden_dim=64,
+            num_centers=len(self.centers),
+            num_time_slots=self.num_time_slots,
+            num_weekdays=7,
+            use_lstm_branch=self.use_lstm_branch,
+            lstm_layers=self.lstm_layers,
+            lstm_dropout=self.lstm_dropout,
+        ).to(self.device)
+
+    def _train_fixed_epochs(
+            self,
+            X_t,
+            Y_t,
+            Y_raw_t,
+            Y_region_raw_t,
+            X_periodic_t,
+            X_weekly_t,
+            slot_ids_t,
+            weekday_ids_t,
+            epochs: int,
+    ) -> None:
+        if epochs <= 0:
+            return
+
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay
+        )
+
+        for _ in range(epochs):
+            self.model.train()
+            optimizer.zero_grad()
+            pred = self.model(
+                X_t,
+                periodic_x=X_periodic_t,
+                weekly_x=X_weekly_t,
+                slot_ids=slot_ids_t,
+                weekday_ids=weekday_ids_t
+            )
+            grid_loss = self._weighted_mse(pred, Y_t, Y_raw_t)
+            center_loss = self._center_weighted_mse(pred, Y_region_raw_t)
+            loss = grid_loss + self.center_loss_weight * center_loss
+            loss.backward()
+            optimizer.step()
+
+        self.model.eval()
 
     def _load_dates(self, dates: List[str]) -> pd.DataFrame:
         df_list = []
@@ -171,6 +240,12 @@ class MCTGNetDispatchPredictor:
                     self.region_slot_means[rid][slot_id] = float(np.mean(region_targets[mask, rid_idx]))
                 else:
                     self.region_slot_means[rid][slot_id] = float(np.mean(region_targets[:, rid_idx])) if len(region_targets) > 0 else 0.0
+
+    def reset_online_state(self) -> None:
+        self.online_region_bias = {rid: 0.0 for rid in self.centers.keys()}
+        self.online_region_scale = {rid: 1.0 for rid in self.centers.keys()}
+        self.online_slot_bias = {rid: {} for rid in self.centers.keys()}
+        self.online_weekday_slot_bias = {rid: {} for rid in self.centers.keys()}
 
     def _fit_region_linear_models(
             self,
@@ -325,14 +400,7 @@ class MCTGNetDispatchPredictor:
         X_train_weekly = self._transform(X_train_weekly_raw)
         X_val_weekly = self._transform(X_val_weekly_raw)
 
-        self.model = MCTGNet(
-            seq_len=self.seq_len,
-            grid_size=self.grid_size,
-            hidden_dim=64,
-            num_centers=len(self.centers),
-            num_time_slots=self.num_time_slots,
-            num_weekdays=7
-        ).to(self.device)
+        self.model = self._build_model()
 
         optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -424,6 +492,29 @@ class MCTGNetDispatchPredictor:
         self.model.to(self.device)
         self.model.eval()
         print(f"   [MCTGNet Dispatch] Best Epoch: {best_epoch}, Best Val Loss: {best_val_loss:.4f}")
+
+        if self.refit_on_all_pretarget and best_epoch > 0:
+            print(f"   [MCTGNet Dispatch] Refit on train+val for {best_epoch} epochs...")
+            X_refit_raw = np.concatenate([X_train_raw, X_val_raw], axis=0)
+            Y_refit_raw = np.concatenate([Y_train_raw, Y_val_raw], axis=0)
+            X_refit_periodic_raw = np.concatenate([X_train_periodic_raw, X_val_periodic_raw], axis=0)
+            X_refit_weekly_raw = np.concatenate([X_train_weekly_raw, X_val_weekly_raw], axis=0)
+            refit_slot_ids = np.concatenate([train_slot_ids, val_slot_ids], axis=0)
+            refit_weekday_ids = np.concatenate([train_weekday_ids, val_weekday_ids], axis=0)
+            refit_region_targets = np.concatenate([train_region_targets, val_region_targets], axis=0)
+
+            self.model = self._build_model()
+            self._train_fixed_epochs(
+                X_t=torch.FloatTensor(self._transform(X_refit_raw)).to(self.device),
+                Y_t=torch.FloatTensor(self._transform(Y_refit_raw)[:, 0]).to(self.device),
+                Y_raw_t=torch.FloatTensor(Y_refit_raw[:, 0]).to(self.device),
+                Y_region_raw_t=torch.FloatTensor(refit_region_targets).to(self.device),
+                X_periodic_t=torch.FloatTensor(self._transform(X_refit_periodic_raw)).to(self.device),
+                X_weekly_t=torch.FloatTensor(self._transform(X_refit_weekly_raw)).to(self.device),
+                slot_ids_t=torch.LongTensor(refit_slot_ids).to(self.device),
+                weekday_ids_t=torch.LongTensor(refit_weekday_ids).to(self.device),
+                epochs=best_epoch,
+            )
 
         pred_region_totals = {rid: 0.0 for rid in self.centers.keys()}
         actual_region_totals = {rid: 0.0 for rid in self.centers.keys()}
@@ -545,5 +636,55 @@ class MCTGNetDispatchPredictor:
                     + coef[3] * weekly_total
                     + coef[4]
                 )
+            if self.use_online_adaptation:
+                slot_bias = self.online_slot_bias.get(rid, {}).get(slot_id, 0.0)
+                weekday_slot_bias = self.online_weekday_slot_bias.get(rid, {}).get((weekday_id, slot_id), 0.0)
+                online_scale = self.online_region_scale.get(rid, 1.0)
+                online_bias = self.online_region_bias.get(rid, 0.0)
+                calibrated_total = calibrated_total * online_scale + online_bias + slot_bias + weekday_slot_bias
             region_demand[rid] = int(round(max(0.0, calibrated_total)))
         return region_demand
+
+    def update_online(
+            self,
+            slot_timestamp: pd.Timestamp,
+            actual_region_demand: Dict[int, int],
+            predicted_region_demand: Optional[Dict[int, int]] = None
+    ) -> None:
+        if not self.use_online_adaptation:
+            return
+
+        ts = pd.Timestamp(slot_timestamp)
+        slot_id = ((ts.hour * 60 + ts.minute) - self.history_start_hour * 60) // self.time_interval
+        slot_id = int(np.clip(slot_id, 0, self.num_time_slots - 1))
+        weekday_id = int(ts.dayofweek)
+
+        for rid in self.sorted_region_ids:
+            actual = float(actual_region_demand.get(rid, 0.0))
+            pred = float(predicted_region_demand.get(rid, actual)) if predicted_region_demand is not None else actual
+            error = actual - pred
+            target_scale = float(np.clip(actual / max(pred, 1.0), 0.5, 2.5))
+
+            self.online_region_bias[rid] = (
+                (1.0 - self.online_bias_alpha) * self.online_region_bias.get(rid, 0.0)
+                + self.online_bias_alpha * error
+            )
+            self.online_region_scale[rid] = float(np.clip(
+                (1.0 - self.online_scale_alpha) * self.online_region_scale.get(rid, 1.0)
+                + self.online_scale_alpha * target_scale,
+                0.5,
+                2.5
+            ))
+
+            prev_slot_bias = self.online_slot_bias.setdefault(rid, {}).get(slot_id, 0.0)
+            self.online_slot_bias[rid][slot_id] = (
+                (1.0 - self.online_slot_bias_alpha) * prev_slot_bias
+                + self.online_slot_bias_alpha * error
+            )
+
+            weekday_slot_key = (weekday_id, slot_id)
+            prev_weekday_slot_bias = self.online_weekday_slot_bias.setdefault(rid, {}).get(weekday_slot_key, 0.0)
+            self.online_weekday_slot_bias[rid][weekday_slot_key] = (
+                (1.0 - self.online_slot_bias_alpha) * prev_weekday_slot_bias
+                + self.online_slot_bias_alpha * error
+            )

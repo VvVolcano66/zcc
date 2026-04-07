@@ -6,6 +6,7 @@ import pandas as pd
 import copy
 from datetime import datetime
 import importlib.util
+from scipy.spatial import KDTree
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,12 +15,48 @@ sys.path.insert(0, project_root)
 import config
 from predicate.data_pipeline import SpatioTemporalDataset
 from predicate.model.XGBoostPredictor import XGBoostPredictor
+from tool.data_loader import get_real_road_network
+from tool.map_algorithms import run_kmeans_baseline, run_rcc_algorithm
 
 
-def calculate_metrics(y_true, y_pred):
+def calculate_metrics(y_true, y_pred, center_masks=None):
+    if center_masks is not None:
+        y_true = aggregate_to_centers(y_true, center_masks)
+        y_pred = aggregate_to_centers(y_pred, center_masks)
+
     mae = np.mean(np.abs(y_true - y_pred))
     rmse = np.sqrt(np.mean(np.square(y_true - y_pred)))
     return mae, rmse
+
+
+def build_center_masks(dataset):
+    G, coords, nodes = get_real_road_network(config.CHENGDU_CENTER, dist=config.DOWNLOAD_DIST)
+    kmeans_partition = run_kmeans_baseline(coords, nodes, k=config.NUM_ZONES)
+    rcc_partition = run_rcc_algorithm(G, kmeans_partition, k=config.NUM_ZONES)
+
+    lon_centers = 0.5 * (dataset.lon_bins[:-1] + dataset.lon_bins[1:])
+    lat_centers = 0.5 * (dataset.lat_bins[:-1] + dataset.lat_bins[1:])
+    tree = KDTree(coords)
+
+    center_masks = np.zeros((config.NUM_ZONES, dataset.grid_size[0], dataset.grid_size[1]), dtype=np.float32)
+    for y_idx, lat in enumerate(lat_centers):
+        for x_idx, lon in enumerate(lon_centers):
+            _, nearest_idx = tree.query([[lon, lat]])
+            node = nodes[int(nearest_idx[0])]
+            region_id = rcc_partition.get(node)
+            if region_id is not None and 0 <= region_id < config.NUM_ZONES:
+                center_masks[region_id, y_idx, x_idx] = 1.0
+
+    return center_masks
+
+
+def aggregate_to_centers(array, center_masks):
+    arr = np.asarray(array)
+    if arr.ndim == 3:
+        arr = arr[:, np.newaxis, :, :]
+    if arr.ndim != 4:
+        raise ValueError("Expected array with shape (N, pre_len, H, W) or (N, H, W)")
+    return np.einsum('nthw,khw->ntk', arr, center_masks)
 
 
 def clone_model_state(model):
@@ -95,6 +132,7 @@ def build_periodic_features(demand_tensor, all_slots, seq_len, pre_len, start_ho
     slot_to_idx = {pd.Timestamp(ts): idx for idx, ts in enumerate(all_slots)}
     periodic_inputs = []
     target_slot_ids = []
+    target_weekday_ids = []
 
     for i in range(len(demand_tensor) - seq_len - pre_len + 1):
         periodic_frames = []
@@ -109,9 +147,14 @@ def build_periodic_features(demand_tensor, all_slots, seq_len, pre_len, start_ho
         first_target_ts = pd.Timestamp(all_slots[i + seq_len])
         slot_id = ((first_target_ts.hour * 60 + first_target_ts.minute) - start_hour * 60) // time_interval
         target_slot_ids.append(max(0, int(slot_id)))
+        target_weekday_ids.append(int(first_target_ts.dayofweek))
         periodic_inputs.append(np.stack(periodic_frames, axis=0))
 
-    return np.array(periodic_inputs), np.array(target_slot_ids, dtype=np.int64)
+    return (
+        np.array(periodic_inputs),
+        np.array(target_slot_ids, dtype=np.int64),
+        np.array(target_weekday_ids, dtype=np.int64),
+    )
 
 def load_specific_date_files(data_dir, date_list):
     df_list = []
@@ -212,15 +255,15 @@ if __name__ == "__main__":
     X_train, Y_train = dataset.create_seq_data_single_tensor(demand_tensor_train, seq_len=SEQ_LEN, pre_len=PRE_LEN)
     X_val, Y_val = dataset.create_seq_data_single_tensor(demand_tensor_val, seq_len=SEQ_LEN, pre_len=PRE_LEN)
     X_test, Y_test = dataset.create_seq_data_single_tensor(demand_tensor_test, seq_len=SEQ_LEN, pre_len=PRE_LEN)
-    X_train_periodic, train_slot_ids = build_periodic_features(
+    X_train_periodic, train_slot_ids, train_weekday_ids = build_periodic_features(
         demand_tensor_train, slots_train, seq_len=SEQ_LEN, pre_len=PRE_LEN,
         start_hour=START_HOUR, time_interval=dataset.time_interval
     )
-    X_val_periodic, val_slot_ids = build_periodic_features(
+    X_val_periodic, val_slot_ids, val_weekday_ids = build_periodic_features(
         demand_tensor_val, slots_val, seq_len=SEQ_LEN, pre_len=PRE_LEN,
         start_hour=START_HOUR, time_interval=dataset.time_interval
     )
-    X_test_periodic, test_slot_ids = build_periodic_features(
+    X_test_periodic, test_slot_ids, test_weekday_ids = build_periodic_features(
         demand_tensor_test, slots_test, seq_len=SEQ_LEN, pre_len=PRE_LEN,
         start_hour=START_HOUR, time_interval=dataset.time_interval
     )
@@ -244,6 +287,8 @@ if __name__ == "__main__":
 
     grid_size = (X_train.shape[2], X_train.shape[3])
     num_nodes = grid_size[0] * grid_size[1]
+    center_masks = build_center_masks(dataset)
+    print(f"   [Metric Level] center-level ({config.NUM_ZONES} centers)")
 
     # === 【核心修改】检测并使用显卡 GPU ===
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -266,6 +311,9 @@ if __name__ == "__main__":
     train_slot_ids_t = torch.LongTensor(train_slot_ids).to(device)
     val_slot_ids_t = torch.LongTensor(val_slot_ids).to(device)
     test_slot_ids_t = torch.LongTensor(test_slot_ids).to(device)
+    train_weekday_ids_t = torch.LongTensor(train_weekday_ids).to(device)
+    val_weekday_ids_t = torch.LongTensor(val_weekday_ids).to(device)
+    test_weekday_ids_t = torch.LongTensor(test_weekday_ids).to(device)
 
     # ================= 模型测试 1：XGBoost =================
     print("\n" + "=" * 70)
@@ -273,7 +321,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     persistence_preds = persistence_predict(X_test)
-    persistence_mae, persistence_rmse = calculate_metrics(Y_test_raw, persistence_preds)
+    persistence_mae, persistence_rmse = calculate_metrics(Y_test_raw, persistence_preds, center_masks=center_masks)
     print(f"[Persistence]    MAE: {persistence_mae:.4f}, RMSE: {persistence_rmse:.4f}")
 
     xgb_model = XGBoostPredictor()
@@ -281,7 +329,7 @@ if __name__ == "__main__":
     xgb_preds = invert_from_training_space(
         xgb_model.predict(X_test_model), use_log1p=USE_LOG1P_TRANSFORM
     )
-    xgb_mae, xgb_rmse = calculate_metrics(Y_test_raw, xgb_preds)
+    xgb_mae, xgb_rmse = calculate_metrics(Y_test_raw, xgb_preds, center_masks=center_masks)
     print(f"[XGBoost Model] MAE: {xgb_mae:.4f}, RMSE: {xgb_rmse:.4f}")
 
     # ================= 模型测试 2：CNN-LSTM =================
@@ -344,7 +392,7 @@ if __name__ == "__main__":
         dl_preds = invert_from_training_space(
             dl_model(X_te_t).cpu().numpy(), use_log1p=USE_LOG1P_TRANSFORM
         )
-    dl_mae, dl_rmse = calculate_metrics(Y_test_raw, dl_preds)
+    dl_mae, dl_rmse = calculate_metrics(Y_test_raw, dl_preds, center_masks=center_masks)
     print(f"  Best Epoch: {best_epoch_dl}, Best Val Loss: {best_val_loss_dl:.4f}")
     print(f"[CNN-LSTM]      MAE: {dl_mae:.4f}, RMSE: {dl_rmse:.4f}")
 
@@ -410,7 +458,7 @@ if __name__ == "__main__":
         st_preds_raw = st_model(X_te_t).cpu().numpy()
         st_preds = np.expand_dims(st_preds_raw, axis=1) if len(st_preds_raw.shape) == 3 else st_preds_raw
         st_preds = invert_from_training_space(st_preds, use_log1p=USE_LOG1P_TRANSFORM)
-    st_mae, st_rmse = calculate_metrics(Y_test_raw, st_preds)
+    st_mae, st_rmse = calculate_metrics(Y_test_raw, st_preds, center_masks=center_masks)
     print(f"  Best Epoch: {best_epoch_st}, Best Val Loss: {best_val_loss_st:.4f}")
     print(f"[ST-Transformer] MAE: {st_mae:.4f}, RMSE: {st_rmse:.4f}")
 
@@ -500,7 +548,7 @@ if __name__ == "__main__":
             gcn_preds_reshaped.shape) == 3 else gcn_preds_reshaped
 
     gcn_preds = invert_from_training_space(gcn_preds, use_log1p=USE_LOG1P_TRANSFORM)
-    gcn_mae, gcn_rmse = calculate_metrics(Y_test_raw, gcn_preds)
+    gcn_mae, gcn_rmse = calculate_metrics(Y_test_raw, gcn_preds, center_masks=center_masks)
     print(f"  Best Epoch: {best_epoch_gcn}, Best Val Loss: {best_val_loss_gcn:.4f}")
     print(f"[ST-GCN]        MAE: {gcn_mae:.4f}, RMSE: {gcn_rmse:.4f}")
 
@@ -596,7 +644,7 @@ if __name__ == "__main__":
         bst_preds = bst_preds_raw.view(-1, 1, grid_size[0], grid_size[1]).cpu().numpy() # <--- 转回 CPU
 
     bst_preds = invert_from_training_space(bst_preds, use_log1p=USE_LOG1P_TRANSFORM)
-    bst_mae, bst_rmse = calculate_metrics(Y_test_raw, bst_preds)
+    bst_mae, bst_rmse = calculate_metrics(Y_test_raw, bst_preds, center_masks=center_masks)
     print(f"  Best Epoch: {best_epoch_bst}, Best Val Loss: {best_val_loss_bst:.4f}")
     print(f"[BSTGCNet]      MAE: {bst_mae:.4f}, RMSE: {bst_rmse:.4f}")
 
@@ -631,7 +679,12 @@ if __name__ == "__main__":
     for epoch in range(max_epochs):
         mctg_model.train()
         optimizer_mctg.zero_grad()
-        outputs_mctg = mctg_model(X_tr_t, X_tr_periodic_t, train_slot_ids_t)
+        outputs_mctg = mctg_model(
+            X_tr_t,
+            periodic_x=X_tr_periodic_t,
+            slot_ids=train_slot_ids_t,
+            weekday_ids=train_weekday_ids_t,
+        )
         target_mctg = Y_tr_t.squeeze(1) if len(Y_tr_t.shape) == 4 else Y_tr_t
         raw_target_mctg = Y_tr_raw_t.squeeze(1) if len(Y_tr_raw_t.shape) == 4 else Y_tr_raw_t
         loss_mctg = weighted_mse_loss(outputs_mctg, target_mctg, raw_target_mctg, alpha=2.5)
@@ -640,7 +693,12 @@ if __name__ == "__main__":
 
         mctg_model.eval()
         with torch.no_grad():
-            preds_val_mctg = mctg_model(X_val_t, X_val_periodic_t, val_slot_ids_t)
+            preds_val_mctg = mctg_model(
+                X_val_t,
+                periodic_x=X_val_periodic_t,
+                slot_ids=val_slot_ids_t,
+                weekday_ids=val_weekday_ids_t,
+            )
             target_val_mctg = Y_val_t.squeeze(1) if len(Y_val_t.shape) == 4 else Y_val_t
             raw_target_val_mctg = Y_val_raw_t.squeeze(1) if len(Y_val_raw_t.shape) == 4 else Y_val_raw_t
             val_loss_mctg = weighted_mse_loss(
@@ -673,10 +731,15 @@ if __name__ == "__main__":
     mctg_model.load_state_dict(best_state_mctg)
     mctg_model.eval()
     with torch.no_grad():
-        mctg_preds_raw = mctg_model(X_te_t, X_te_periodic_t, test_slot_ids_t).cpu().numpy()
+        mctg_preds_raw = mctg_model(
+            X_te_t,
+            periodic_x=X_te_periodic_t,
+            slot_ids=test_slot_ids_t,
+            weekday_ids=test_weekday_ids_t,
+        ).cpu().numpy()
         mctg_preds = np.expand_dims(mctg_preds_raw, axis=1) if len(mctg_preds_raw.shape) == 3 else mctg_preds_raw
         mctg_preds = invert_from_training_space(mctg_preds, use_log1p=USE_LOG1P_TRANSFORM)
-    mctg_mae, mctg_rmse = calculate_metrics(Y_test_raw, mctg_preds)
+    mctg_mae, mctg_rmse = calculate_metrics(Y_test_raw, mctg_preds, center_masks=center_masks)
     print(f"  Best Epoch: {best_epoch_mctg}, Best Val Loss: {best_val_loss_mctg:.4f}")
     print(f"[MCTGNet]       MAE: {mctg_mae:.4f}, RMSE: {mctg_rmse:.4f}")
 

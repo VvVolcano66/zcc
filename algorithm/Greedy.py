@@ -19,16 +19,16 @@ def greedy_assignment_with_center_pickup(
     total_profit = 0.0
     assignment_details = []
     path_cache = {}
+    source_cache = {}
 
     def get_dist(n1, n2):
         if n1 == n2:
             return 0.0
         pair = (n1, n2) if str(n1) < str(n2) else (n2, n1)
         if pair not in path_cache:
-            try:
-                path_cache[pair] = nx.shortest_path_length(G, source=n1, target=n2, weight="length")
-            except nx.NetworkXNoPath:
-                path_cache[pair] = float("inf")
+            if n1 not in source_cache:
+                source_cache[n1] = nx.single_source_dijkstra_path_length(G, n1, weight="length")
+            path_cache[pair] = source_cache[n1].get(n2, float("inf"))
         return path_cache[pair]
 
     for region_id, center_node in centers.items():

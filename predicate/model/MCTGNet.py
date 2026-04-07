@@ -35,7 +35,18 @@ class MCTGNet(nn.Module):
     3. Residual delta prediction and recent-trend gating preserve local bursts.
     """
 
-    def __init__(self, seq_len, grid_size=(5, 5), hidden_dim=64, num_centers=5, num_time_slots=8, num_weekdays=7):
+    def __init__(
+        self,
+        seq_len,
+        grid_size=(5, 5),
+        hidden_dim=64,
+        num_centers=5,
+        num_time_slots=8,
+        num_weekdays=7,
+        use_lstm_branch=True,
+        lstm_layers=1,
+        lstm_dropout=0.1,
+    ):
         super().__init__()
         self.seq_len = seq_len
         self.grid_size = grid_size
@@ -43,6 +54,9 @@ class MCTGNet(nn.Module):
         self.num_centers = num_centers
         self.num_time_slots = num_time_slots
         self.num_weekdays = num_weekdays
+        self.use_lstm_branch = use_lstm_branch
+        self.lstm_layers = max(1, int(lstm_layers))
+        self.lstm_dropout = float(lstm_dropout) if self.lstm_layers > 1 else 0.0
 
         self.spatial_encoder = nn.Sequential(
             nn.Conv2d(1, hidden_dim // 2, kernel_size=3, padding=1),
@@ -65,6 +79,29 @@ class MCTGNet(nn.Module):
             hidden_size=hidden_dim,
             batch_first=True
         )
+        if self.use_lstm_branch:
+            self.global_lstm = nn.LSTM(
+                input_size=hidden_dim,
+                hidden_size=hidden_dim,
+                num_layers=self.lstm_layers,
+                batch_first=True,
+                dropout=self.lstm_dropout
+            )
+            self.center_lstm = nn.LSTM(
+                input_size=hidden_dim,
+                hidden_size=hidden_dim,
+                num_layers=self.lstm_layers,
+                batch_first=True,
+                dropout=self.lstm_dropout
+            )
+            self.global_temporal_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU()
+            )
+            self.center_temporal_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU()
+            )
 
         self.global_proj = nn.Linear(hidden_dim, hidden_dim)
 
@@ -141,13 +178,25 @@ class MCTGNet(nn.Module):
 
         global_seq = torch.stack(global_features, dim=1)  # (B, T, C)
         _, global_hidden = self.global_gru(global_seq)
-        global_context = self.global_proj(global_hidden[-1]).view(batch_size, self.hidden_dim, 1, 1)
+        global_temporal = global_hidden[-1]
+        if self.use_lstm_branch:
+            _, (global_lstm_hidden, _) = self.global_lstm(global_seq)
+            global_temporal = self.global_temporal_fusion(
+                torch.cat([global_temporal, global_lstm_hidden[-1]], dim=-1)
+            )
+        global_context = self.global_proj(global_temporal).view(batch_size, self.hidden_dim, 1, 1)
 
         center_seq = torch.stack(center_feature_seq, dim=1)  # (B, T, K, C)
         center_seq = center_seq.permute(0, 2, 1, 3).contiguous()  # (B, K, T, C)
         center_seq = center_seq.view(batch_size * self.num_centers, seq_len, self.hidden_dim)
         _, center_hidden = self.center_gru(center_seq)
-        center_hidden = center_hidden[-1].view(batch_size, self.num_centers, self.hidden_dim)
+        center_temporal = center_hidden[-1]
+        if self.use_lstm_branch:
+            _, (center_lstm_hidden, _) = self.center_lstm(center_seq)
+            center_temporal = self.center_temporal_fusion(
+                torch.cat([center_temporal, center_lstm_hidden[-1]], dim=-1)
+            )
+        center_hidden = center_temporal.view(batch_size, self.num_centers, self.hidden_dim)
 
         last_feat = spatial_features[-1]
         last_frame = x[:, -1]

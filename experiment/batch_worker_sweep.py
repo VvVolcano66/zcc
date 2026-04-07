@@ -4,10 +4,11 @@ import os
 import batch as batch_exp
 
 
-WORKER_COUNTS = [200, 300, 400, 500, 600]
+WORKER_COUNTS = [500, 600, 700, 800, 900]
 ALGORITHMS = [
     ("greedy", "Greedy"),
     ("imtao", "IMTAO (Seq-BDC)"),
+    ("game_only_dispatch", "Game-Only"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("predictive_game_mctgnet", "Game-MCTGNet"),
 ]
