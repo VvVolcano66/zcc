@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,10 @@ class MCTGNetDispatchPredictor:
             online_bias_alpha: float = 0.30,
             online_slot_bias_alpha: float = 0.40,
             online_scale_alpha: float = 0.15,
+            uncertainty_quantile: float = 0.90,
+            uncertainty_slot_blend: float = 0.65,
+            online_uncertainty_alpha: float = 0.20,
+            min_sigma_ratio: float = 0.15,
             use_log1p: bool = True,
             device: Optional[str] = None
     ):
@@ -68,6 +72,10 @@ class MCTGNetDispatchPredictor:
         self.online_bias_alpha = float(online_bias_alpha)
         self.online_slot_bias_alpha = float(online_slot_bias_alpha)
         self.online_scale_alpha = float(online_scale_alpha)
+        self.uncertainty_quantile = float(np.clip(uncertainty_quantile, 0.5, 0.99))
+        self.uncertainty_slot_blend = float(np.clip(uncertainty_slot_blend, 0.0, 1.0))
+        self.online_uncertainty_alpha = float(np.clip(online_uncertainty_alpha, 0.0, 1.0))
+        self.min_sigma_ratio = float(max(0.01, min_sigma_ratio))
         self.use_log1p = use_log1p
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -88,12 +96,41 @@ class MCTGNetDispatchPredictor:
             rid: np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
             for rid in centers.keys()
         }
+        self.region_uncertainty_stats = {
+            rid: {'sigma': 1.0, 'q_resid': 1.0, 'under_rate': 0.0}
+            for rid in centers.keys()
+        }
+        self.region_slot_uncertainty = {rid: {} for rid in centers.keys()}
         self.region_masks_t = None
+        self._cuda_fallback_triggered = False
         self.reset_online_state()
 
     @staticmethod
     def _clone_state(model):
         return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    @staticmethod
+    def _is_cuda_runtime_error(exc: RuntimeError) -> bool:
+        message = str(exc).lower()
+        return "cuda" in message or "cublas" in message or "cudnn" in message
+
+    def _fallback_to_cpu(self, reason: str) -> None:
+        if self.device.type == "cpu":
+            return
+        if not self._cuda_fallback_triggered:
+            print(f"   [MCTGNet Dispatch] CUDA runtime failed, falling back to CPU. Reason: {reason}")
+            self._cuda_fallback_triggered = True
+        self.device = torch.device("cpu")
+        if self.model is not None:
+            self.model = self.model.to(self.device)
+            self.model.eval()
+        if self.region_masks_t is not None:
+            self.region_masks_t = self.region_masks_t.to(self.device)
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _transform(self, array):
         if self.use_log1p:
@@ -246,6 +283,16 @@ class MCTGNetDispatchPredictor:
         self.online_region_scale = {rid: 1.0 for rid in self.centers.keys()}
         self.online_slot_bias = {rid: {} for rid in self.centers.keys()}
         self.online_weekday_slot_bias = {rid: {} for rid in self.centers.keys()}
+        self.online_region_abs_error = {rid: 0.0 for rid in self.centers.keys()}
+        self.online_region_sq_error = {rid: 0.0 for rid in self.centers.keys()}
+        self.online_region_under_rate = {rid: 0.0 for rid in self.centers.keys()}
+        self.online_slot_abs_error = {rid: {} for rid in self.centers.keys()}
+        self.online_slot_sq_error = {rid: {} for rid in self.centers.keys()}
+        self.online_slot_under_rate = {rid: {} for rid in self.centers.keys()}
+
+    def _slot_id_for_timestamp(self, slot_timestamp: pd.Timestamp) -> int:
+        slot_id = ((slot_timestamp.hour * 60 + slot_timestamp.minute) - self.history_start_hour * 60) // self.time_interval
+        return int(np.clip(slot_id, 0, self.num_time_slots - 1))
 
     def _fit_region_linear_models(
             self,
@@ -277,6 +324,67 @@ class MCTGNetDispatchPredictor:
             coef[:3] = np.clip(coef[:3], 0.0, 3.0)
             coef[3] = float(np.clip(coef[3], -100.0, 100.0))
             self.region_linear_models[rid] = coef
+
+    def _fit_region_uncertainty_models(
+            self,
+            pred_region_scaled: np.ndarray,
+            actual_region: np.ndarray,
+            periodic_region: np.ndarray,
+            weekly_region: np.ndarray,
+            slot_ids: np.ndarray
+    ) -> None:
+        sorted_region_ids = sorted(self.centers.keys())
+        self.region_uncertainty_stats = {
+            rid: {'sigma': 1.0, 'q_resid': 1.0, 'under_rate': 0.0}
+            for rid in sorted_region_ids
+        }
+        self.region_slot_uncertainty = {rid: {} for rid in sorted_region_ids}
+
+        for rid_idx, rid in enumerate(sorted_region_ids):
+            slot_feature = np.array(
+                [self.region_slot_means[rid].get(int(slot_id), 0.0) for slot_id in slot_ids],
+                dtype=np.float32
+            )
+            coef = self.region_linear_models.get(rid)
+            if coef is None:
+                calibrated = pred_region_scaled[:, rid_idx]
+            else:
+                calibrated = (
+                    coef[0] * pred_region_scaled[:, rid_idx]
+                    + coef[1] * slot_feature
+                    + coef[2] * periodic_region[:, rid_idx]
+                    + coef[3] * weekly_region[:, rid_idx]
+                    + coef[4]
+                )
+            calibrated = np.clip(calibrated.astype(np.float32), 0.0, None)
+            residual = actual_region[:, rid_idx].astype(np.float32) - calibrated
+            positive_residual = np.clip(residual, 0.0, None)
+            sigma = float(np.std(residual)) if len(residual) > 1 else 0.0
+            sigma = max(sigma, self.min_sigma_ratio * max(float(np.mean(actual_region[:, rid_idx])), 1.0))
+            q_resid = float(np.quantile(positive_residual, self.uncertainty_quantile)) if len(positive_residual) > 0 else sigma
+            under_rate = float(np.mean((residual > 0).astype(np.float32))) if len(residual) > 0 else 0.0
+            self.region_uncertainty_stats[rid] = {
+                'sigma': sigma,
+                'q_resid': max(q_resid, sigma),
+                'under_rate': under_rate,
+            }
+
+            unique_slots = sorted(set(int(slot_id) for slot_id in slot_ids))
+            for slot_id in unique_slots:
+                mask = slot_ids == slot_id
+                if not np.any(mask):
+                    continue
+                slot_residual = residual[mask]
+                slot_positive = positive_residual[mask]
+                slot_sigma = float(np.std(slot_residual)) if len(slot_residual) > 1 else sigma
+                slot_sigma = max(slot_sigma, self.min_sigma_ratio * max(float(np.mean(actual_region[mask, rid_idx])), 1.0))
+                slot_q_resid = float(np.quantile(slot_positive, self.uncertainty_quantile)) if len(slot_positive) > 0 else slot_sigma
+                slot_under_rate = float(np.mean((slot_residual > 0).astype(np.float32))) if len(slot_residual) > 0 else under_rate
+                self.region_slot_uncertainty[rid][int(slot_id)] = {
+                    'sigma': slot_sigma,
+                    'q_resid': max(slot_q_resid, slot_sigma),
+                    'under_rate': slot_under_rate,
+                }
 
     def _build_periodic_features(self, demand_tensor, all_slots):
         slot_to_idx = {pd.Timestamp(ts): idx for idx, ts in enumerate(all_slots)}
@@ -571,8 +679,18 @@ class MCTGNetDispatchPredictor:
             weekly_region=val_region_weekly,
             slot_ids=val_slot_ids
         )
+        self._fit_region_uncertainty_models(
+            pred_region_scaled=pred_region_scaled,
+            actual_region=val_region_targets,
+            periodic_region=val_region_periodic,
+            weekly_region=val_region_weekly,
+            slot_ids=val_slot_ids
+        )
 
-    def predict_region_demand(self, slot_timestamp: pd.Timestamp) -> Optional[Dict[int, int]]:
+    def _predict_region_values(
+            self,
+            slot_timestamp: pd.Timestamp
+    ) -> Optional[Tuple[Dict[int, float], Dict[int, float], Dict[int, float], int, int]]:
         if self.model is None or self.target_tensor is None or self.target_slots is None:
             raise RuntimeError("MCTGNet dispatch predictor must be fitted before prediction.")
 
@@ -593,8 +711,7 @@ class MCTGNetDispatchPredictor:
         else:
             weekly_frame = self.target_tensor[prev_week_idx]
 
-        slot_id = ((target_slot.hour * 60 + target_slot.minute) - self.history_start_hour * 60) // self.time_interval
-        slot_id = int(np.clip(slot_id, 0, self.num_time_slots - 1))
+        slot_id = self._slot_id_for_timestamp(target_slot)
         weekday_id = int(target_slot.dayofweek)
 
         X_t = torch.FloatTensor(self._transform(window)).unsqueeze(0).to(self.device)
@@ -618,7 +735,7 @@ class MCTGNetDispatchPredictor:
         raw_region_demand = self._aggregate_grid_to_regions(pred_grid)
         periodic_region_demand = self._aggregate_grid_to_regions(periodic_frame)
         weekly_region_demand = self._aggregate_grid_to_regions(weekly_frame)
-        region_demand = {}
+        calibrated_region_demand = {}
         for rid, total in raw_region_demand.items():
             scale = self.region_scale_factors.get(rid, 1.0)
             scaled_total = total * scale
@@ -642,8 +759,84 @@ class MCTGNetDispatchPredictor:
                 online_scale = self.online_region_scale.get(rid, 1.0)
                 online_bias = self.online_region_bias.get(rid, 0.0)
                 calibrated_total = calibrated_total * online_scale + online_bias + slot_bias + weekday_slot_bias
-            region_demand[rid] = int(round(max(0.0, calibrated_total)))
-        return region_demand
+            calibrated_region_demand[rid] = float(max(0.0, calibrated_total))
+        return calibrated_region_demand, raw_region_demand, periodic_region_demand, slot_id, weekday_id
+
+    def predict_region_demand(self, slot_timestamp: pd.Timestamp) -> Optional[Dict[int, int]]:
+        try:
+            prediction = self._predict_region_values(slot_timestamp)
+        except RuntimeError as exc:
+            if self.device.type == "cuda" and self._is_cuda_runtime_error(exc):
+                self._fallback_to_cpu(str(exc))
+                prediction = self._predict_region_values(slot_timestamp)
+            else:
+                raise
+        if prediction is None:
+            return None
+
+        calibrated_region_demand, _, _, _, _ = prediction
+        return {
+            rid: int(round(total))
+            for rid, total in calibrated_region_demand.items()
+        }
+
+    def predict_region_distribution(self, slot_timestamp: pd.Timestamp) -> Optional[Dict[int, Dict[str, float]]]:
+        try:
+            prediction = self._predict_region_values(slot_timestamp)
+        except RuntimeError as exc:
+            if self.device.type == "cuda" and self._is_cuda_runtime_error(exc):
+                self._fallback_to_cpu(str(exc))
+                prediction = self._predict_region_values(slot_timestamp)
+            else:
+                raise
+        if prediction is None:
+            return None
+
+        calibrated_region_demand, _, _, slot_id, _ = prediction
+        distribution = {}
+        for rid, mu in calibrated_region_demand.items():
+            global_stats = self.region_uncertainty_stats.get(rid, {})
+            slot_stats = self.region_slot_uncertainty.get(rid, {}).get(slot_id, global_stats)
+
+            sigma = (
+                self.uncertainty_slot_blend * float(slot_stats.get('sigma', global_stats.get('sigma', 1.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('sigma', 1.0))
+            )
+            q_resid = (
+                self.uncertainty_slot_blend * float(slot_stats.get('q_resid', global_stats.get('q_resid', sigma)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('q_resid', sigma))
+            )
+            under_rate = (
+                self.uncertainty_slot_blend * float(slot_stats.get('under_rate', global_stats.get('under_rate', 0.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('under_rate', 0.0))
+            )
+
+            online_sigma = float(np.sqrt(max(self.online_region_sq_error.get(rid, 0.0), 0.0)))
+            online_slot_sigma = float(np.sqrt(max(self.online_slot_sq_error.get(rid, {}).get(slot_id, 0.0), 0.0)))
+            sigma = max(
+                sigma,
+                0.5 * online_sigma + 0.5 * online_slot_sigma,
+                self.min_sigma_ratio * max(mu, 1.0)
+            )
+            q_resid = max(
+                q_resid,
+                max(0.0, self.online_region_bias.get(rid, 0.0)) + 0.5 * self.online_region_abs_error.get(rid, 0.0),
+                sigma
+            )
+            burst_prob = float(np.clip(
+                0.5 * under_rate
+                + 0.3 * self.online_region_under_rate.get(rid, 0.0)
+                + 0.2 * self.online_slot_under_rate.get(rid, {}).get(slot_id, 0.0),
+                0.0,
+                1.0
+            ))
+            distribution[rid] = {
+                'mu': float(mu),
+                'sigma': float(sigma),
+                'q90': float(mu + max(q_resid, sigma)),
+                'burst_prob': burst_prob,
+            }
+        return distribution
 
     def update_online(
             self,
@@ -655,14 +848,14 @@ class MCTGNetDispatchPredictor:
             return
 
         ts = pd.Timestamp(slot_timestamp)
-        slot_id = ((ts.hour * 60 + ts.minute) - self.history_start_hour * 60) // self.time_interval
-        slot_id = int(np.clip(slot_id, 0, self.num_time_slots - 1))
+        slot_id = self._slot_id_for_timestamp(ts)
         weekday_id = int(ts.dayofweek)
 
         for rid in self.sorted_region_ids:
             actual = float(actual_region_demand.get(rid, 0.0))
             pred = float(predicted_region_demand.get(rid, actual)) if predicted_region_demand is not None else actual
             error = actual - pred
+            abs_error = abs(error)
             target_scale = float(np.clip(actual / max(pred, 1.0), 0.5, 2.5))
 
             self.online_region_bias[rid] = (
@@ -687,4 +880,33 @@ class MCTGNetDispatchPredictor:
             self.online_weekday_slot_bias[rid][weekday_slot_key] = (
                 (1.0 - self.online_slot_bias_alpha) * prev_weekday_slot_bias
                 + self.online_slot_bias_alpha * error
+            )
+
+            self.online_region_abs_error[rid] = (
+                (1.0 - self.online_uncertainty_alpha) * self.online_region_abs_error.get(rid, 0.0)
+                + self.online_uncertainty_alpha * abs_error
+            )
+            self.online_region_sq_error[rid] = (
+                (1.0 - self.online_uncertainty_alpha) * self.online_region_sq_error.get(rid, 0.0)
+                + self.online_uncertainty_alpha * (error ** 2)
+            )
+            self.online_region_under_rate[rid] = (
+                (1.0 - self.online_uncertainty_alpha) * self.online_region_under_rate.get(rid, 0.0)
+                + self.online_uncertainty_alpha * (1.0 if error > 0 else 0.0)
+            )
+
+            prev_slot_abs_error = self.online_slot_abs_error.setdefault(rid, {}).get(slot_id, 0.0)
+            self.online_slot_abs_error[rid][slot_id] = (
+                (1.0 - self.online_uncertainty_alpha) * prev_slot_abs_error
+                + self.online_uncertainty_alpha * abs_error
+            )
+            prev_slot_sq_error = self.online_slot_sq_error.setdefault(rid, {}).get(slot_id, 0.0)
+            self.online_slot_sq_error[rid][slot_id] = (
+                (1.0 - self.online_uncertainty_alpha) * prev_slot_sq_error
+                + self.online_uncertainty_alpha * (error ** 2)
+            )
+            prev_slot_under_rate = self.online_slot_under_rate.setdefault(rid, {}).get(slot_id, 0.0)
+            self.online_slot_under_rate[rid][slot_id] = (
+                (1.0 - self.online_uncertainty_alpha) * prev_slot_under_rate
+                + self.online_uncertainty_alpha * (1.0 if error > 0 else 0.0)
             )

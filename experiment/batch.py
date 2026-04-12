@@ -10,6 +10,10 @@ import config
 from algorithm.Greedy import greedy_assignment_with_center_pickup
 from algorithm.PredictiveDispatch import predict_next_slot_demand, predispatch_workers_for_next_slot
 from algorithm.GameTheoreticPredictiveDispatch import game_theoretic_predispatch_workers
+from algorithm.UncertaintyAwareBilateralDispatch import (
+    UncertaintyAwareBilateralState,
+    uncertainty_aware_bilateral_predispatch_workers,
+)
 from predicate.MCTGNetDispatchPredictor import MCTGNetDispatchPredictor
 from predicate.CenterPatternLSTMDispatchPredictor import CenterPatternLSTMDispatchPredictor
 from tool.TaskWorkerToMap import WorkerSimulator
@@ -45,6 +49,19 @@ DEFAULT_WORKER_SAMPLE_SEED = int(getattr(config, 'EXPERIMENT_WORKER_SAMPLE_SEED'
 _SIMULATION_CONTEXT_CACHE = {}
 _MCTG_PREDICTOR_CACHE = {}
 _CENTER_LSTM_PREDICTOR_CACHE = {}
+PREDICTIVE_UABG_ALGOS = {
+    'predictive_uabg_mctgnet',
+    'predictive_uncertainty_game_mctgnet',
+    'predictive_bilateral_game_mctgnet',
+}
+NO_PRED_GAME_ALGOS = {'game_only_dispatch', 'game_only', 'no_pred_game'}
+
+
+def _should_force_mctgnet_cpu() -> bool:
+    env_value = os.environ.get("MCTGNET_DISPATCH_FORCE_CPU")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(getattr(config, 'MCTGNET_DISPATCH_FORCE_CPU', False))
 
 
 def build_prediction_date_split(test_date: str, data_dir: str):
@@ -210,6 +227,11 @@ def _get_or_train_mctg_predictor(
         getattr(config, 'MCTGNET_DISPATCH_USE_LSTM', True),
         getattr(config, 'MCTGNET_DISPATCH_LSTM_LAYERS', 1),
         getattr(config, 'MCTGNET_DISPATCH_LSTM_DROPOUT', 0.1),
+        getattr(config, 'MCTGNET_DISPATCH_UQ_QUANTILE', 0.90),
+        getattr(config, 'MCTGNET_DISPATCH_UQ_SLOT_BLEND', 0.65),
+        getattr(config, 'MCTGNET_DISPATCH_UQ_ONLINE_ALPHA', 0.20),
+        getattr(config, 'MCTGNET_DISPATCH_UQ_MIN_SIGMA_RATIO', 0.15),
+        _should_force_mctgnet_cpu(),
     )
     if predictor_key in _MCTG_PREDICTOR_CACHE:
         print("   - Reusing cached MCTGNet predictor")
@@ -225,6 +247,9 @@ def _get_or_train_mctg_predictor(
     print(f"   - Train Days:  {len(train_dates)} | Val Days: {len(val_dates)}")
     print(f"   - Target Date: {test_date}")
     print(f"   - History Window: {history_start_hour}:00 - {test_end_hour}:00")
+    force_cpu = _should_force_mctgnet_cpu()
+    if force_cpu:
+        print("   - MCTGNet dispatch predictor device: CPU-only (forced for this run)")
 
     predictor = MCTGNetDispatchPredictor(
         data_dir=dispatch_data_dir,
@@ -251,6 +276,11 @@ def _get_or_train_mctg_predictor(
         online_bias_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_BIAS_ALPHA', 0.30),
         online_slot_bias_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_SLOT_BIAS_ALPHA', 0.40),
         online_scale_alpha=getattr(config, 'MCTGNET_DISPATCH_ONLINE_SCALE_ALPHA', 0.15),
+        uncertainty_quantile=getattr(config, 'MCTGNET_DISPATCH_UQ_QUANTILE', 0.90),
+        uncertainty_slot_blend=getattr(config, 'MCTGNET_DISPATCH_UQ_SLOT_BLEND', 0.65),
+        online_uncertainty_alpha=getattr(config, 'MCTGNET_DISPATCH_UQ_ONLINE_ALPHA', 0.20),
+        min_sigma_ratio=getattr(config, 'MCTGNET_DISPATCH_UQ_MIN_SIGMA_RATIO', 0.15),
+        device='cpu' if force_cpu else None,
     )
     predictor.fit(
         train_dates=train_dates,
@@ -657,8 +687,9 @@ def run_online_simulation_with_center_pickup(
     dispatch_predictor = None
     prediction_abs_errors = []
     prediction_sq_errors = []
+    uncertainty_dispatch_state = None
 
-    if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet']:
+    if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', *PREDICTIVE_UABG_ALGOS]:
         dispatch_predictor = _get_or_train_mctg_predictor(
             test_date=test_date,
             test_start_hour=test_start_hour,
@@ -683,6 +714,14 @@ def run_online_simulation_with_center_pickup(
 
     if dispatch_predictor is not None and hasattr(dispatch_predictor, 'reset_online_state'):
         dispatch_predictor.reset_online_state()
+    if algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+        uncertainty_dispatch_state = UncertaintyAwareBilateralState(
+            region_ids=sorted(centers.keys()),
+            history_size=int(getattr(config, 'UABG_HISTORY_SIZE', 12)),
+            service_debt_decay=float(getattr(config, 'UABG_SERVICE_DEBT_DECAY', 0.85)),
+            max_service_debt=float(getattr(config, 'UABG_MAX_SERVICE_DEBT', 4.0)),
+            move_history_size=int(getattr(config, 'UABG_MOVE_HISTORY_SIZE', 8))
+        )
 
     for slot_idx in range(num_slots):
         slot_start_minute = slot_idx * time_slot_minutes
@@ -701,7 +740,7 @@ def run_online_simulation_with_center_pickup(
         current_slot_predicted_demand = None
         current_predict_label = None
 
-        if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm']:
+        if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', *PREDICTIVE_UABG_ALGOS]:
             slot_timestamp = pd.Timestamp(test_date) + pd.Timedelta(seconds=slot_start_seconds)
             one_step_predicted_demand = dispatch_predictor.predict_region_demand(slot_timestamp)
             if one_step_predicted_demand is not None:
@@ -709,7 +748,54 @@ def run_online_simulation_with_center_pickup(
             if one_step_predicted_demand is not None:
                 backlog_counts = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
                 displayed_plan_demand = dict(one_step_predicted_demand)
-                if algo_name.lower() in ['predictive_game_mctgnet', 'predictive_game_center_lstm']:
+                predicted_distribution = None
+                if algo_name.lower() in PREDICTIVE_UABG_ALGOS and hasattr(dispatch_predictor, 'predict_region_distribution'):
+                    predicted_distribution = dispatch_predictor.predict_region_distribution(slot_timestamp)
+                if algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                    predispatch_result = uncertainty_aware_bilateral_predispatch_workers(
+                        G=G,
+                        worker_sim=worker_sim,
+                        centers=centers,
+                        predicted_demand=displayed_plan_demand,
+                        state=uncertainty_dispatch_state,
+                        slot_idx=slot_idx,
+                        next_slot_start_seconds=slot_start_seconds,
+                        predicted_distribution=predicted_distribution,
+                        max_tasks_per_worker=getattr(config, 'MAX_TASKS_PER_WORKER', 4),
+                        backlog_counts=backlog_counts,
+                        backlog_weight=getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0),
+                        uncertainty_weight=getattr(config, 'UABG_UNCERTAINTY_WEIGHT', 0.45),
+                        quantile_weight=getattr(config, 'UABG_QUANTILE_WEIGHT', 0.55),
+                        burst_weight=getattr(config, 'UABG_BURST_WEIGHT', 1.2),
+                        min_buffer_workers=getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1),
+                        reserve_ratio=getattr(config, 'UABG_RESERVE_RATIO', 0.1),
+                        max_rebalance_share=getattr(config, 'UABG_MAX_SHARE_PER_DONOR', 0.6),
+                        max_distance_km=getattr(config, 'UABG_MAX_DISTANCE_KM', getattr(config, 'PREDISPATCH_MAX_DISTANCE_KM', None)),
+                        donor_sigma_buffer=getattr(config, 'UABG_DONOR_SIGMA_BUFFER', 0.3),
+                        donor_tail_buffer=getattr(config, 'UABG_DONOR_TAIL_BUFFER', 0.4),
+                        donor_debt_buffer=getattr(config, 'UABG_DONOR_DEBT_BUFFER', 0.35),
+                        bid_shortage_weight=getattr(config, 'UABG_BID_SHORTAGE_WEIGHT', 0.9),
+                        bid_service_weight=getattr(config, 'UABG_BID_SERVICE_WEIGHT', 0.7),
+                        bid_backlog_weight=getattr(config, 'UABG_BID_BACKLOG_WEIGHT', 0.45),
+                        bid_burst_weight=getattr(config, 'UABG_BID_BURST_WEIGHT', 0.6),
+                        bid_debt_weight=getattr(config, 'UABG_BID_DEBT_WEIGHT', 0.85),
+                        ask_shortage_weight=getattr(config, 'UABG_ASK_SHORTAGE_WEIGHT', 0.85),
+                        ask_fairness_weight=getattr(config, 'UABG_ASK_FAIRNESS_WEIGHT', 0.7),
+                        ask_uncertainty_weight=getattr(config, 'UABG_ASK_UNCERTAINTY_WEIGHT', 0.65),
+                        distance_penalty=getattr(config, 'UABG_DISTANCE_PENALTY', 0.004),
+                        opportunity_eta_weight=getattr(config, 'UABG_OPPORTUNITY_ETA_WEIGHT', 0.015),
+                        opportunity_capture_weight=getattr(config, 'UABG_OPPORTUNITY_CAPTURE_WEIGHT', 0.9),
+                        opportunity_return_weight=getattr(config, 'UABG_OPPORTUNITY_RETURN_WEIGHT', 0.06),
+                        remote_worker_bonus=getattr(config, 'UABG_REMOTE_WORKER_BONUS', 0.05),
+                        switch_cooldown_slots=getattr(config, 'UABG_SWITCH_COOLDOWN_SLOTS', 2),
+                        switch_recent_penalty=getattr(config, 'UABG_SWITCH_RECENT_PENALTY', 0.6),
+                        switch_repeat_penalty=getattr(config, 'UABG_SWITCH_REPEAT_PENALTY', 0.25),
+                        switch_lookback_slots=getattr(config, 'UABG_SWITCH_LOOKBACK_SLOTS', 4),
+                        candidate_k=getattr(config, 'UABG_CANDIDATE_K', 16),
+                        edge_epsilon=getattr(config, 'UABG_EDGE_EPSILON', 0.05)
+                    )
+                    predict_label = 'UABG-MCTGNet Predict'
+                elif algo_name.lower() in ['predictive_game_mctgnet', 'predictive_game_center_lstm']:
                     predispatch_result = game_theoretic_predispatch_workers(
                         G=G,
                         worker_sim=worker_sim,
@@ -759,15 +845,34 @@ def run_online_simulation_with_center_pickup(
                     )
                     predict_label = 'CenterLSTM Predict' if algo_name.lower() == 'predictive_center_lstm' else 'MCTGNet Predict'
                 current_predict_label = predict_label
-                prediction_text = ", ".join(
-                    [
-                        f"R{rid}: pred={one_step_predicted_demand.get(rid, 0)}, "
-                        f"plan={displayed_plan_demand.get(rid, 0)}, "
-                        f"eff={predispatch_result['effective_demand'].get(rid, 0)}"
-                        for rid in sorted(centers.keys())
-                    ]
-                )
+                if algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                    prediction_text = ", ".join(
+                        [
+                            f"R{rid}: mu={predispatch_result['demand_profile'][rid]['mu']:.1f}, "
+                            f"sigma={predispatch_result['demand_profile'][rid]['sigma']:.1f}, "
+                            f"q90={predispatch_result['demand_profile'][rid]['q90']:.1f}, "
+                            f"burst={predispatch_result['demand_profile'][rid]['burst_prob']:.2f}, "
+                            f"eff={predispatch_result['effective_demand'].get(rid, 0)}"
+                            for rid in sorted(centers.keys())
+                        ]
+                    )
+                else:
+                    prediction_text = ", ".join(
+                        [
+                            f"R{rid}: pred={one_step_predicted_demand.get(rid, 0)}, "
+                            f"plan={displayed_plan_demand.get(rid, 0)}, "
+                            f"eff={predispatch_result['effective_demand'].get(rid, 0)}"
+                            for rid in sorted(centers.keys())
+                        ]
+                    )
                 print(f"   [{predict_label}] current-slot forecast: {prediction_text}")
+                if algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                    diag = predispatch_result.get('diagnostics', {})
+                    print(
+                        f"   [{predict_label}] diag: mode={'relative' if diag.get('global_shortage_mode') else 'absolute'}, "
+                        f"donors={diag.get('active_donors', 0)}, receivers={diag.get('active_receivers', 0)}, "
+                        f"candidates={diag.get('candidate_pairs', 0)}, positive={diag.get('positive_edges', 0)}"
+                    )
                 if predispatch_result['moves']:
                     move_summary = ", ".join(
                         [f"{m['wid']}:{m['from_region']}->{m['to_region']}" for m in predispatch_result['moves'][:8]]
@@ -775,12 +880,71 @@ def run_online_simulation_with_center_pickup(
                     if len(predispatch_result['moves']) > 8:
                         move_summary += f", ... (+{len(predispatch_result['moves']) - 8} more)"
                     print(f"   [{predict_label}] pre-dispatched {len(predispatch_result['moves'])} workers: {move_summary}")
+                    if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                        uncertainty_dispatch_state.record_moves(
+                            slot_idx=slot_idx,
+                            moved_workers=[m['wid'] for m in predispatch_result['moves']]
+                        )
                 else:
-                    print(f"   [{predict_label}] no worker rebalancing needed")
+                    if algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                        diag = predispatch_result.get('diagnostics', {})
+                        print(
+                            f"   [{predict_label}] no worker rebalancing needed "
+                            f"(max_gap={diag.get('max_receiver_gap', 0)}, max_supply={diag.get('max_donor_supply', 0)})"
+                        )
+                    else:
+                        print(f"   [{predict_label}] no worker rebalancing needed")
             else:
                 print("   [MCTGNet Predict] insufficient multi-batch history, skip pre-dispatch for this slot")
 
         print(f">> 按当前时刻推进工人位置与状态...")
+        if algo_name.lower() in NO_PRED_GAME_ALGOS:
+            backlog_counts = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
+            displayed_plan_demand = {rid: 0 for rid in centers.keys()}
+            game_only_result = game_theoretic_predispatch_workers(
+                G=G,
+                worker_sim=worker_sim,
+                centers=centers,
+                predicted_demand=displayed_plan_demand,
+                next_slot_start_seconds=slot_start_seconds,
+                max_tasks_per_worker=getattr(config, 'MAX_TASKS_PER_WORKER', 4),
+                backlog_counts=backlog_counts,
+                backlog_weight=getattr(config, 'PREDISPATCH_BACKLOG_WEIGHT', 1.0),
+                min_buffer_workers=getattr(config, 'PREDISPATCH_MIN_BUFFER_WORKERS', 3),
+                reserve_ratio=getattr(config, 'PREDISPATCH_RESERVE_RATIO', 0.15),
+                max_rebalance_share=getattr(config, 'PREDISPATCH_MAX_SHARE_PER_DONOR', 0.35),
+                max_distance_km=getattr(config, 'PREDISPATCH_MAX_DISTANCE_KM', None),
+                fairness_weight=getattr(config, 'GAME_DISPATCH_FAIRNESS_WEIGHT', 0.5),
+                distance_penalty=getattr(config, 'GAME_DISPATCH_DISTANCE_PENALTY', 0.015),
+                idle_penalty=getattr(config, 'PREDISPATCH_IDLE_PENALTY', 0.8),
+                congestion_penalty=getattr(config, 'PREDISPATCH_CONGESTION_PENALTY', 0.35),
+                remote_worker_bonus=getattr(config, 'PREDISPATCH_REMOTE_WORKER_BONUS', 0.03),
+                donor_max_utility_drop=getattr(config, 'GAME_DISPATCH_DONOR_MAX_UTILITY_DROP', 0.04),
+                receiver_min_utility_gain=getattr(config, 'GAME_DISPATCH_RECEIVER_MIN_GAIN', 0.01),
+                max_iterations=getattr(config, 'GAME_DISPATCH_MAX_ITERATIONS', 120),
+                burst_outbound_share=getattr(config, 'GAME_DISPATCH_BURST_OUTBOUND_SHARE', 0.6),
+                high_demand_multiplier=getattr(config, 'GAME_DISPATCH_HIGH_DEMAND_MULTIPLIER', 1.25),
+                high_demand_shortage_ratio=getattr(config, 'GAME_DISPATCH_HIGH_DEMAND_SHORTAGE_RATIO', 0.3),
+                candidate_k=getattr(config, 'GAME_DISPATCH_CANDIDATE_K', 12),
+                potential_gain_epsilon=getattr(config, 'GAME_DISPATCH_POTENTIAL_EPSILON', 1e-4)
+            )
+            game_only_text = ", ".join(
+                [
+                    f"R{rid}: backlog={backlog_counts.get(rid, 0)}, eff={game_only_result['effective_demand'].get(rid, 0)}"
+                    for rid in sorted(centers.keys())
+                ]
+            )
+            print(f"   [NoPred-Game Dispatch] backlog-only plan: {game_only_text}")
+            if game_only_result['moves']:
+                move_summary = ", ".join(
+                    [f"{m['wid']}:{m['from_region']}->{m['to_region']}" for m in game_only_result['moves'][:8]]
+                )
+                if len(game_only_result['moves']) > 8:
+                    move_summary += f", ... (+{len(game_only_result['moves']) - 8} more)"
+                print(f"   [NoPred-Game Dispatch] pre-dispatched {len(game_only_result['moves'])} workers: {move_summary}")
+            else:
+                print("   [NoPred-Game Dispatch] no worker rebalancing needed")
+
         worker_sim.advance_workers_to_time(centers, slot_start_seconds)
 
         tasks_per_center = {region_id: [] for region_id in centers.keys()}
@@ -827,12 +991,17 @@ def run_online_simulation_with_center_pickup(
                     actual_region_demand=actual_region_demand,
                     predicted_region_demand=current_slot_predicted_demand
                 )
+            if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                uncertainty_dispatch_state.record_prediction_feedback(
+                    predicted_region_demand=current_slot_predicted_demand,
+                    actual_region_demand=actual_region_demand
+                )
             for rid in centers.keys():
                 err = float(current_slot_predicted_demand.get(rid, 0) - slot_new_tasks_per_center[rid])
                 prediction_abs_errors.append(abs(err))
                 prediction_sq_errors.append(err * err)
 
-        if algo_name.lower() in ['game_only_dispatch', 'game_only', 'no_pred_game']:
+        if False and algo_name.lower() in ['game_only_dispatch', 'game_only', 'no_pred_game']:
             backlog_counts = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
             displayed_plan_demand = {
                 rid: int(slot_new_tasks_per_center[rid])
@@ -894,13 +1063,19 @@ def run_online_simulation_with_center_pickup(
         total_workers = sum(len(w) for w in workers_per_center.values())
         total_current_tasks = sum(len(t) for t in tasks_per_center.values())
         print(f"可用工人: {total_workers} 个 | 新增订单: {new_tasks_count} 个 | 池内总单量: {total_current_tasks} 个")
+        total_slot_tasks_per_center = {rid: len(tasks_per_center[rid]) for rid in centers.keys()}
 
         if total_current_tasks == 0:
+            if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+                uncertainty_dispatch_state.record_service_outcome(
+                    total_tasks_by_region=total_slot_tasks_per_center,
+                    assigned_tasks_by_region={rid: 0 for rid in centers.keys()}
+                )
             print("本时段无订单，跳过分配。")
             continue
 
         # 4.3 执行调度分配算法
-        if algo_name.lower() in ['greedy', 'predictive_greedy', 'predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', 'game_only_dispatch', 'game_only', 'no_pred_game']:
+        if algo_name.lower() in ['greedy', 'predictive_greedy', 'predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', 'game_only_dispatch', 'game_only', 'no_pred_game', *PREDICTIVE_UABG_ALGOS]:
             slot_assignments, slot_profit, slot_details = greedy_assignment_with_center_pickup(
                 G=G, config=config, centers=centers, partition=rcc_partition,
                 workers_per_center=workers_per_center, tasks_per_center=tasks_per_center,
@@ -985,6 +1160,14 @@ def run_online_simulation_with_center_pickup(
 
         leftover_count = sum(len(pool) for pool in unassigned_tasks_pool.values())
         total_expired_tasks_global += slot_expired_count
+        slot_assigned_tasks_per_center = {rid: 0 for rid in centers.keys()}
+        for detail in slot_details:
+            slot_assigned_tasks_per_center[detail['region_id']] += 1
+        if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
+            uncertainty_dispatch_state.record_service_outcome(
+                total_tasks_by_region=total_slot_tasks_per_center,
+                assigned_tasks_by_region=slot_assigned_tasks_per_center
+            )
 
         if algo_name.lower() == 'predictive_greedy':
             observed_arrivals_history.append(slot_new_tasks_per_center)
@@ -1112,44 +1295,53 @@ if __name__ == "__main__":
         test_end_hour=DEFAULT_END_HOUR,
         time_slot_minutes=DEFAULT_TIME_SLOT_MINUTES
     )
+    uabg_assignments, uabg_details, uabg_metrics = run_online_simulation_with_center_pickup(
+        algo_name='predictive_uabg_mctgnet',
+        test_date=DEFAULT_TEST_DATE,
+        test_start_hour=DEFAULT_START_HOUR,
+        test_end_hour=DEFAULT_END_HOUR,
+        time_slot_minutes=DEFAULT_TIME_SLOT_MINUTES
+    )
 
     # 3. 打印与论文一致的评价指标
-    print("\n\n" + "=" * 110)
+    print("\n\n" + "=" * 142)
     print("论文指标对齐：多中心调度算法横向对比")
-    print("=" * 110)
+    print("=" * 142)
     def _fmt_optional_metric(value):
         return f"{value:.4f}" if value is not None else "-"
 
     print(
         f"{'指标':<25} | {'Greedy':<12} | {'IMTAO':<12} | {'Game-Only':<12} | "
-        f"{'Predictive-MCTGNet':<20} | {'Game-MCTGNet':<16}"
+        f"{'Predictive-MCTGNet':<20} | {'Game-MCTGNet':<16} | {'UABG-MCTGNet':<16}"
     )
-    print("-" * 110)
+    print("-" * 142)
     print(
         f"{'#Assigned Tasks':<25} | {greedy_metrics['assigned_tasks']:<12} | "
         f"{imtao_metrics['assigned_tasks']:<12} | {game_only_metrics['assigned_tasks']:<12} | {predictive_metrics['assigned_tasks']:<20} | "
-        f"{game_predictive_metrics['assigned_tasks']:<16}"
+        f"{game_predictive_metrics['assigned_tasks']:<16} | {uabg_metrics['assigned_tasks']:<16}"
     )
     print(
         f"{'Collaboration Unfairness':<25} | {greedy_metrics['u_rho']:<12.4f} | "
         f"{imtao_metrics['u_rho']:<12.4f} | {game_only_metrics['u_rho']:<12.4f} | {predictive_metrics['u_rho']:<20.4f} | "
-        f"{game_predictive_metrics['u_rho']:<16.4f}"
+        f"{game_predictive_metrics['u_rho']:<16.4f} | {uabg_metrics['u_rho']:<16.4f}"
     )
     print(
         f"{'CPU Time (s)':<25} | {greedy_metrics['cpu_time']:<12.4f} | "
         f"{imtao_metrics['cpu_time']:<12.4f} | {game_only_metrics['cpu_time']:<12.4f} | {predictive_metrics['cpu_time']:<20.4f} | "
-        f"{game_predictive_metrics['cpu_time']:<16.4f}"
+        f"{game_predictive_metrics['cpu_time']:<16.4f} | {uabg_metrics['cpu_time']:<16.4f}"
     )
     print(
         f"{'Prediction MAE':<25} | {_fmt_optional_metric(greedy_metrics.get('pred_mae')):<12} | "
         f"{_fmt_optional_metric(imtao_metrics.get('pred_mae')):<12} | {_fmt_optional_metric(game_only_metrics.get('pred_mae')):<12} | "
         f"{_fmt_optional_metric(predictive_metrics.get('pred_mae')):<20} | "
-        f"{_fmt_optional_metric(game_predictive_metrics.get('pred_mae')):<16}"
+        f"{_fmt_optional_metric(game_predictive_metrics.get('pred_mae')):<16} | "
+        f"{_fmt_optional_metric(uabg_metrics.get('pred_mae')):<16}"
     )
     print(
         f"{'Prediction RMSE':<25} | {_fmt_optional_metric(greedy_metrics.get('pred_rmse')):<12} | "
         f"{_fmt_optional_metric(imtao_metrics.get('pred_rmse')):<12} | {_fmt_optional_metric(game_only_metrics.get('pred_rmse')):<12} | "
         f"{_fmt_optional_metric(predictive_metrics.get('pred_rmse')):<20} | "
-        f"{_fmt_optional_metric(game_predictive_metrics.get('pred_rmse')):<16}"
+        f"{_fmt_optional_metric(game_predictive_metrics.get('pred_rmse')):<16} | "
+        f"{_fmt_optional_metric(uabg_metrics.get('pred_rmse')):<16}"
     )
-    print("=" * 110)
+    print("=" * 142)

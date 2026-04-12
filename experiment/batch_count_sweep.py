@@ -6,7 +6,8 @@ os.environ["MCTGNET_DISPATCH_FORCE_CPU"] = "1"
 import batch as batch_exp
 
 
-WORKER_COUNTS = [500, 600, 700, 800, 900]
+FIXED_WORKER_COUNT = 500
+BATCH_COUNTS = [2, 4, 6, 8, 10]
 ALGORITHMS = [
     ("greedy", "Greedy"),
     ("imtao", "IMTAO (Seq-BDC)"),
@@ -21,9 +22,10 @@ def _fmt_optional(value):
     return f"{value:.4f}" if value is not None else "-"
 
 
-def run_single_setting(worker_limit: int):
+def run_single_setting(batch_count: int):
     batch_exp._MCTG_PREDICTOR_CACHE.clear()
-    batch_exp.DEFAULT_WORKER_LIMIT = worker_limit
+    batch_exp.DEFAULT_WORKER_LIMIT = FIXED_WORKER_COUNT
+    batch_exp.DEFAULT_COMPARE_SLOT_COUNT = batch_count
     # Important: the simulation context cache key does not include worker_limit.
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
 
@@ -40,9 +42,10 @@ def run_single_setting(worker_limit: int):
     return results
 
 
-def write_csv(results_by_worker_count, output_path: str):
+def write_csv(results_by_batch_count, output_path: str):
     fieldnames = [
         "worker_count",
+        "batch_count",
         "algorithm",
         "assigned_tasks",
         "u_rho",
@@ -53,11 +56,12 @@ def write_csv(results_by_worker_count, output_path: str):
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for worker_count, algo_results in results_by_worker_count.items():
+        for batch_count, algo_results in results_by_batch_count.items():
             for algorithm, metrics in algo_results.items():
                 writer.writerow(
                     {
-                        "worker_count": worker_count,
+                        "worker_count": FIXED_WORKER_COUNT,
+                        "batch_count": batch_count,
                         "algorithm": algorithm,
                         "assigned_tasks": metrics["assigned_tasks"],
                         "u_rho": metrics["u_rho"],
@@ -68,12 +72,12 @@ def write_csv(results_by_worker_count, output_path: str):
                 )
 
 
-def print_summary(results_by_worker_count):
+def print_summary(results_by_batch_count):
     print("\n" + "=" * 130)
-    print("不同工人数量下的多算法批量实验结果")
+    print(f"固定工人数 {FIXED_WORKER_COUNT} 下的 batch 数量敏感性实验结果")
     print("=" * 130)
-    for worker_count, algo_results in results_by_worker_count.items():
-        print(f"\n[Worker Count = {worker_count}]")
+    for batch_count, algo_results in results_by_batch_count.items():
+        print(f"\n[Batch Count = {batch_count}]")
         print("-" * 130)
         print(
             f"{'Algorithm':<22} | {'#Assigned Tasks':<16} | {'Collaboration Unfairness':<26} | "
@@ -93,16 +97,16 @@ def print_summary(results_by_worker_count):
 
 
 def main():
-    results_by_worker_count = {}
-    for worker_count in WORKER_COUNTS:
+    results_by_batch_count = {}
+    for batch_count in BATCH_COUNTS:
         print("\n" + "#" * 90)
-        print(f"开始工人数实验: {worker_count}")
+        print(f"开始 batch 数实验: {batch_count} | 固定工人数: {FIXED_WORKER_COUNT}")
         print("#" * 90)
-        results_by_worker_count[worker_count] = run_single_setting(worker_count)
+        results_by_batch_count[batch_count] = run_single_setting(batch_count)
 
-    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_worker_sweep_results.csv")
-    write_csv(results_by_worker_count, output_csv)
-    print_summary(results_by_worker_count)
+    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_count_sweep_results.csv")
+    write_csv(results_by_batch_count, output_csv)
+    print_summary(results_by_batch_count)
     print(f"\nCSV results saved to: {output_csv}")
 
 
