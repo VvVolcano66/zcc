@@ -12,15 +12,16 @@ import numpy as np
 from datetime import datetime, date, timezone, timedelta
 
 # ============ 路径与日期范围（只改这里） ============
-RAW_DIR = r"D:\2016年11月成都市二环局部区域轨迹数据"
-OUT_DIR = r"D:\biyelunwen\data\task"
+RAW_DIR = r"D:\2016年10月西安市二环局部区域轨迹数据"
+OUT_DIR = r"D:\biyelunwen\xian_data\task"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-START_DAY = "2016-11-01"   # 含
-END_DAY   = "2016-11-30"   # 含
+START_DAY = "2016-10-01"   # 含
+END_DAY   = "2016-10-31"   # 含
 
 # ============ 空间范围（10 km × 10 km） ============
-CENTER_LON, CENTER_LAT = 104.06, 30.67     # 中心点
+# CENTER_LON, CENTER_LAT = 104.06, 30.67     # 中心点
+CENTER_LON, CENTER_LAT = 108.96,34.24
 HALF_SIZE_KM = 5.0                          # 半边长 5km -> 10×10 km
 
 def km_to_deg_lon(lat, km): return km / (111.32 * np.cos(np.deg2rad(lat)))
@@ -80,15 +81,23 @@ def parse_day_from_tar(filename: str) -> date | None:
         y, mth, d = map(int, m.groups())
         try: return date(y, mth, d)
         except: return None
-    # 10-19
-    m = re.match(r"^11-(\d{1,2})$", base)
+    # 10-19 / 10-1 / 11-19 / 11-1
+    m = re.match(r"^(\d{1,2})-(\d{1,2})$", base)
     if m:
-        d = int(m.group(1))
-        if 1 <= d <= 31:
-            return date(2016, 11, d)
+        mth, d = map(int, m.groups())
+        try:
+            return date(2016, mth, d)
+        except Exception:
+            return None
     return None
 
 def in_target_range(day_dt: date, start_s: str, end_s: str) -> bool:
+    if not start_s and not end_s:
+        return True
+    if not start_s:
+        return day_dt <= date.fromisoformat(end_s)
+    if not end_s:
+        return day_dt >= date.fromisoformat(start_s)
     sd = date.fromisoformat(start_s)
     ed = date.fromisoformat(end_s)
     return sd <= day_dt <= ed
@@ -160,8 +169,20 @@ def main():
     tars = sorted(glob.glob(os.path.join(RAW_DIR, "*.tar.gz")))
     if not tars:
         raise SystemExit(f"未在 {RAW_DIR} 找到 .tar.gz")
+    processed = 0
+    skipped = 0
     for t in tars:
+        day_dt = parse_day_from_tar(t)
+        if day_dt is None:
+            skipped += 1
+            print(f"[skip] unable to parse date from file name: {os.path.basename(t)}")
+            continue
+        if not in_target_range(day_dt, START_DAY, END_DAY):
+            skipped += 1
+            continue
         process_one_day_tar(t)
+        processed += 1
+    print(f"[done] processed={processed}, skipped={skipped}, out_dir={OUT_DIR}")
 
 if __name__ == "__main__":
     main()

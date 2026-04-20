@@ -216,7 +216,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_dir = os.path.join(project_root, 'data', 'task')
+    data_dir = config.TASK_DATA_DIR
     all_dates = discover_available_task_dates(data_dir)
     TRAIN_DATES, VAL_DATES, TEST_DATES = build_date_split(
         all_dates, val_days=VAL_DAYS, test_days=TEST_DAYS

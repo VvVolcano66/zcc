@@ -13,15 +13,15 @@ def greedy_assignment_with_center_pickup(
     slot_start_seconds: float = 0.0,
     slot_end_seconds: float = float("inf"),
 ) -> Tuple[Dict[Tuple[str, str], float], float, List[Dict]]:
-    print(">> 开始执行贪心任务分配算法（带时间窗死线约束）...")
+    print(">> Start greedy assignment (task-count objective, time-window constrained)...")
 
-    all_assignments = {}
-    total_profit = 0.0
-    assignment_details = []
-    path_cache = {}
-    source_cache = {}
+    all_assignments: Dict[Tuple[str, str], float] = {}
+    total_score = 0.0
+    assignment_details: List[Dict] = []
+    path_cache: Dict[Tuple[Any, Any], float] = {}
+    source_cache: Dict[Any, Dict[Any, float]] = {}
 
-    def get_dist(n1, n2):
+    def get_dist(n1: Any, n2: Any) -> float:
         if n1 == n2:
             return 0.0
         pair = (n1, n2) if str(n1) < str(n2) else (n2, n1)
@@ -41,7 +41,7 @@ def greedy_assignment_with_center_pickup(
         if not workers or not tasks:
             continue
 
-        region_profit, region_assignments, region_details = _assign_single_region_dynamic_greedy(
+        region_score, region_assignments, region_details = _assign_single_region_dynamic_greedy(
             config=config,
             region_id=region_id,
             workers=workers,
@@ -53,11 +53,11 @@ def greedy_assignment_with_center_pickup(
         )
 
         all_assignments.update(region_assignments)
-        total_profit += region_profit
+        total_score += region_score
         assignment_details.extend(region_details)
 
-    print(f"✅ 贪心分配完成！总分配任务数：{len(all_assignments)}，总利润：{total_profit:.2f} 元")
-    return all_assignments, total_profit, assignment_details
+    print(f"✅ Greedy finished: assigned={len(all_assignments)}, objective_score={total_score:.2f}")
+    return all_assignments, total_score, assignment_details
 
 
 def _assign_single_region_dynamic_greedy(
@@ -88,13 +88,16 @@ def _assign_single_region_dynamic_greedy(
     worker_current_time = {w[1]: slot_start_seconds for w in workers}
     dist_worker_to_center = {wid: get_dist(w_node, center_node) for wid, w_node in worker_nodes.items()}
 
-    assignments = {}
-    details = []
-    region_profit = 0.0
+    center_to_task_dist = {tid: get_dist(center_node, task_nodes[tid]) for tid in task_nodes}
+    task_to_center_dist = {tid: get_dist(task_nodes[tid], center_node) for tid in task_nodes}
+
+    assignments: Dict[Tuple[str, str], float] = {}
+    details: List[Dict] = []
+    region_score = 0.0
 
     while available_tasks:
         best_pair = None
-        best_profit = -float("inf")
+        best_priority = None
         best_dist_to_center = 0.0
         best_dist_to_task = 0.0
         best_return_dist = 0.0
@@ -123,11 +126,12 @@ def _assign_single_region_dynamic_greedy(
             for tid in available_tasks:
                 if task_regions.get(tid) != region_id:
                     continue
-                t_node = task_nodes[tid]
-                reward = task_rewards[tid]
-                release_time = task_releases[tid]
 
-                dist_to_task = get_dist(worker_virtual_loc[wid], t_node)
+                release_time = task_releases[tid]
+                if worker_virtual_loc[wid] == center_node:
+                    dist_to_task = center_to_task_dist[tid]
+                else:
+                    dist_to_task = get_dist(worker_virtual_loc[wid], task_nodes[tid])
                 if dist_to_task == float("inf"):
                     continue
 
@@ -138,29 +142,38 @@ def _assign_single_region_dynamic_greedy(
                 if arrival_time > task_expires[tid]:
                     continue
 
-                travel_cost = total_dist * config.TRAVEL_COST_PER_METER
-                candidate_profit = reward - travel_cost
                 candidate_end_time = arrival_time
-                candidate_end_node = t_node
+                candidate_end_node = task_nodes[tid]
                 candidate_returned_to_center = False
                 candidate_return_dist = 0.0
 
                 if worker_round_load[wid] + 1 >= config.MAX_TASKS_PER_WORKER:
-                    return_dist = get_dist(t_node, center_node)
+                    return_dist = task_to_center_dist[tid]
                     if return_dist != float("inf"):
                         return_finish_time = arrival_time + return_dist / config.WORKER_SPEED_MS
                         if return_finish_time <= slot_end_seconds:
-                            candidate_profit -= return_dist * config.TRAVEL_COST_PER_METER
                             candidate_end_time = return_finish_time
                             candidate_end_node = center_node
                             candidate_returned_to_center = True
                             candidate_return_dist = return_dist
 
-                if candidate_profit <= 0 or candidate_profit <= best_profit:
+                # Task-maximizing priority:
+                # 1. smaller slack first (avoid losing urgent tasks)
+                # 2. earlier end time (free worker sooner)
+                # 3. shorter travel first
+                candidate_priority = (
+                    task_expires[tid] - arrival_time,
+                    candidate_end_time,
+                    dist_to_task + candidate_return_dist,
+                    task_expires[tid],
+                    tid,
+                    wid,
+                )
+                if best_priority is not None and candidate_priority >= best_priority:
                     continue
 
                 best_pair = (wid, tid)
-                best_profit = candidate_profit
+                best_priority = candidate_priority
                 best_dist_to_center = dist_to_center
                 best_dist_to_task = dist_to_task
                 best_return_dist = candidate_return_dist
@@ -175,7 +188,7 @@ def _assign_single_region_dynamic_greedy(
             break
 
         best_wid, best_tid = best_pair
-        assignments[(best_wid, best_tid)] = best_profit
+        assignments[(best_wid, best_tid)] = 1.0
 
         worker_round_load[best_wid] += 1
         worker_virtual_loc[best_wid] = best_end_node
@@ -184,8 +197,10 @@ def _assign_single_region_dynamic_greedy(
         if best_returned_to_center:
             worker_round_load[best_wid] = 0
 
-        region_profit += best_profit
+        region_score += 1.0
 
+        actual_cost = (best_dist_to_center + best_dist_to_task + best_return_dist) * config.TRAVEL_COST_PER_METER
+        actual_profit = task_rewards[best_tid] - actual_cost
         details.append(
             {
                 "region_id": region_id,
@@ -197,19 +212,20 @@ def _assign_single_region_dynamic_greedy(
                 "task_node": best_end_node,
                 "service_node": task_nodes[best_tid],
                 "reward": task_rewards[best_tid],
-                "cost": (best_dist_to_center + best_dist_to_task + best_return_dist) * config.TRAVEL_COST_PER_METER,
+                "cost": actual_cost,
                 "finish_time": best_end_time,
                 "service_finish_time": best_finish_time,
                 "end_time": best_end_time,
                 "end_node": best_end_node,
-                "profit": best_profit,
+                "profit": actual_profit,
+                "objective_score": 1.0,
             }
         )
 
         available_tasks.remove(best_tid)
 
         if len(details) % 100 == 0:
-            print(f"   已处理 {len(details)} 个分配...")
+            print(f"   processed {len(details)} assignments...")
 
-    print(f"✅ 区域 {region_id} 贪心分配完成！分配任务数：{len(assignments)}，利润：{region_profit:.2f} 元")
-    return region_profit, assignments, details
+    print(f"✅ Region {region_id} greedy finished: assigned={len(assignments)}, objective_score={region_score:.2f}")
+    return region_score, assignments, details

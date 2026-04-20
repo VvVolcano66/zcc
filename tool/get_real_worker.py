@@ -11,11 +11,12 @@ import os, io, tarfile, glob, re
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timezone, timedelta
+import config
 
 # ============ 路径与日期范围 ============#
 RAW_DIR = r"D:\2016年11月成都市二环局部区域轨迹数据"
-OUT_DIR_1 = r"D:\biyelunwen\data\worker"
-OUT_DIR_2 = r"D:\biyelunwen\data\worker_id"
+OUT_DIR_1 = config.WORKER_DATA_DIR
+OUT_DIR_2 = config.WORKER_ID_DATA_DIR
 os.makedirs(OUT_DIR_1, exist_ok=True)
 os.makedirs(OUT_DIR_2, exist_ok=True)
 

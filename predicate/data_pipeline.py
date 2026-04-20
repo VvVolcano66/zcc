@@ -8,8 +8,8 @@ import config
 
 
 class SpatioTemporalDataset:
-    def __init__(self, data_dir=r'D:\biyelunwen\data\task', time_interval=30):
-        self.data_dir = data_dir
+    def __init__(self, data_dir=None, time_interval=30):
+        self.data_dir = data_dir or config.TASK_DATA_DIR
         self.time_interval = time_interval  # 分钟
 
         # 1. 使用预测模块独立网格，避免与多中心分区数量耦合

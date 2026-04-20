@@ -58,6 +58,30 @@ def gcj02_to_wgs84(lon: float, lat: float) -> Tuple[float, float]:
     return lon * 2 - mg_lon, lat * 2 - mg_lat
 
 
+def _compute_map_bbox(center_point, dist_m):
+    center_lat, center_lon = center_point
+    lat_delta = float(dist_m) / 111320.0
+    lon_scale = max(np.cos(np.radians(center_lat)), 1e-6)
+    lon_delta = float(dist_m) / (111320.0 * lon_scale)
+    return (
+        center_lon - lon_delta,
+        center_lon + lon_delta,
+        center_lat - lat_delta,
+        center_lat + lat_delta,
+    )
+
+
+def _filter_positions_by_map_bbox(df: pd.DataFrame, lon_col: str, lat_col: str) -> Tuple[pd.DataFrame, int]:
+    if df.empty:
+        return df, 0
+    min_lon, max_lon, min_lat, max_lat = _compute_map_bbox(config.CHENGDU_CENTER, config.DOWNLOAD_DIST)
+    mask = (
+        df[lon_col].between(min_lon, max_lon)
+        & df[lat_col].between(min_lat, max_lat)
+    )
+    return df[mask].copy(), int((~mask).sum())
+
+
 class WorkerSimulator:
     """
     工人位置模拟器（带中心取货逻辑）
@@ -90,7 +114,7 @@ class WorkerSimulator:
         end_timestamp = test_start_hour * 3600
         start_timestamp = end_timestamp - prep_minutes * 60
 
-        file_path = f"D:/biyelunwen/data/worker/workers_{date}.csv"
+        file_path = os.path.join(config.WORKER_DATA_DIR, f"workers_{date}.csv")
         df = pd.read_csv(file_path)
         df['seconds_of_day'] = pd.to_datetime(df['time_str']).dt.hour * 3600 + \
                                pd.to_datetime(df['time_str']).dt.minute * 60 + \
@@ -195,7 +219,7 @@ class WorkerSimulator:
         end_timestamp = test_start_hour * 3600
         start_timestamp = end_timestamp - prep_minutes * 60
 
-        file_path = f"D:/biyelunwen/data/worker/workers_{date}.csv"
+        file_path = os.path.join(config.WORKER_DATA_DIR, f"workers_{date}.csv")
 
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"数据文件不存在：{file_path}")
@@ -236,6 +260,14 @@ class WorkerSimulator:
             latest_positions['nearest_node'] = None
             latest_positions['lon_wgs84'] = latest_positions['lon_gcj']
             latest_positions['lat_wgs84'] = latest_positions['lat_gcj']
+
+        latest_positions, filtered_out_count = _filter_positions_by_map_bbox(
+            latest_positions,
+            'lon_wgs84',
+            'lat_wgs84'
+        )
+        if filtered_out_count > 0:
+            print(f"   - Spatially filtered out {filtered_out_count} workers outside current map boundary")
 
         # 获取所有的中心区域 ID
         region_ids = list(centers.keys()) if centers else []
@@ -542,7 +574,7 @@ def load_task_locations(
         )
         print(f"   筛选条件：{time_desc}")
 
-    file_path = f"D:/biyelunwen/data/task/tasks_{date}.csv"
+    file_path = os.path.join(config.TASK_DATA_DIR, f"tasks_{date}.csv")
 
     df = pd.read_csv(file_path)
 
