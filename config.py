@@ -10,7 +10,8 @@ WORKER_DATA_DIR = os.path.join(DATA_ROOT_DIR, "worker")
 WORKER_ID_DATA_DIR = os.path.join(DATA_ROOT_DIR, "worker_id")
 
 # --- 模拟与算法参数 ---
-NUM_ZONES = 5        # 分区数量 (论文中的 k_n)
+DEFAULT_NUM_ZONES = 5
+NUM_ZONES = DEFAULT_NUM_ZONES        # 分区数量 (论文中的 k_n)
 CITY_NAME = "Chengdu"
 
 # --- 地理位置参数 ---
@@ -20,7 +21,8 @@ CHENGDU_CENTER = (30.67, 104.06)
 
 # 下载半径 (米)
 # 之前的 2000 米可能略大，如果为了测试速度可以改小，比如 1000
-DOWNLOAD_DIST = 5000
+DEFAULT_DOWNLOAD_DIST = 5000
+DOWNLOAD_DIST = DEFAULT_DOWNLOAD_DIST
 
 # --- 绘图配置 ---
 # 颜色映射风格
@@ -49,7 +51,7 @@ EXPERIMENT_TEST_DATE = "2016-11-30"  # 默认实验日期
 EXPERIMENT_START_HOUR = 7             # 默认实验开始时间（小时）
 EXPERIMENT_END_HOUR = 9               # 默认实验结束时间（小时）
 EXPERIMENT_TIME_SLOT_MINUTES = 15     # 默认时间槽长度（分钟）
-WORKER_INIT_PREP_MINUTES = 5          # 初始化工人位置时回看历史轨迹的分钟数
+WORKER_INIT_PREP_MINUTES = 2          # 初始化工人位置时回看历史轨迹的分钟数
 
 # 5. 预测驱动预调度配置
 DISPATCH_PRED_SEQ_LEN = 8
@@ -121,11 +123,12 @@ GAME_DISPATCH_HIGH_DEMAND_SHORTAGE_RATIO = 0.15
 GAME_DISPATCH_CANDIDATE_K = 20
 GAME_DISPATCH_POTENTIAL_EPSILON = 0.0005
 
-# Worker sampling for the fixed 06:55 snapshot used by the 07:00 batch.
+# Worker sampling for the fixed initialization snapshot used by the 07:00 batch.
 # `None` means keep all workers from the snapshot.
-EXPERIMENT_WORKER_LIMIT = 400
+DEFAULT_EXPERIMENT_WORKER_LIMIT = 400
+EXPERIMENT_WORKER_LIMIT = DEFAULT_EXPERIMENT_WORKER_LIMIT
 # Options:
-# - "snapshot_global": sample directly from the full 06:55 snapshot pool
+# - "snapshot_global": sample directly from the full initialization snapshot pool
 # - "per_region": sample as evenly as possible from each region's snapshot workers
 #EXPERIMENT_WORKER_SAMPLING_MODE = "snapshot_global"
 EXPERIMENT_WORKER_SAMPLING_MODE = "per_region"
@@ -186,5 +189,20 @@ UABG_SWITCH_REPEAT_PENALTY = 0.25
 UABG_SWITCH_LOOKBACK_SLOTS = 4
 UABG_CANDIDATE_K = 16
 UABG_EDGE_EPSILON = 0.05
+
+# 7. RL retention + bilateral game dispatch
+RBG_ACTION_RATIOS = (-0.30, -0.15, 0.0, 0.15, 0.30)
+RBG_LEARNING_RATE = 0.03
+RBG_TEMPERATURE = 0.85
+RBG_EXPLORATION_PROB = 0.12
+RBG_SERVICE_DEBT_DECAY = 0.85
+RBG_MAX_SERVICE_DEBT = 4.0
+RBG_MOVE_HISTORY_SIZE = 8
+RBG_RANDOM_SEED = 42
+RBG_HOARD_DISCOUNT_WEIGHT = 0.40
+RBG_MOVE_COST_WEIGHT = 0.02
+RBG_REWARD_HOARD_WEIGHT = 0.02
+RBG_REWARD_MOVE_WEIGHT = 0.08
+RBG_REWARD_UNFAIRNESS_WEIGHT = 1.0
 UABG_SERVICE_DEBT_DECAY = 0.85
 UABG_MAX_SERVICE_DEBT = 4.0

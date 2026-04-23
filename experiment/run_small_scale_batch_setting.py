@@ -21,6 +21,7 @@ ALGORITHMS = [
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("predictive_game_mctgnet", "Game-MCTGNet"),
     ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
+    ("predictive_rl_game_mctgnet", "RBG-MCTGNet"),
 ]
 
 

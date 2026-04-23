@@ -18,6 +18,7 @@ ALGORITHMS = [
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("predictive_game_mctgnet", "Game-MCTGNet"),
     ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
+    ("predictive_rl_game_mctgnet", "RBG-MCTGNet"),
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,24 +38,53 @@ def _ensure_output_dir(output_dir: str = None) -> str:
     return resolved_dir
 
 
-def _run_algorithms(worker_limit: int, batch_count: int) -> Dict[str, dict]:
+def _run_algorithms(
+    worker_limit: int,
+    batch_count: int,
+    center_count: int = None,
+    download_dist: int = None,
+) -> Dict[str, dict]:
+    original_worker_limit = batch_exp.DEFAULT_WORKER_LIMIT
+    original_compare_slot_count = batch_exp.DEFAULT_COMPARE_SLOT_COUNT
+    original_num_zones = batch_exp.config.NUM_ZONES
+    original_download_dist = batch_exp.config.DOWNLOAD_DIST
+
+    resolved_center_count = (
+        int(center_count)
+        if center_count is not None
+        else int(getattr(batch_exp.config, "DEFAULT_NUM_ZONES", original_num_zones))
+    )
+    resolved_download_dist = (
+        int(download_dist)
+        if download_dist is not None
+        else int(getattr(batch_exp.config, "DEFAULT_DOWNLOAD_DIST", original_download_dist))
+    )
+
     batch_exp._MCTG_PREDICTOR_CACHE.clear()
     batch_exp.DEFAULT_WORKER_LIMIT = worker_limit
     batch_exp.DEFAULT_COMPARE_SLOT_COUNT = batch_count
+    batch_exp.config.NUM_ZONES = resolved_center_count
+    batch_exp.config.DOWNLOAD_DIST = resolved_download_dist
     # Important: the simulation context cache key does not include worker_limit.
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
 
-    results = {}
-    for algo_name, display_name in ALGORITHMS:
-        _, _, metrics = batch_exp.run_online_simulation_with_center_pickup(
-            algo_name=algo_name,
-            test_date=batch_exp.DEFAULT_TEST_DATE,
-            test_start_hour=batch_exp.DEFAULT_START_HOUR,
-            test_end_hour=batch_exp.DEFAULT_END_HOUR,
-            time_slot_minutes=batch_exp.DEFAULT_TIME_SLOT_MINUTES,
-        )
-        results[display_name] = metrics
-    return results
+    try:
+        results = {}
+        for algo_name, display_name in ALGORITHMS:
+            _, _, metrics = batch_exp.run_online_simulation_with_center_pickup(
+                algo_name=algo_name,
+                test_date=batch_exp.DEFAULT_TEST_DATE,
+                test_start_hour=batch_exp.DEFAULT_START_HOUR,
+                test_end_hour=batch_exp.DEFAULT_END_HOUR,
+                time_slot_minutes=batch_exp.DEFAULT_TIME_SLOT_MINUTES,
+            )
+            results[display_name] = metrics
+        return results
+    finally:
+        batch_exp.DEFAULT_WORKER_LIMIT = original_worker_limit
+        batch_exp.DEFAULT_COMPARE_SLOT_COUNT = original_compare_slot_count
+        batch_exp.config.NUM_ZONES = original_num_zones
+        batch_exp.config.DOWNLOAD_DIST = original_download_dist
 
 
 def _write_single_setting_csv(
@@ -154,12 +184,11 @@ def run_center_count_setting(
 ) -> str:
     resolved_batch_count = batch_count if batch_count is not None else batch_exp.DEFAULT_COMPARE_SLOT_COUNT
     resolved_output_dir = _ensure_output_dir(output_dir or CENTER_SPLIT_RESULTS_DIR)
-    original_num_zones = batch_exp.config.NUM_ZONES
-    try:
-        batch_exp.config.NUM_ZONES = int(center_count)
-        algo_results = _run_algorithms(worker_count, resolved_batch_count)
-    finally:
-        batch_exp.config.NUM_ZONES = original_num_zones
+    algo_results = _run_algorithms(
+        worker_count,
+        resolved_batch_count,
+        center_count=int(center_count),
+    )
 
     output_path = os.path.join(resolved_output_dir, f"center_count_{int(center_count)}.csv")
     _write_single_setting_csv(

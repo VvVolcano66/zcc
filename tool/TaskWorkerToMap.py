@@ -87,7 +87,7 @@ class WorkerSimulator:
     工人位置模拟器（带中心取货逻辑）
 
     工作流程：
-    1. 初始化时加载真实工人位置（测试前 5 分钟的数据）
+    1. 初始化时加载真实工人位置（测试前 2 分钟的数据）
     2. 每次分配任务时，计算路径：工人当前位置 → 中心 → 任务点
     3. 更新位置时，直接更新到任务地点（模拟完成整个配送过程）
 
@@ -107,10 +107,10 @@ class WorkerSimulator:
         self.worker_available_from = {}  # {wid: timestamp} 工人从该时刻起可在当前位置自由移动
 
     def initialize_from_real_data(
-            self, date: str, test_start_hour: int, prep_minutes: int = 5,
+            self, date: str, test_start_hour: int, prep_minutes: int = 2,
             coords=None, nodes=None, partition=None, centers=None
     ) -> None:
-        # 计算时间窗口：例如 7点开始，则窗口是 06:55 - 07:00
+        # 计算时间窗口：例如 7点开始，则窗口是 06:58 - 07:00
         end_timestamp = test_start_hour * 3600
         start_timestamp = end_timestamp - prep_minutes * 60
 
@@ -139,11 +139,11 @@ class WorkerSimulator:
         region_ids = list(centers.keys())
         for idx, row in latest_positions.iterrows():
             wid = row['wid']
-            # 初始位置是 06:55 的真实位置
+            # 初始位置是初始化窗口末端前的真实位置
             self.worker_positions[wid] = (row['nearest_node'], row['lon_wgs84'], row['lat_wgs84'])
             self.worker_status[wid] = 'idle'
 
-            # 【关键修改】：起始可用时间设为 06:55，确保有 5 分钟的空闲移动时间
+            # 起始可用时间设为初始化窗口起点
             self.worker_available_from[wid] = start_timestamp
 
             # 初始分配中心
@@ -200,7 +200,7 @@ class WorkerSimulator:
             self,
             date: str,
             test_start_hour: int,
-            prep_minutes: int = 5,
+            prep_minutes: int = 2,
             coords: np.ndarray = None,
             nodes: list = None,
             partition: Dict[Any, int] = None,

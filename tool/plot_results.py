@@ -17,6 +17,17 @@ DEFAULT_SMALL_SCALE_BATCH_SPLIT_DIR = Path(r"D:\biyelunwen\result\small_scale_3x
 DEFAULT_WORKER_COUNTS = [200, 300, 400, 500, 600, 700, 800, 900]
 DEFAULT_BATCH_COUNTS = [2, 4, 6, 8]
 DEFAULT_CENTER_COUNTS = [3, 4, 5, 6, 7]
+DEFAULT_ALGORITHM_ORDER = [
+    "Greedy",
+    "IMTAO",
+    "IMTAO (Seq-BDC)",
+    "NoPred-Game",
+    "Game-Only",
+    "Predictive-MCTGNet",
+    "Game-MCTGNet",
+    "UABG-MCTGNet",
+    "RBG-MCTGNet",
+]
 
 
 def ensure_result_dir(result_dir: Optional[Path] = None) -> Path:
@@ -28,6 +39,15 @@ def ensure_result_dir(result_dir: Optional[Path] = None) -> Path:
 def _configure_matplotlib() -> None:
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
+
+
+def _ordered_algorithms(df: pd.DataFrame, series_col: str = "algorithm") -> list:
+    if series_col not in df.columns:
+        return []
+    observed = [str(value) for value in df[series_col].dropna().drop_duplicates().tolist()]
+    ordered = [name for name in DEFAULT_ALGORITHM_ORDER if name in observed]
+    ordered.extend([name for name in observed if name not in ordered])
+    return ordered
 
 
 def _plot_metric(
@@ -51,7 +71,7 @@ def _plot_metric(
         return
 
     if algorithms is None:
-        algorithms = metric_df[series_col].drop_duplicates().tolist()
+        algorithms = _ordered_algorithms(metric_df, series_col=series_col)
 
     plt.figure(figsize=(10, 6), dpi=180)
     for algorithm in algorithms:
@@ -97,7 +117,9 @@ def _plot_single_setting_metric(
     if metric_df.empty:
         return
 
-    metric_df = metric_df.sort_values(metric, ascending=False)
+    order_map = {name: idx for idx, name in enumerate(DEFAULT_ALGORITHM_ORDER)}
+    metric_df["_algorithm_order"] = metric_df["algorithm"].map(lambda value: order_map.get(str(value), len(order_map)))
+    metric_df = metric_df.sort_values(["_algorithm_order", "algorithm"])
 
     plt.figure(figsize=(10, 6), dpi=180)
     plt.bar(metric_df["algorithm"], metric_df[metric])
