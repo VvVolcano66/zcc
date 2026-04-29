@@ -8,7 +8,7 @@ from scipy.spatial import KDTree
 
 import config
 from algorithm.Greedy import greedy_assignment_with_center_pickup
-from algorithm.RouteILPAssignment import route_ilp_assignment_with_center_pickup
+from algorithm.EnhancedIMTAOAssignment import enhanced_imtao_assignment_with_center_pickup
 from algorithm.PredictiveDispatch import predict_next_slot_demand, predispatch_workers_for_next_slot
 from algorithm.GameTheoreticPredictiveDispatch import game_theoretic_predispatch_workers
 from algorithm.UncertaintyAwareBilateralDispatch import (
@@ -17,6 +17,7 @@ from algorithm.UncertaintyAwareBilateralDispatch import (
 )
 from algorithm.RLRetentionGameDispatch import (
     RLRetentionBilateralState,
+    offline_warm_start_retention_policy,
     rl_retention_bilateral_predispatch_workers,
     update_rl_retention_bilateral_state,
 )
@@ -157,6 +158,263 @@ def build_prediction_date_split(test_date: str, data_dir: str):
     train_dates = available_dates[:-val_days]
     val_dates = available_dates[-val_days:]
     return train_dates, val_dates
+
+
+def _build_rbg_offline_historical_samples(
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        coords,
+        nodes,
+        rcc_partition,
+        centers,
+        worker_sim,
+):
+    region_ids = sorted(centers.keys())
+    tree = KDTree(coords)
+
+    available_workers = {rid: 0 for rid in region_ids}
+    for wid, rid in worker_sim.worker_center_map.items():
+        if rid in available_workers and wid in worker_sim.worker_positions:
+            available_workers[rid] += 1
+
+    max_tasks_per_worker = int(getattr(config, 'MAX_TASKS_PER_WORKER', 4))
+
+    if bool(getattr(config, 'RBG_OFFLINE_USE_SAME_DAY_PREFIX', True)):
+        prefix_start_hour = int(getattr(config, 'RBG_OFFLINE_SAME_DAY_START_HOUR', 7))
+        prefix_start_hour = max(0, min(prefix_start_hour, test_start_hour))
+        if prefix_start_hour < test_start_hour:
+            same_day_file = os.path.join(config.TASK_DATA_DIR, f"tasks_{test_date}.csv")
+            if os.path.exists(same_day_file):
+                df = pd.read_csv(same_day_file)
+                if not df.empty:
+                    df, _ = _filter_df_by_map_bbox(df, 'first_lon', 'first_lat')
+                    if not df.empty:
+                        df['first_time'] = pd.to_datetime(df['first_time'])
+                        df['hour'] = df['first_time'].dt.hour
+                        df = df[(df['hour'] >= prefix_start_hour) & (df['hour'] < test_start_hour)].copy()
+                        if not df.empty:
+                            task_coords = df[['first_lon', 'first_lat']].values
+                            _, idxs = tree.query(task_coords)
+                            df['nearest_node'] = [nodes[i] for i in idxs]
+                            df = df[df['nearest_node'].isin(rcc_partition)].copy()
+                            if not df.empty:
+                                df['region_id'] = df['nearest_node'].map(rcc_partition)
+                                num_prefix_slots = max(
+                                    1,
+                                    ((test_start_hour - prefix_start_hour) * 60) // int(time_slot_minutes)
+                                )
+                                df['slot_id'] = (
+                                    ((df['first_time'].dt.hour * 60 + df['first_time'].dt.minute) - prefix_start_hour * 60)
+                                    // int(time_slot_minutes)
+                                ).astype(int)
+                                df = df[(df['slot_id'] >= 0) & (df['slot_id'] < num_prefix_slots)].copy()
+                                if not df.empty:
+                                    grouped = df.groupby(['slot_id', 'region_id']).size()
+                                    rolling_history = {rid: [] for rid in region_ids}
+                                    backlog_counts = {rid: 0 for rid in region_ids}
+                                    same_day_samples = []
+
+                                    for slot_id in range(num_prefix_slots):
+                                        actual_counts = {
+                                            rid: int(grouped.get((slot_id, rid), 0))
+                                            for rid in region_ids
+                                        }
+                                        sigma_map = {}
+                                        q90_map = {}
+                                        burst_map = {}
+                                        for rid in region_ids:
+                                            history = rolling_history[rid]
+                                            if history:
+                                                hist_arr = np.asarray(history, dtype=np.float32)
+                                                hist_mean = float(np.mean(hist_arr))
+                                                hist_std = float(np.std(hist_arr)) if hist_arr.size > 1 else 0.0
+                                                sigma_map[rid] = hist_std
+                                                q90_map[rid] = float(np.quantile(hist_arr, 0.90))
+                                                burst_map[rid] = 1.0 if actual_counts[rid] > hist_mean + hist_std else 0.0
+                                            else:
+                                                sigma_map[rid] = 0.0
+                                                q90_map[rid] = float(actual_counts[rid])
+                                                burst_map[rid] = 0.0
+
+                                        same_day_samples.append(
+                                            {
+                                                'slot_id': slot_id,
+                                                'actual_counts': actual_counts,
+                                                'available_workers': dict(available_workers),
+                                                'backlog_counts': dict(backlog_counts),
+                                                'sigma_map': sigma_map,
+                                                'q90_map': q90_map,
+                                                'burst_map': burst_map,
+                                                'source': 'same_day_prefix',
+                                            }
+                                        )
+
+                                        for rid in region_ids:
+                                            rolling_history[rid].append(actual_counts[rid])
+                                            capacity = available_workers[rid] * max_tasks_per_worker
+                                            backlog_counts[rid] = max(
+                                                0,
+                                                backlog_counts[rid] + actual_counts[rid] - capacity
+                                            )
+
+                                    if same_day_samples:
+                                        return same_day_samples
+
+    if not bool(getattr(config, 'RBG_OFFLINE_FALLBACK_TO_HISTORY_DAYS', True)):
+        return []
+
+    train_dates, val_dates = build_prediction_date_split(test_date, config.TASK_DATA_DIR)
+    max_days = max(1, int(getattr(config, 'RBG_OFFLINE_MAX_DAYS', 21)))
+    history_dates = (train_dates + val_dates)[-max_days:]
+    if not history_dates:
+        return []
+
+    num_slots = max(1, ((test_end_hour - test_start_hour) * 60) // int(time_slot_minutes))
+
+    daily_slot_counts = []
+    slot_history = {
+        slot_id: {rid: [] for rid in region_ids}
+        for slot_id in range(num_slots)
+    }
+
+    for date_str in history_dates:
+        file_path = os.path.join(config.TASK_DATA_DIR, f"tasks_{date_str}.csv")
+        if not os.path.exists(file_path):
+            continue
+
+        df = pd.read_csv(file_path)
+        if df.empty:
+            continue
+        df, _ = _filter_df_by_map_bbox(df, 'first_lon', 'first_lat')
+        if df.empty:
+            continue
+
+        df['first_time'] = pd.to_datetime(df['first_time'])
+        df['hour'] = df['first_time'].dt.hour
+        df = df[(df['hour'] >= test_start_hour) & (df['hour'] < test_end_hour)].copy()
+        if df.empty:
+            continue
+
+        task_coords = df[['first_lon', 'first_lat']].values
+        _, idxs = tree.query(task_coords)
+        df['nearest_node'] = [nodes[i] for i in idxs]
+        df = df[df['nearest_node'].isin(rcc_partition)].copy()
+        if df.empty:
+            continue
+
+        df['region_id'] = df['nearest_node'].map(rcc_partition)
+        df['slot_id'] = (
+            ((df['first_time'].dt.hour * 60 + df['first_time'].dt.minute) - test_start_hour * 60)
+            // int(time_slot_minutes)
+        ).clip(lower=0, upper=num_slots - 1)
+
+        slot_counts = {
+            slot_id: {rid: 0 for rid in region_ids}
+            for slot_id in range(num_slots)
+        }
+        grouped = df.groupby(['slot_id', 'region_id']).size()
+        for (slot_id, rid), count in grouped.items():
+            slot_id = int(slot_id)
+            rid = int(rid)
+            slot_counts[slot_id][rid] = int(count)
+
+        for slot_id in range(num_slots):
+            for rid in region_ids:
+                slot_history[slot_id][rid].append(int(slot_counts[slot_id][rid]))
+
+        daily_slot_counts.append((date_str, slot_counts))
+
+    if not daily_slot_counts:
+        return []
+
+    slot_stats = {
+        slot_id: {
+            rid: {
+                'sigma': float(np.std(slot_history[slot_id][rid])) if len(slot_history[slot_id][rid]) > 1 else 0.0,
+                'q90': float(np.quantile(slot_history[slot_id][rid], 0.90)) if slot_history[slot_id][rid] else 0.0,
+                'burst': float(np.mean(
+                    np.asarray(slot_history[slot_id][rid], dtype=np.float32)
+                    > (np.mean(slot_history[slot_id][rid]) + np.std(slot_history[slot_id][rid]))
+                )) if slot_history[slot_id][rid] else 0.0,
+            }
+            for rid in region_ids
+        }
+        for slot_id in range(num_slots)
+    }
+
+    samples = []
+    for _, slot_counts in daily_slot_counts:
+        backlog_counts = {rid: 0 for rid in region_ids}
+        for slot_id in range(num_slots):
+            actual_counts = {rid: int(slot_counts[slot_id][rid]) for rid in region_ids}
+            samples.append(
+                {
+                    'slot_id': slot_id,
+                    'actual_counts': actual_counts,
+                    'available_workers': dict(available_workers),
+                    'backlog_counts': dict(backlog_counts),
+                    'sigma_map': {rid: slot_stats[slot_id][rid]['sigma'] for rid in region_ids},
+                    'q90_map': {rid: slot_stats[slot_id][rid]['q90'] for rid in region_ids},
+                    'burst_map': {rid: slot_stats[slot_id][rid]['burst'] for rid in region_ids},
+                    'source': 'history_days',
+                }
+            )
+            for rid in region_ids:
+                capacity = available_workers[rid] * max_tasks_per_worker
+                backlog_counts[rid] = max(0, backlog_counts[rid] + actual_counts[rid] - capacity)
+
+    return samples
+
+
+def _offline_warm_start_rbg_state(
+        state: RLRetentionBilateralState,
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        coords,
+        nodes,
+        rcc_partition,
+        centers,
+        worker_sim,
+):
+    if not bool(getattr(config, 'RBG_OFFLINE_WARM_START', True)):
+        return None
+
+    historical_samples = _build_rbg_offline_historical_samples(
+        test_date=test_date,
+        test_start_hour=test_start_hour,
+        test_end_hour=test_end_hour,
+        time_slot_minutes=time_slot_minutes,
+        coords=coords,
+        nodes=nodes,
+        rcc_partition=rcc_partition,
+        centers=centers,
+        worker_sim=worker_sim,
+    )
+    if not historical_samples:
+        print("   - RBG offline warm-start skipped: no historical samples")
+        return None
+
+    stats = offline_warm_start_retention_policy(
+        state=state,
+        historical_samples=historical_samples,
+        max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+        min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+        reserve_ratio=float(getattr(config, 'UABG_RESERVE_RATIO', 0.10)),
+        backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+        uncertainty_weight=float(getattr(config, 'UABG_UNCERTAINTY_WEIGHT', 0.45)),
+        quantile_weight=float(getattr(config, 'UABG_QUANTILE_WEIGHT', 0.55)),
+        burst_weight=float(getattr(config, 'UABG_BURST_WEIGHT', 1.2)),
+        epochs=int(getattr(config, 'RBG_OFFLINE_EPOCHS', 3)),
+    )
+    print(
+        f"   - RBG offline warm-start ready: samples={stats['sample_count']}, "
+        f"epochs={stats['epochs']}, source={historical_samples[0].get('source', 'unknown')}"
+    )
+    return stats
 
 def _build_simulation_context(
         test_date: str,
@@ -713,6 +971,7 @@ def _run_assignment_for_window(
         tasks_per_center,
         slot_start_seconds,
         slot_end_seconds,
+        stackelberg_control=None,
 ):
     algo_key = algo_name.lower()
     if algo_key in ['greedy', 'predictive_greedy']:
@@ -727,15 +986,15 @@ def _run_assignment_for_window(
             slot_end_seconds=slot_end_seconds,
         )
     if algo_key in ROUTE_ILP_ASSIGNMENT_ALGOS:
-        return route_ilp_assignment_with_center_pickup(
+        return enhanced_imtao_assignment_with_center_pickup(
             G=G,
             config=config,
-            centers=centers,
-            partition=rcc_partition,
+            centers_dict=centers,
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
             slot_end_seconds=slot_end_seconds,
+            stackelberg_control=stackelberg_control if algo_key in PREDICTIVE_RBG_ALGOS else None,
         )
     if algo_key in ['imtao', 'imtao_seq_bdc', 'seq_bdc']:
         return run_imtao_for_slot(
@@ -969,6 +1228,17 @@ def _run_triggered_micro_predispatch(
             uncertainty_weight=getattr(config, 'UABG_UNCERTAINTY_WEIGHT', 0.45),
             quantile_weight=getattr(config, 'UABG_QUANTILE_WEIGHT', 0.55),
             burst_weight=getattr(config, 'UABG_BURST_WEIGHT', 1.2),
+            calibration_bias_weight=getattr(config, 'RBG_PREDICTION_BIAS_WEIGHT', 0.60),
+            calibration_shrink_weight=getattr(config, 'RBG_PREDICTION_SHRINK_WEIGHT', 0.55),
+            calibration_sigma_boost=getattr(config, 'RBG_PREDICTION_SIGMA_BOOST', 0.75),
+            calibration_min_scale=getattr(config, 'RBG_PREDICTION_MIN_SCALE', 0.55),
+            platform_task_weight=getattr(config, 'RBG_PLATFORM_TASK_WEIGHT', 0.30),
+            platform_gap_weight=getattr(config, 'RBG_PLATFORM_GAP_WEIGHT', 0.55),
+            platform_release_credit_weight=getattr(config, 'RBG_PLATFORM_RELEASE_CREDIT_WEIGHT', 0.35),
+            center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
+            worker_completion_bonus=getattr(config, 'RBG_WORKER_COMPLETION_BONUS', 0.20),
+            worker_distance_penalty=getattr(config, 'RBG_WORKER_DISTANCE_PENALTY', 0.015),
+            same_worker_chain_bonus=getattr(config, 'RBG_WORKER_CHAIN_BONUS', 0.08),
             min_buffer_workers=getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1),
             reserve_ratio=getattr(config, 'UABG_RESERVE_RATIO', 0.1),
             bid_shortage_weight=getattr(config, 'UABG_BID_SHORTAGE_WEIGHT', 0.9),
@@ -1117,7 +1387,8 @@ def _run_microbatch_simulation(
         retention_game_state,
 ):
     algo_key = algo_name.lower()
-    is_intrabatch_online = algo_key in INTRABATCH_ONLINE_ALGOS
+    slot_duration_seconds = int(time_slot_minutes) * 60
+    is_intrabatch_online = algo_key in INTRABATCH_ONLINE_ALGOS or micro_batch_seconds >= slot_duration_seconds
     all_assignments = {}
     all_details = []
     total_profit = 0.0
@@ -1144,6 +1415,7 @@ def _run_microbatch_simulation(
         current_slot_rbg_transitions = {}
         current_slot_rbg_hoard_penalty = {}
         current_slot_rbg_move_cost = {}
+        current_slot_rbg_stackelberg_control = {}
 
         if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', *PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS]:
             one_step_predicted_demand = dispatch_predictor.predict_region_demand(slot_timestamp)
@@ -1171,6 +1443,17 @@ def _run_microbatch_simulation(
                         uncertainty_weight=getattr(config, 'UABG_UNCERTAINTY_WEIGHT', 0.45),
                         quantile_weight=getattr(config, 'UABG_QUANTILE_WEIGHT', 0.55),
                         burst_weight=getattr(config, 'UABG_BURST_WEIGHT', 1.2),
+                        calibration_bias_weight=getattr(config, 'RBG_PREDICTION_BIAS_WEIGHT', 0.60),
+                        calibration_shrink_weight=getattr(config, 'RBG_PREDICTION_SHRINK_WEIGHT', 0.55),
+                        calibration_sigma_boost=getattr(config, 'RBG_PREDICTION_SIGMA_BOOST', 0.75),
+                        calibration_min_scale=getattr(config, 'RBG_PREDICTION_MIN_SCALE', 0.55),
+                        platform_task_weight=getattr(config, 'RBG_PLATFORM_TASK_WEIGHT', 0.30),
+                        platform_gap_weight=getattr(config, 'RBG_PLATFORM_GAP_WEIGHT', 0.55),
+                        platform_release_credit_weight=getattr(config, 'RBG_PLATFORM_RELEASE_CREDIT_WEIGHT', 0.35),
+                        center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
+                        worker_completion_bonus=getattr(config, 'RBG_WORKER_COMPLETION_BONUS', 0.20),
+                        worker_distance_penalty=getattr(config, 'RBG_WORKER_DISTANCE_PENALTY', 0.015),
+                        same_worker_chain_bonus=getattr(config, 'RBG_WORKER_CHAIN_BONUS', 0.08),
                         min_buffer_workers=getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1),
                         reserve_ratio=getattr(config, 'UABG_RESERVE_RATIO', 0.1),
                         bid_shortage_weight=getattr(config, 'UABG_BID_SHORTAGE_WEIGHT', 0.9),
@@ -1189,6 +1472,7 @@ def _run_microbatch_simulation(
                     current_slot_rbg_transitions = predispatch_result.get('transitions', {})
                     current_slot_rbg_hoard_penalty = predispatch_result.get('hoard_penalty', {})
                     current_slot_rbg_move_cost = predispatch_result.get('move_cost_by_region', {})
+                    current_slot_rbg_stackelberg_control = predispatch_result.get('stackelberg_control', {})
                     predict_label = 'RBG-MCTGNet Predict'
                 elif algo_name.lower() in PREDICTIVE_UABG_ALGOS:
                     predispatch_result = uncertainty_aware_bilateral_predispatch_workers(
@@ -1484,6 +1768,7 @@ def _run_microbatch_simulation(
                     tasks_per_center=tasks_per_center,
                     slot_start_seconds=micro_start_seconds,
                     slot_end_seconds=slot_end_seconds,
+                    stackelberg_control=current_slot_rbg_stackelberg_control,
                 )
                 dist_center_inc, dist_task_inc = _apply_assignment_results_to_workers(G, worker_sim, micro_details)
                 slot_dist_to_center += dist_center_inc
@@ -1533,6 +1818,11 @@ def _run_microbatch_simulation(
                 )
             if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
                 uncertainty_dispatch_state.record_prediction_feedback(
+                    predicted_region_demand=current_slot_predicted_demand,
+                    actual_region_demand=actual_region_demand
+                )
+            if retention_game_state is not None and algo_name.lower() in PREDICTIVE_RBG_ALGOS:
+                retention_game_state.record_prediction_feedback(
                     predicted_region_demand=current_slot_predicted_demand,
                     actual_region_demand=actual_region_demand
                 )
@@ -1619,9 +1909,8 @@ def run_online_simulation_with_center_pickup(
 ):
     cpu_start = time.process_time()
     algo_key = algo_name.lower()
-    execution_mode = "批次内在线" if algo_key in INTRABATCH_ONLINE_ALGOS else "微批在线"
-    configured_micro_batch_minutes = max(1, min(int(getattr(config, 'EXPERIMENT_MICRO_BATCH_MINUTES', 1)), time_slot_minutes))
-    effective_micro_batch_minutes = time_slot_minutes if algo_key in INTRABATCH_ONLINE_ALGOS else configured_micro_batch_minutes
+    execution_mode = "15分钟槽在线"
+    effective_micro_batch_minutes = time_slot_minutes
     micro_batch_seconds = effective_micro_batch_minutes * 60
     compare_slots = max(1, DEFAULT_COMPARE_SLOT_COUNT)
     compare_end_seconds = test_start_hour * 3600 + compare_slots * time_slot_minutes * 60
@@ -1713,6 +2002,18 @@ def run_online_simulation_with_center_pickup(
             max_service_debt=float(getattr(config, 'RBG_MAX_SERVICE_DEBT', 4.0)),
             move_history_size=int(getattr(config, 'RBG_MOVE_HISTORY_SIZE', 8)),
             random_seed=int(getattr(config, 'RBG_RANDOM_SEED', 42)),
+        )
+        _offline_warm_start_rbg_state(
+            state=retention_game_state,
+            test_date=test_date,
+            test_start_hour=test_start_hour,
+            test_end_hour=test_end_hour,
+            time_slot_minutes=time_slot_minutes,
+            coords=context['coords'],
+            nodes=context['nodes'],
+            rcc_partition=rcc_partition,
+            centers=centers,
+            worker_sim=worker_sim,
         )
 
     all_assignments, all_details, total_profit, total_dist_to_center, total_dist_to_task, total_expired_tasks_global = _run_microbatch_simulation(
@@ -2129,10 +2430,11 @@ def run_online_simulation_with_center_pickup(
                 slot_start_seconds=slot_start_seconds  # 💡 补全了这个漏掉的参数！
             )
         elif algo_name.lower() in ROUTE_ILP_ASSIGNMENT_ALGOS:
-            slot_assignments, slot_profit, slot_details = route_ilp_assignment_with_center_pickup(
-                G=G, config=config, centers=centers, partition=rcc_partition,
+            slot_assignments, slot_profit, slot_details = enhanced_imtao_assignment_with_center_pickup(
+                G=G, config=config, centers_dict=centers,
                 workers_per_center=workers_per_center, tasks_per_center=tasks_per_center,
-                slot_start_seconds=slot_start_seconds
+                slot_start_seconds=slot_start_seconds,
+                slot_end_seconds=slot_end_seconds,
             )
         elif algo_name.lower() in ['imtao', 'imtao_seq_bdc', 'seq_bdc']:
             slot_assignments, slot_profit, slot_details = run_imtao_for_slot(

@@ -140,6 +140,7 @@ def _assign_single_region_route_ilp(
     task_to_center_dist = {tid: get_dist(task_nodes[tid], center_node) for tid in task_ids}
 
     max_tasks_per_worker = int(getattr(config, "MAX_TASKS_PER_WORKER", 4))
+    max_route_tasks = int(getattr(config, "ROUTE_ILP_MAX_ROUTE_TASKS", max_tasks_per_worker * 3))
     candidate_task_limit = int(getattr(config, "ROUTE_ILP_CANDIDATE_TASKS_PER_WORKER", 18))
     branch_limit = int(getattr(config, "ROUTE_ILP_BRANCH_LIMIT", 6))
     max_routes_per_worker = int(getattr(config, "ROUTE_ILP_MAX_ROUTES_PER_WORKER", 80))
@@ -149,15 +150,33 @@ def _assign_single_region_route_ilp(
 
     for worker in workers:
         wid = worker[1]
-        candidate_task_ids = sorted(
-            task_ids,
-            key=lambda tid: (
-                task_expires[tid],
+        worker_center_arrival = slot_start_seconds + dist_worker_to_center[wid] / config.WORKER_SPEED_MS
+        feasible_first_tasks = []
+        for tid in task_ids:
+            center_dist = center_to_task_dist[tid]
+            if center_dist == float("inf"):
+                continue
+            first_arrival = max(
+                worker_center_arrival + center_dist / config.WORKER_SPEED_MS,
                 task_releases[tid],
-                center_to_task_dist[tid],
-                tid,
-            ),
-        )[:candidate_task_limit]
+            )
+            if first_arrival > task_expires[tid]:
+                continue
+            feasible_first_tasks.append(
+                (
+                    task_expires[tid] - first_arrival,
+                    first_arrival,
+                    center_dist,
+                    task_expires[tid],
+                    task_releases[tid],
+                    tid,
+                )
+            )
+
+        candidate_task_ids = [
+            item[-1]
+            for item in sorted(feasible_first_tasks)[:candidate_task_limit]
+        ]
 
         route_candidates_by_worker[wid] = _enumerate_worker_routes(
             wid=wid,
@@ -177,6 +196,7 @@ def _assign_single_region_route_ilp(
             slot_start_seconds=slot_start_seconds,
             slot_end_seconds=slot_end_seconds,
             max_tasks_per_worker=max_tasks_per_worker,
+            max_route_tasks=max_route_tasks,
             branch_limit=branch_limit,
             max_routes=max_routes_per_worker,
         )
@@ -191,6 +211,24 @@ def _assign_single_region_route_ilp(
 
     if pulp is None:
         total_score, assignments, details = _select_routes_greedily(all_routes)
+        used_workers = {wid for wid, _ in assignments.keys()}
+        used_tasks = {tid for _, tid in assignments.keys()}
+        remaining_workers = [worker for worker in workers if worker[1] not in used_workers]
+        remaining_tasks = [task for task in tasks if task[1] not in used_tasks]
+        if remaining_workers and remaining_tasks:
+            extra_score, extra_assignments, extra_details = _assign_single_region_dynamic_greedy(
+                config=config,
+                region_id=region_id,
+                workers=remaining_workers,
+                tasks=remaining_tasks,
+                center_node=center_node,
+                get_dist=get_dist,
+                slot_start_seconds=slot_start_seconds,
+                slot_end_seconds=slot_end_seconds,
+            )
+            assignments.update(extra_assignments)
+            details.extend(extra_details)
+            total_score += extra_score
         print(
             f"✅ Region {region_id} route-pack fallback finished: "
             f"assigned={len(assignments)}, objective_score={total_score:.2f}"
@@ -240,6 +278,25 @@ def _assign_single_region_route_ilp(
             assignments[(wid, detail["task_id"])] = 1.0
             details.append(detail)
 
+    used_workers = {wid for wid, _ in assignments.keys()}
+    used_tasks = {tid for _, tid in assignments.keys()}
+    remaining_workers = [worker for worker in workers if worker[1] not in used_workers]
+    remaining_tasks = [task for task in tasks if task[1] not in used_tasks]
+    if remaining_workers and remaining_tasks:
+        extra_score, extra_assignments, extra_details = _assign_single_region_dynamic_greedy(
+            config=config,
+            region_id=region_id,
+            workers=remaining_workers,
+            tasks=remaining_tasks,
+            center_node=center_node,
+            get_dist=get_dist,
+            slot_start_seconds=slot_start_seconds,
+            slot_end_seconds=slot_end_seconds,
+        )
+        assignments.update(extra_assignments)
+        details.extend(extra_details)
+        total_score += extra_score
+
     print(f"✅ Region {region_id} route-ILP finished: assigned={len(assignments)}, objective_score={total_score:.2f}")
     return total_score, assignments, details
 
@@ -262,6 +319,7 @@ def _enumerate_worker_routes(
     slot_start_seconds: float,
     slot_end_seconds: float,
     max_tasks_per_worker: int,
+    max_route_tasks: int,
     branch_limit: int,
     max_routes: int,
 ) -> List[Dict]:
@@ -270,8 +328,6 @@ def _enumerate_worker_routes(
         return routes
 
     worker_arrival_at_center = slot_start_seconds + dist_worker_to_center / speed_ms
-    if worker_arrival_at_center > slot_end_seconds:
-        return routes
 
     def add_route(
         seq: List[str],
@@ -298,8 +354,11 @@ def _enumerate_worker_routes(
         used: set,
         detail_states: List[Dict],
         total_distance: float,
+        round_load: int,
     ) -> None:
         if len(routes) >= max_routes:
+            return
+        if len(seq) >= max_route_tasks:
             return
 
         candidates = []
@@ -324,13 +383,12 @@ def _enumerate_worker_routes(
             returned_to_center = False
             total_distance_after = total_distance + dist_to_task
 
-            if len(seq) + 1 >= max_tasks_per_worker:
+            next_round_load = round_load + 1
+            if next_round_load >= max_tasks_per_worker:
                 return_dist = task_to_center_dist[tid]
                 if return_dist == float("inf"):
                     continue
                 return_finish_time = arrival_time + return_dist / speed_ms
-                if return_finish_time > slot_end_seconds:
-                    continue
                 end_time = return_finish_time
                 end_node = center_node
                 returned_to_center = True
@@ -349,6 +407,7 @@ def _enumerate_worker_routes(
                     return_dist,
                     returned_to_center,
                     total_distance_after,
+                    next_round_load,
                 )
             )
 
@@ -365,6 +424,7 @@ def _enumerate_worker_routes(
                 return_dist,
                 returned_to_center,
                 total_distance_after,
+                next_round_load,
             ) = candidate
 
             dist_to_center = dist_worker_to_center if not seq else 0.0
@@ -392,6 +452,7 @@ def _enumerate_worker_routes(
                 }
             ]
             next_seq = seq + [tid]
+            next_used = used | {tid}
             add_route(
                 seq=next_seq,
                 detail_states=next_details,
@@ -399,16 +460,29 @@ def _enumerate_worker_routes(
                 returned_to_center=returned_to_center,
             )
 
-            if returned_to_center or len(next_seq) >= max_tasks_per_worker:
+            if len(next_seq) >= max_route_tasks:
+                continue
+
+            if returned_to_center:
+                dfs(
+                    current_node=center_node,
+                    current_time=end_time,
+                    seq=next_seq,
+                    used=next_used,
+                    detail_states=next_details,
+                    total_distance=total_distance_after,
+                    round_load=0,
+                )
                 continue
 
             dfs(
                 current_node=task_nodes[tid],
                 current_time=arrival_time,
                 seq=next_seq,
-                used=used | {tid},
+                used=next_used,
                 detail_states=next_details,
                 total_distance=total_distance_after,
+                round_load=next_round_load,
             )
 
     dfs(
@@ -418,6 +492,7 @@ def _enumerate_worker_routes(
         used=set(),
         detail_states=[],
         total_distance=dist_worker_to_center,
+        round_load=0,
     )
 
     deduped: Dict[Tuple[str, ...], Dict] = {}
