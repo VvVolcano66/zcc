@@ -27,6 +27,7 @@ DEFAULT_ALGORITHM_ORDER = [
     "Game-MCTGNet",
     "UABG-MCTGNet",
     "RBG-MCTGNet",
+    "Platform-RL-MCTGNet",
 ]
 
 

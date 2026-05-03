@@ -321,8 +321,8 @@ class MCTGNetDispatchPredictor:
 
             coef, *_ = np.linalg.lstsq(features, target, rcond=None)
             coef = coef.astype(np.float32)
-            coef[:3] = np.clip(coef[:3], 0.0, 3.0)
-            coef[3] = float(np.clip(coef[3], -100.0, 100.0))
+            coef[:4] = np.clip(coef[:4], 0.0, 3.0)
+            coef[4] = float(np.clip(coef[4], -100.0, 100.0))
             self.region_linear_models[rid] = coef
 
     def _fit_region_uncertainty_models(
@@ -335,7 +335,7 @@ class MCTGNetDispatchPredictor:
     ) -> None:
         sorted_region_ids = sorted(self.centers.keys())
         self.region_uncertainty_stats = {
-            rid: {'sigma': 1.0, 'q_resid': 1.0, 'under_rate': 0.0}
+            rid: {'sigma': 1.0, 'q_resid': 1.0, 'under_rate': 0.0, 'bias': 0.0, 'abs_bias': 0.0}
             for rid in sorted_region_ids
         }
         self.region_slot_uncertainty = {rid: {} for rid in sorted_region_ids}
@@ -363,10 +363,14 @@ class MCTGNetDispatchPredictor:
             sigma = max(sigma, self.min_sigma_ratio * max(float(np.mean(actual_region[:, rid_idx])), 1.0))
             q_resid = float(np.quantile(positive_residual, self.uncertainty_quantile)) if len(positive_residual) > 0 else sigma
             under_rate = float(np.mean((residual > 0).astype(np.float32))) if len(residual) > 0 else 0.0
+            pred_minus_actual_bias = float(-np.mean(residual)) if len(residual) > 0 else 0.0
+            abs_bias = float(np.mean(np.abs(residual))) if len(residual) > 0 else 0.0
             self.region_uncertainty_stats[rid] = {
                 'sigma': sigma,
                 'q_resid': max(q_resid, sigma),
                 'under_rate': under_rate,
+                'bias': pred_minus_actual_bias,
+                'abs_bias': abs_bias,
             }
 
             unique_slots = sorted(set(int(slot_id) for slot_id in slot_ids))
@@ -380,10 +384,14 @@ class MCTGNetDispatchPredictor:
                 slot_sigma = max(slot_sigma, self.min_sigma_ratio * max(float(np.mean(actual_region[mask, rid_idx])), 1.0))
                 slot_q_resid = float(np.quantile(slot_positive, self.uncertainty_quantile)) if len(slot_positive) > 0 else slot_sigma
                 slot_under_rate = float(np.mean((slot_residual > 0).astype(np.float32))) if len(slot_residual) > 0 else under_rate
+                slot_pred_minus_actual_bias = float(-np.mean(slot_residual)) if len(slot_residual) > 0 else pred_minus_actual_bias
+                slot_abs_bias = float(np.mean(np.abs(slot_residual))) if len(slot_residual) > 0 else abs_bias
                 self.region_slot_uncertainty[rid][int(slot_id)] = {
                     'sigma': slot_sigma,
                     'q_resid': max(slot_q_resid, slot_sigma),
                     'under_rate': slot_under_rate,
+                    'bias': slot_pred_minus_actual_bias,
+                    'abs_bias': slot_abs_bias,
                 }
 
     def _build_periodic_features(self, demand_tensor, all_slots):
@@ -753,13 +761,41 @@ class MCTGNetDispatchPredictor:
                     + coef[3] * weekly_total
                     + coef[4]
                 )
+            global_stats = self.region_uncertainty_stats.get(rid, {})
+            slot_stats = self.region_slot_uncertainty.get(rid, {}).get(slot_id, global_stats)
+            hist_bias = (
+                self.uncertainty_slot_blend * float(slot_stats.get('bias', global_stats.get('bias', 0.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('bias', 0.0))
+            )
+            hist_abs_bias = (
+                self.uncertainty_slot_blend * float(slot_stats.get('abs_bias', global_stats.get('abs_bias', 0.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('abs_bias', 0.0))
+            )
+            hist_sigma = (
+                self.uncertainty_slot_blend * float(slot_stats.get('sigma', global_stats.get('sigma', 1.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('sigma', 1.0))
+            )
+            anchor_total = max(
+                0.0,
+                0.45 * slot_mean + 0.35 * periodic_total + 0.20 * weekly_total,
+            )
+            corrected_total = max(0.0, calibrated_total - hist_bias)
+            historical_band = max(1.0, hist_abs_bias + 0.75 * hist_sigma)
+            if hist_bias >= 0.0:
+                lower_bound = max(0.0, anchor_total - 1.10 * historical_band)
+                upper_bound = anchor_total + 1.00 * historical_band
+            else:
+                lower_bound = max(0.0, anchor_total - 1.00 * historical_band)
+                upper_bound = anchor_total + 1.60 * historical_band
+            corrected_total = float(np.clip(corrected_total, lower_bound, upper_bound))
             if self.use_online_adaptation:
                 slot_bias = self.online_slot_bias.get(rid, {}).get(slot_id, 0.0)
                 weekday_slot_bias = self.online_weekday_slot_bias.get(rid, {}).get((weekday_id, slot_id), 0.0)
                 online_scale = self.online_region_scale.get(rid, 1.0)
                 online_bias = self.online_region_bias.get(rid, 0.0)
-                calibrated_total = calibrated_total * online_scale + online_bias + slot_bias + weekday_slot_bias
-            calibrated_region_demand[rid] = float(max(0.0, calibrated_total))
+                corrected_total = corrected_total * online_scale + online_bias + slot_bias + weekday_slot_bias
+                corrected_total = float(np.clip(corrected_total, max(0.0, lower_bound), upper_bound + 0.75 * historical_band))
+            calibrated_region_demand[rid] = float(max(0.0, corrected_total))
         return calibrated_region_demand, raw_region_demand, periodic_region_demand, slot_id, weekday_id
 
     def predict_region_demand(self, slot_timestamp: pd.Timestamp) -> Optional[Dict[int, int]]:
@@ -810,6 +846,14 @@ class MCTGNetDispatchPredictor:
                 self.uncertainty_slot_blend * float(slot_stats.get('under_rate', global_stats.get('under_rate', 0.0)))
                 + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('under_rate', 0.0))
             )
+            hist_bias = (
+                self.uncertainty_slot_blend * float(slot_stats.get('bias', global_stats.get('bias', 0.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('bias', 0.0))
+            )
+            hist_abs_bias = (
+                self.uncertainty_slot_blend * float(slot_stats.get('abs_bias', global_stats.get('abs_bias', 0.0)))
+                + (1.0 - self.uncertainty_slot_blend) * float(global_stats.get('abs_bias', 0.0))
+            )
 
             online_sigma = float(np.sqrt(max(self.online_region_sq_error.get(rid, 0.0), 0.0)))
             online_slot_sigma = float(np.sqrt(max(self.online_slot_sq_error.get(rid, {}).get(slot_id, 0.0), 0.0)))
@@ -835,6 +879,8 @@ class MCTGNetDispatchPredictor:
                 'sigma': float(sigma),
                 'q90': float(mu + max(q_resid, sigma)),
                 'burst_prob': burst_prob,
+                'hist_bias': float(hist_bias),
+                'hist_abs_bias': float(hist_abs_bias),
             }
         return distribution
 

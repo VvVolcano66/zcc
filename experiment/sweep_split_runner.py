@@ -12,13 +12,14 @@ BATCH_COUNTS = [2, 4, 6, 8, 10]
 CENTER_COUNTS = [3, 4, 5, 6, 7]
 FIXED_WORKER_COUNT = 500
 ALGORITHMS = [
-    ("greedy", "Greedy"),
-    ("imtao", "IMTAO (Seq-BDC)"),
-    ("game_only_dispatch", "NoPred-Game"),
+    # ("greedy", "Greedy"),
+    # ("imtao", "IMTAO (Seq-BDC)"),
+    # ("game_only_dispatch", "NoPred-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("predictive_game_mctgnet", "Game-MCTGNet"),
-    ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
+    # ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
     ("predictive_rl_game_mctgnet", "RBG-MCTGNet"),
+    ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -68,7 +68,7 @@ class RLRetentionBilateralState:
     max_service_debt: float = 4.0
     move_history_size: int = 8
     random_seed: int = 42
-    feature_dim: int = 11
+    feature_dim: int = 13
     prediction_error_decay: float = 0.80
     prediction_bias_clip_ratio: float = 0.75
     prediction_bias_ema: Dict[int, float] = field(default_factory=dict)
@@ -130,6 +130,8 @@ class RLRetentionBilateralState:
             float(profile.get("effective_demand", 0.0)),
         )
         debt = float(self.service_debt.get(region_id, 0.0))
+        bias_ema = float(profile.get("bias_ema", 0.0))
+        abs_err_ema = float(profile.get("abs_err_ema", 0.0))
         features = np.asarray(
             [
                 1.0,
@@ -142,6 +144,8 @@ class RLRetentionBilateralState:
                 float(base_keep * max_tasks_per_worker) / scale,
                 float(shortage_workers * max_tasks_per_worker) / scale,
                 float(neighbor_backlog_pressure) / scale,
+                bias_ema / scale,
+                abs_err_ema / scale,
                 debt / max(1.0, self.max_service_debt),
             ],
             dtype=np.float32,
@@ -205,6 +209,91 @@ class RLRetentionBilateralState:
             weights[action_idx] += self.learning_rate * grad_scale * features
 
 
+@dataclass
+class PlatformTaskFirstRLState:
+    region_ids: List[int]
+    action_profiles: Tuple[Tuple[float, float, float, float, float, float], ...] = (
+        (1.30, 1.20, 0.95, 0.82, 1.18, 0.10),
+        (1.15, 1.10, 1.00, 0.92, 1.08, 0.18),
+        (1.00, 1.00, 1.08, 1.00, 0.98, 0.28),
+        (0.92, 0.95, 1.20, 1.10, 0.88, 0.40),
+    )
+    learning_rate: float = 0.03
+    temperature: float = 0.90
+    exploration_prob: float = 0.10
+    random_seed: int = 7
+    feature_dim: int = 9
+    reward_baseline: float = 0.0
+    completion_rate_ema: float = 0.0
+    unfairness_ema: float = 0.0
+    policy_weights: np.ndarray = field(init=False)
+    rng: np.random.Generator = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.rng = np.random.default_rng(self.random_seed)
+        self.policy_weights = np.zeros((len(self.action_profiles), self.feature_dim), dtype=np.float32)
+
+    def build_features(
+        self,
+        demand_profile: Dict[int, Dict[str, float]],
+        available_workers: Dict[int, int],
+        desired_workers: Dict[int, int],
+        max_tasks_per_worker: int,
+    ) -> np.ndarray:
+        total_effective = float(sum(profile.get("effective_demand", 0.0) for profile in demand_profile.values()))
+        total_backlog = float(sum(profile.get("backlog", 0.0) for profile in demand_profile.values()))
+        mean_sigma = float(np.mean([profile.get("sigma", 0.0) for profile in demand_profile.values()])) if demand_profile else 0.0
+        mean_bias = float(np.mean([profile.get("bias_ema", 0.0) for profile in demand_profile.values()])) if demand_profile else 0.0
+        mean_abs_error = float(np.mean([profile.get("abs_err_ema", 0.0) for profile in demand_profile.values()])) if demand_profile else 0.0
+        total_capacity = float(sum(int(available_workers.get(rid, 0)) * max_tasks_per_worker for rid in self.region_ids))
+        total_shortage = float(sum(max(0, desired_workers.get(rid, 0) - int(available_workers.get(rid, 0))) for rid in self.region_ids))
+        scale = max(1.0, total_effective + total_backlog, total_capacity)
+        features = np.asarray(
+            [
+                1.0,
+                total_effective / scale,
+                total_backlog / scale,
+                mean_sigma / scale,
+                total_capacity / scale,
+                total_shortage / max(1.0, total_capacity / max(1, max_tasks_per_worker)),
+                mean_bias / scale,
+                mean_abs_error / scale,
+                float(self.unfairness_ema),
+            ],
+            dtype=np.float32,
+        )
+        return features
+
+    def sample_action(self, features: np.ndarray) -> Tuple[int, Tuple[float, float, float, float, float, float], np.ndarray]:
+        logits = self.policy_weights @ features
+        probs = _softmax(logits, self.temperature)
+        if self.rng.random() < self.exploration_prob:
+            action_idx = int(self.rng.integers(0, len(self.action_profiles)))
+        else:
+            action_idx = int(self.rng.choice(len(self.action_profiles), p=probs))
+        return action_idx, self.action_profiles[action_idx], probs
+
+    def update_policy(
+        self,
+        features: np.ndarray,
+        probs: np.ndarray,
+        action_idx: int,
+        reward: float,
+        completion_rate: float,
+        unfairness: float,
+    ) -> None:
+        baseline = float(self.reward_baseline)
+        advantage = float(reward) - baseline
+        self.reward_baseline = 0.9 * baseline + 0.1 * float(reward)
+        self.completion_rate_ema = 0.85 * float(self.completion_rate_ema) + 0.15 * float(completion_rate)
+        self.unfairness_ema = 0.85 * float(self.unfairness_ema) + 0.15 * float(unfairness)
+
+        for idx in range(self.policy_weights.shape[0]):
+            indicator = 1.0 if idx == int(action_idx) else 0.0
+            grad_scale = (indicator - float(probs[idx])) * advantage
+            self.policy_weights[idx] += self.learning_rate * grad_scale * features
+
+
 def _build_movable_workers(
     worker_sim,
     centers: Dict[int, Any],
@@ -251,25 +340,43 @@ def _build_demand_profile(
         debt = float(state.service_debt.get(rid, 0.0))
         bias_ema = float(state.prediction_bias_ema.get(rid, 0.0))
         abs_err_ema = float(state.prediction_abs_error_ema.get(rid, 0.0))
-        relative_error = abs_err_ema / max(1.0, raw_mu)
+        hist_bias = float(dist_profile.get("hist_bias", 0.0))
+        hist_abs_bias = float(dist_profile.get("hist_abs_bias", 0.0))
+        combined_bias = 0.60 * hist_bias + 0.40 * bias_ema
+        combined_abs_bias = 0.60 * hist_abs_bias + 0.40 * abs_err_ema
+        relative_error = combined_abs_bias / max(1.0, raw_mu)
 
-        corrected_mu = max(0.0, raw_mu - calibration_bias_weight * bias_ema)
-        shrink_scale = float(np.clip(
-            1.0 - calibration_shrink_weight * relative_error,
-            calibration_min_scale,
-            1.25,
-        ))
-        mu = max(0.0, corrected_mu * shrink_scale)
-        sigma = max(raw_sigma, raw_sigma * (1.0 + calibration_sigma_boost * relative_error))
+        corrected_mu = max(0.0, raw_mu - calibration_bias_weight * combined_bias)
+        shrink_scale = 1.0
+        mu = corrected_mu
+        sigma = max(
+            raw_sigma,
+            raw_sigma * (1.0 + calibration_sigma_boost * relative_error),
+            0.35 * combined_abs_bias,
+        )
         q90 = max(mu, mu + raw_tail_gap)
         tail_gap = max(0.0, q90 - mu)
-        effective = (
-            mu
-            + backlog_weight * backlog
-            + uncertainty_weight * sigma
+        base_demand = mu + backlog_weight * backlog
+        underpredict_ratio = max(0.0, -combined_bias) / max(1.0, raw_mu)
+        overpredict_ratio = max(0.0, combined_bias) / max(1.0, raw_mu)
+        risk_scale = float(np.clip(
+            0.25
+            + 0.90 * underpredict_ratio
+            + 0.20 * burst
+            - 0.35 * overpredict_ratio,
+            0.10,
+            1.05,
+        ))
+        uncertainty_component = (
+            uncertainty_weight * sigma
             + quantile_weight * tail_gap
             + burst_weight * burst * max(1.0, sigma)
         )
+        capped_uncertainty = min(
+            risk_scale * uncertainty_component,
+            0.28 * max(1.0, base_demand),
+        )
+        effective = base_demand + capped_uncertainty
         demand_profile[rid] = {
             "mu": mu,
             "sigma": sigma,
@@ -279,12 +386,64 @@ def _build_demand_profile(
             "backlog": backlog,
             "debt": debt,
             "effective_demand": effective,
+            "base_demand": base_demand,
+            "risk_scale": risk_scale,
+            "capped_uncertainty": capped_uncertainty,
             "raw_mu": raw_mu,
+            "hist_bias": hist_bias,
+            "hist_abs_bias": hist_abs_bias,
             "bias_ema": bias_ema,
+            "combined_bias": combined_bias,
             "abs_err_ema": abs_err_ema,
             "shrink_scale": shrink_scale,
         }
     return demand_profile
+
+
+def _normalize_worker_targets(
+    region_ids: List[int],
+    demand_profile: Dict[int, Dict[str, float]],
+    raw_desired_workers: Dict[int, int],
+    total_available_workers: int,
+) -> Dict[int, int]:
+    total_available_workers = max(0, int(total_available_workers))
+    total_raw_desired = int(sum(max(0, int(raw_desired_workers.get(rid, 0))) for rid in region_ids))
+    if total_available_workers <= 0 or total_raw_desired <= total_available_workers:
+        return {rid: max(0, int(raw_desired_workers.get(rid, 0))) for rid in region_ids}
+
+    score_basis = {}
+    for rid in region_ids:
+        profile = demand_profile[rid]
+        score_basis[rid] = max(
+            1e-6,
+            profile["effective_demand"] * (1.0 + 0.15 * profile["burst_prob"] + 0.10 * profile["debt"])
+        )
+    score_sum = float(sum(score_basis.values()))
+    if score_sum <= 0.0:
+        score_sum = float(len(region_ids))
+
+    normalized_targets = {}
+    fractional_targets = []
+    allocated = 0
+    for rid in region_ids:
+        target_float = total_available_workers * score_basis[rid] / score_sum
+        target_floor = int(math.floor(target_float))
+        capped_floor = min(max(0, int(raw_desired_workers.get(rid, 0))), target_floor)
+        normalized_targets[rid] = capped_floor
+        allocated += capped_floor
+        fractional_targets.append((target_float - target_floor, rid))
+
+    remaining = max(0, total_available_workers - allocated)
+    for _, rid in sorted(fractional_targets, reverse=True):
+        if remaining <= 0:
+            break
+        raw_target = max(0, int(raw_desired_workers.get(rid, 0)))
+        if normalized_targets[rid] >= raw_target:
+            continue
+        normalized_targets[rid] += 1
+        remaining -= 1
+
+    return normalized_targets
 
 
 def _select_retained_and_releasable_workers(
@@ -369,6 +528,85 @@ def _choose_worker_for_receiver(
     return top_candidates[0][1] if top_candidates else None
 
 
+def sample_platform_task_first_control(
+    region_ids: List[int],
+    predicted_demand: Dict[int, int],
+    backlog_counts: Dict[int, int],
+    available_workers: Dict[int, int],
+    max_tasks_per_worker: int,
+    retention_state: RLRetentionBilateralState,
+    platform_state: PlatformTaskFirstRLState,
+    predicted_distribution: Optional[Dict[int, Dict[str, float]]],
+    backlog_weight: float,
+    uncertainty_weight: float,
+    quantile_weight: float,
+    burst_weight: float,
+    calibration_bias_weight: float,
+    calibration_shrink_weight: float,
+    calibration_sigma_boost: float,
+    calibration_min_scale: float,
+    base_platform_task_weight: float,
+    base_platform_gap_weight: float,
+    base_platform_release_credit_weight: float,
+) -> Dict[str, Any]:
+    demand_profile = _build_demand_profile(
+        region_ids=region_ids,
+        predicted_demand=predicted_demand,
+        backlog_counts=backlog_counts,
+        state=retention_state,
+        predicted_distribution=predicted_distribution,
+        backlog_weight=backlog_weight,
+        uncertainty_weight=uncertainty_weight,
+        quantile_weight=quantile_weight,
+        burst_weight=burst_weight,
+        calibration_bias_weight=calibration_bias_weight,
+        calibration_shrink_weight=calibration_shrink_weight,
+        calibration_sigma_boost=calibration_sigma_boost,
+        calibration_min_scale=calibration_min_scale,
+    )
+    raw_desired_workers = {
+        rid: int(math.ceil(demand_profile[rid]["effective_demand"] / max(1, int(max_tasks_per_worker))))
+        for rid in region_ids
+    }
+    desired_workers = _normalize_worker_targets(
+        region_ids=region_ids,
+        demand_profile=demand_profile,
+        raw_desired_workers=raw_desired_workers,
+        total_available_workers=int(sum(max(0, int(available_workers.get(rid, 0))) for rid in region_ids)),
+    )
+    desired_workers = {
+        rid: max(
+            int(math.ceil(demand_profile[rid]["backlog"] / max(1, int(max_tasks_per_worker)))),
+            desired_workers[rid] + max(
+                0,
+                int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max(1, int(max_tasks_per_worker)) * 0.5)),
+            ),
+        )
+        for rid in region_ids
+    }
+    features = platform_state.build_features(
+        demand_profile=demand_profile,
+        available_workers=available_workers,
+        desired_workers=desired_workers,
+        max_tasks_per_worker=max_tasks_per_worker,
+    )
+    action_idx, action_profile, probs = platform_state.sample_action(features)
+    task_scale, gap_scale, release_scale, keep_scale, need_scale, fairness_weight = action_profile
+    return {
+        "features": features,
+        "probs": probs,
+        "action_idx": action_idx,
+        "task_weight": float(base_platform_task_weight * task_scale),
+        "gap_weight": float(base_platform_gap_weight * gap_scale),
+        "release_credit_weight": float(base_platform_release_credit_weight * release_scale),
+        "keep_scale": float(keep_scale),
+        "need_scale": float(need_scale),
+        "fairness_weight": float(fairness_weight),
+        "desired_workers": desired_workers,
+        "demand_profile": demand_profile,
+    }
+
+
 def rl_retention_bilateral_predispatch_workers(
     G: nx.Graph,
     worker_sim,
@@ -391,6 +629,8 @@ def rl_retention_bilateral_predispatch_workers(
     platform_task_weight: float = 0.30,
     platform_gap_weight: float = 0.55,
     platform_release_credit_weight: float = 0.35,
+    platform_keep_scale: float = 1.0,
+    platform_need_scale: float = 1.0,
     center_local_task_weight: float = 1.0,
     worker_completion_bonus: float = 0.20,
     worker_distance_penalty: float = 0.015,
@@ -432,8 +672,31 @@ def rl_retention_bilateral_predispatch_workers(
         calibration_min_scale=calibration_min_scale,
     )
 
-    desired_workers = {
+    raw_desired_workers = {
         rid: int(math.ceil(demand_profile[rid]["effective_demand"] / max_tasks_per_worker))
+        for rid in region_ids
+    }
+    normalized_desired_workers = _normalize_worker_targets(
+        region_ids=region_ids,
+        demand_profile=demand_profile,
+        raw_desired_workers=raw_desired_workers,
+        total_available_workers=int(sum(available_workers.values())),
+    )
+    stabilized_desired_workers = {
+        rid: max(
+            int(math.ceil(demand_profile[rid]["backlog"] / max_tasks_per_worker)),
+            normalized_desired_workers[rid] + max(
+                0,
+                int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max_tasks_per_worker * 0.5)),
+            ),
+        )
+        for rid in region_ids
+    }
+    desired_workers = {
+        rid: max(
+            0,
+            int(math.ceil(stabilized_desired_workers[rid] * max(0.65, float(platform_need_scale)))),
+        )
         for rid in region_ids
     }
     shortage_guess = {
@@ -461,11 +724,23 @@ def rl_retention_bilateral_predispatch_workers(
     total_backlog = float(sum(max(0, backlog_counts.get(rid, 0)) for rid in region_ids))
     for rid in region_ids:
         idle_count = available_workers.get(rid, 0)
+        bias_keep_bonus = max(
+            0,
+            int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max_tasks_per_worker * 0.5)),
+        )
         base_keep = min(
             idle_count,
             max(
                 min_buffer_workers,
-                int(math.ceil(desired_workers[rid] * (1.0 + max(0.0, reserve_ratio)))),
+                int(math.ceil(desired_workers[rid] * (1.0 + max(0.0, reserve_ratio)))) + bias_keep_bonus,
+            ),
+        )
+        keep_scale_effective = max(0.75, float(platform_keep_scale))
+        base_keep = min(
+            idle_count,
+            max(
+                min_buffer_workers,
+                int(round(base_keep * keep_scale_effective)),
             ),
         )
         safe_reserve_by_region[rid] = base_keep
@@ -682,6 +957,35 @@ def update_rl_retention_bilateral_state(
         assigned_tasks_by_region=assigned_tasks_by_region,
     )
     return reward_by_region
+
+
+def update_platform_task_first_state(
+    state: PlatformTaskFirstRLState,
+    transition: Dict[str, Any],
+    assigned_tasks_by_region: Dict[int, int],
+    total_tasks_by_region: Dict[int, int],
+    fairness_secondary_weight: float = 0.20,
+) -> Dict[str, float]:
+    total_assigned = float(sum(assigned_tasks_by_region.values()))
+    total_tasks = float(sum(total_tasks_by_region.values()))
+    completion_rate = (total_assigned / total_tasks) if total_tasks > 0 else 0.0
+    service_ratio = _compute_service_ratio(assigned_tasks_by_region, total_tasks_by_region)
+    unfairness_by_region = _compute_pairwise_unfairness(service_ratio)
+    mean_unfairness = float(np.mean(list(unfairness_by_region.values()))) if unfairness_by_region else 0.0
+    reward = total_assigned - float(fairness_secondary_weight) * mean_unfairness
+    state.update_policy(
+        features=transition["features"],
+        probs=transition["probs"],
+        action_idx=int(transition["action_idx"]),
+        reward=reward,
+        completion_rate=completion_rate,
+        unfairness=mean_unfairness,
+    )
+    return {
+        "platform_reward": reward,
+        "completion_rate": completion_rate,
+        "mean_unfairness": mean_unfairness,
+    }
 
 
 def offline_warm_start_retention_policy(
