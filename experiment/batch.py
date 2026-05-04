@@ -526,6 +526,7 @@ def _simulate_same_day_prefix_rbg_learning(
             bid_burst_weight=getattr(config, 'UABG_BID_BURST_WEIGHT', 0.6),
             ask_shortage_weight=getattr(config, 'UABG_ASK_SHORTAGE_WEIGHT', 0.85),
             ask_uncertainty_weight=getattr(config, 'UABG_ASK_UNCERTAINTY_WEIGHT', 0.65),
+            dispatch_phase='slot_start',
             hoard_discount_weight=getattr(config, 'RBG_HOARD_DISCOUNT_WEIGHT', 0.40),
             move_cost_weight=getattr(config, 'RBG_MOVE_COST_WEIGHT', 0.02),
             distance_penalty=getattr(config, 'UABG_DISTANCE_PENALTY', 0.004),
@@ -584,6 +585,7 @@ def _simulate_same_day_prefix_rbg_learning(
             total_tasks_by_region=slot_total_tasks_per_center,
             hoard_penalty_by_region=predispatch_result.get('hoard_penalty', {}),
             move_cost_by_region=predispatch_result.get('move_cost_by_region', {}),
+            moves=predispatch_result.get('moves', []),
             hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
             move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
             unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
@@ -1384,6 +1386,7 @@ def _build_intrabatch_online_tasks(
 
 
 def _should_trigger_micro_redispatch(
+        algo_name,
         current_time,
         slot_start_seconds,
         slot_end_seconds,
@@ -1396,9 +1399,14 @@ def _should_trigger_micro_redispatch(
         return False
 
     max_tasks_per_worker = int(getattr(config, 'MAX_TASKS_PER_WORKER', 4))
-    backlog_gap_threshold = int(getattr(config, 'MICROBATCH_REDISPATCH_BACKLOG_GAP_THRESHOLD', 8))
-    underpredict_ratio = float(getattr(config, 'MICROBATCH_REDISPATCH_UNDERPREDICT_RATIO', 0.25))
-    backlog_pressure_ratio = float(getattr(config, 'MICROBATCH_REDISPATCH_BACKLOG_PRESSURE_RATIO', 0.75))
+    if algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+        backlog_gap_threshold = int(getattr(config, 'RBG_MICROBATCH_REDISPATCH_BACKLOG_GAP_THRESHOLD', 4))
+        underpredict_ratio = float(getattr(config, 'RBG_MICROBATCH_REDISPATCH_UNDERPREDICT_RATIO', 0.10))
+        backlog_pressure_ratio = float(getattr(config, 'RBG_MICROBATCH_REDISPATCH_BACKLOG_PRESSURE_RATIO', 0.45))
+    else:
+        backlog_gap_threshold = int(getattr(config, 'MICROBATCH_REDISPATCH_BACKLOG_GAP_THRESHOLD', 8))
+        underpredict_ratio = float(getattr(config, 'MICROBATCH_REDISPATCH_UNDERPREDICT_RATIO', 0.25))
+        backlog_pressure_ratio = float(getattr(config, 'MICROBATCH_REDISPATCH_BACKLOG_PRESSURE_RATIO', 0.75))
 
     slot_duration = max(1.0, float(slot_end_seconds - slot_start_seconds))
     elapsed_ratio = min(1.0, max(0.0, (current_time - slot_start_seconds) / slot_duration))
@@ -1445,6 +1453,7 @@ def _run_triggered_micro_predispatch(
     }
 
     if not _should_trigger_micro_redispatch(
+        algo_name=algo_name,
         current_time=current_time,
         slot_start_seconds=slot_start_seconds,
         slot_end_seconds=slot_end_seconds,
@@ -1520,6 +1529,7 @@ def _run_triggered_micro_predispatch(
             platform_task_weight=platform_task_weight,
             platform_gap_weight=platform_gap_weight,
             platform_release_credit_weight=platform_release_credit_weight,
+            platform_fairness_weight=float(current_slot_platform_transition.get('fairness_weight', 0.0)) if current_slot_platform_transition else 0.0,
             platform_keep_scale=float(current_slot_platform_transition.get('keep_scale', 1.0)) if current_slot_platform_transition else 1.0,
             platform_need_scale=float(current_slot_platform_transition.get('need_scale', 1.0)) if current_slot_platform_transition else 1.0,
             center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
@@ -1539,6 +1549,7 @@ def _run_triggered_micro_predispatch(
             distance_penalty=getattr(config, 'UABG_DISTANCE_PENALTY', 0.004),
             candidate_k=getattr(config, 'UABG_CANDIDATE_K', 16),
             edge_epsilon=getattr(config, 'UABG_EDGE_EPSILON', 0.05),
+            dispatch_phase='micro',
             record_transition=False,
         )
         label = 'Platform-RL-Micro' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-Micro'
@@ -1703,6 +1714,7 @@ def _run_microbatch_simulation(
         current_slot_rbg_transitions = {}
         current_slot_rbg_hoard_penalty = {}
         current_slot_rbg_move_cost = {}
+        current_slot_rbg_moves = []
         current_slot_rbg_stackelberg_control = {}
         current_slot_platform_transition = None
         current_slot_platform_fairness_weight = float(getattr(config, 'PFRL_FAIRNESS_SECONDARY_WEIGHT', 0.20))
@@ -1774,6 +1786,7 @@ def _run_microbatch_simulation(
                         platform_task_weight=platform_task_weight,
                         platform_gap_weight=platform_gap_weight,
                         platform_release_credit_weight=platform_release_credit_weight,
+                        platform_fairness_weight=float(current_slot_platform_transition.get('fairness_weight', 0.0)) if current_slot_platform_transition else 0.0,
                         platform_keep_scale=float(current_slot_platform_transition.get('keep_scale', 1.0)) if current_slot_platform_transition else 1.0,
                         platform_need_scale=float(current_slot_platform_transition.get('need_scale', 1.0)) if current_slot_platform_transition else 1.0,
                         center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
@@ -1788,6 +1801,7 @@ def _run_microbatch_simulation(
                         bid_burst_weight=getattr(config, 'UABG_BID_BURST_WEIGHT', 0.6),
                         ask_shortage_weight=getattr(config, 'UABG_ASK_SHORTAGE_WEIGHT', 0.85),
                         ask_uncertainty_weight=getattr(config, 'UABG_ASK_UNCERTAINTY_WEIGHT', 0.65),
+                        dispatch_phase='slot_start',
                         hoard_discount_weight=getattr(config, 'RBG_HOARD_DISCOUNT_WEIGHT', 0.40),
                         move_cost_weight=getattr(config, 'RBG_MOVE_COST_WEIGHT', 0.02),
                         distance_penalty=getattr(config, 'UABG_DISTANCE_PENALTY', 0.004),
@@ -1798,6 +1812,7 @@ def _run_microbatch_simulation(
                     current_slot_rbg_transitions = predispatch_result.get('transitions', {})
                     current_slot_rbg_hoard_penalty = predispatch_result.get('hoard_penalty', {})
                     current_slot_rbg_move_cost = predispatch_result.get('move_cost_by_region', {})
+                    current_slot_rbg_moves = predispatch_result.get('moves', [])
                     current_slot_rbg_stackelberg_control = predispatch_result.get('stackelberg_control', {})
                     predict_label = 'Platform-RL-MCTGNet Predict' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-MCTGNet Predict'
                 elif algo_name.lower() in PREDICTIVE_UABG_ALGOS:
@@ -1903,6 +1918,7 @@ def _run_microbatch_simulation(
                             f"q90={predispatch_result['demand_profile'][rid]['q90']:.1f}, "
                             f"hbias={predispatch_result['demand_profile'][rid].get('hist_bias', 0.0):.1f}, "
                             f"cbias={predispatch_result['demand_profile'][rid].get('combined_bias', 0.0):.1f}, "
+                            f"bcap={predispatch_result['demand_profile'][rid].get('bias_cap', 0.0):.1f}, "
                             f"eff={predispatch_result['effective_demand'].get(rid, 0)}"
                             for rid in sorted(centers.keys())
                         ]
@@ -2006,7 +2022,10 @@ def _run_microbatch_simulation(
         slot_worker_ids = set()
         slot_expired_count = 0
         last_micro_redispatch_idx = -999
-        redispatch_gap = int(getattr(config, 'MICROBATCH_REDISPATCH_MIN_GAP', 2))
+        if algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+            redispatch_gap = int(getattr(config, 'RBG_MICROBATCH_REDISPATCH_MIN_GAP', 1))
+        else:
+            redispatch_gap = int(getattr(config, 'MICROBATCH_REDISPATCH_MIN_GAP', 2))
 
         for micro_idx, micro_start_seconds in enumerate(range(slot_start_seconds, slot_end_seconds, micro_batch_seconds)):
             micro_end_seconds = min(slot_end_seconds, micro_start_seconds + micro_batch_seconds)
@@ -2176,22 +2195,23 @@ def _run_microbatch_simulation(
                 assigned_tasks_by_region=slot_assigned_tasks_per_center
             )
         if retention_game_state is not None and algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS] and current_slot_rbg_transitions:
-            reward_by_region = update_rl_retention_bilateral_state(
-                state=retention_game_state,
-                transitions=current_slot_rbg_transitions,
-                assigned_tasks_by_region=slot_assigned_tasks_per_center,
-                total_tasks_by_region=slot_total_tasks_per_center,
-                hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
-                move_cost_by_region=current_slot_rbg_move_cost,
-                hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
-                move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
-                unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
-            )
-            reward_text = ", ".join(
-                [f"R{rid}: reward={reward_by_region.get(rid, 0.0):.2f}" for rid in sorted(centers.keys())]
-            )
-            reward_label = 'Platform-RL-MCTGNet Reward' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-MCTGNet Reward'
-            print(f"   [{reward_label}] {reward_text}")
+                reward_by_region = update_rl_retention_bilateral_state(
+                    state=retention_game_state,
+                    transitions=current_slot_rbg_transitions,
+                    assigned_tasks_by_region=slot_assigned_tasks_per_center,
+                    total_tasks_by_region=slot_total_tasks_per_center,
+                    hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
+                    move_cost_by_region=current_slot_rbg_move_cost,
+                    moves=current_slot_rbg_moves,
+                    hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                    move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                    unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                )
+                reward_text = ", ".join(
+                    [f"R{rid}: reward={reward_by_region.get(rid, 0.0):.2f}" for rid in sorted(centers.keys())]
+                )
+                reward_label = 'Platform-RL-MCTGNet Reward' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-MCTGNet Reward'
+                print(f"   [{reward_label}] {reward_text}")
 
         if platform_rl_state is not None and algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS and current_slot_platform_transition is not None:
             platform_stats = update_platform_task_first_state(

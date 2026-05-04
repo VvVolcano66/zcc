@@ -1,8 +1,6 @@
 import csv
 import os
 
-os.environ["MCTGNET_DISPATCH_FORCE_CPU"] = "1"
-
 import batch as batch_exp
 
 

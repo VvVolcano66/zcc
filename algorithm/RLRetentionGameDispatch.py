@@ -5,6 +5,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
+import config
 
 
 def _softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
@@ -71,11 +72,14 @@ class RLRetentionBilateralState:
     feature_dim: int = 13
     prediction_error_decay: float = 0.80
     prediction_bias_clip_ratio: float = 0.75
+    affinity_decay: float = 0.92
+    affinity_learning_rate: float = 0.12
     prediction_bias_ema: Dict[int, float] = field(default_factory=dict)
     prediction_abs_error_ema: Dict[int, float] = field(default_factory=dict)
     policy_weights: Dict[int, np.ndarray] = field(default_factory=dict)
     reward_baseline: Dict[int, float] = field(default_factory=dict)
     service_debt: Dict[int, float] = field(default_factory=dict)
+    receiver_affinity: Dict[int, Dict[int, float]] = field(default_factory=dict)
     worker_move_slots: Dict[str, Deque[int]] = field(default_factory=dict)
     rng: np.random.Generator = field(init=False)
 
@@ -88,11 +92,47 @@ class RLRetentionBilateralState:
             self.service_debt.setdefault(rid, 0.0)
             self.prediction_bias_ema.setdefault(rid, 0.0)
             self.prediction_abs_error_ema.setdefault(rid, 0.0)
+            affinity_row = self.receiver_affinity.setdefault(rid, {})
+            for target_rid in self.region_ids:
+                if target_rid == rid:
+                    continue
+                affinity_row.setdefault(target_rid, 0.0)
 
     def record_moves(self, slot_idx: int, moved_workers: Iterable[str]) -> None:
         for wid in moved_workers:
             history = self.worker_move_slots.setdefault(wid, deque(maxlen=self.move_history_size))
             history.append(int(slot_idx))
+
+    def get_receiver_affinity(self, donor_region: int, receiver_region: int) -> float:
+        if donor_region == receiver_region:
+            return 0.0
+        return float(self.receiver_affinity.get(donor_region, {}).get(receiver_region, 0.0))
+
+    def update_receiver_affinity(
+        self,
+        moves: List[Dict[str, Any]],
+        reward_by_region: Dict[int, float],
+    ) -> None:
+        decay = float(np.clip(self.affinity_decay, 0.0, 0.999))
+        lr = max(0.0, float(self.affinity_learning_rate))
+        for donor in self.region_ids:
+            row = self.receiver_affinity.setdefault(donor, {})
+            for receiver in self.region_ids:
+                if receiver == donor:
+                    continue
+                row[receiver] = decay * float(row.get(receiver, 0.0))
+
+        for move in moves:
+            donor = int(move.get("from_region", -1))
+            receiver = int(move.get("to_region", -1))
+            if donor not in self.receiver_affinity or receiver == donor:
+                continue
+            receiver_reward = float(reward_by_region.get(receiver, 0.0))
+            donor_reward = float(reward_by_region.get(donor, 0.0))
+            reward_gap = receiver_reward - donor_reward
+            signal = float(np.tanh(reward_gap / 50.0))
+            row = self.receiver_affinity.setdefault(donor, {})
+            row[receiver] = float(np.clip(row.get(receiver, 0.0) + lr * signal, -2.0, 2.0))
 
     def record_prediction_feedback(
         self,
@@ -258,7 +298,7 @@ class PlatformTaskFirstRLState:
                 total_shortage / max(1.0, total_capacity / max(1, max_tasks_per_worker)),
                 mean_bias / scale,
                 mean_abs_error / scale,
-                float(self.unfairness_ema),
+                0.0,
             ],
             dtype=np.float32,
         )
@@ -342,11 +382,21 @@ def _build_demand_profile(
         abs_err_ema = float(state.prediction_abs_error_ema.get(rid, 0.0))
         hist_bias = float(dist_profile.get("hist_bias", 0.0))
         hist_abs_bias = float(dist_profile.get("hist_abs_bias", 0.0))
-        combined_bias = 0.60 * hist_bias + 0.40 * bias_ema
-        combined_abs_bias = 0.60 * hist_abs_bias + 0.40 * abs_err_ema
+        bias_cap = max(8.0, 0.30 * max(1.0, raw_mu))
+        clipped_hist_bias = float(np.clip(hist_bias, -bias_cap, bias_cap))
+        clipped_online_bias = float(np.clip(bias_ema, -bias_cap, bias_cap))
+        bias_agreement = 1.0 if clipped_hist_bias * clipped_online_bias > 0.0 else 0.0
+        hist_bias_weight = 0.40 + 0.15 * bias_agreement
+        online_bias_weight = 0.25 + 0.20 * bias_agreement
+        combined_bias = hist_bias_weight * clipped_hist_bias + online_bias_weight * clipped_online_bias
+        combined_bias = float(np.clip(combined_bias, -bias_cap, bias_cap))
+        combined_abs_bias = min(
+            bias_cap,
+            0.60 * min(hist_abs_bias, bias_cap) + 0.40 * min(abs_err_ema, bias_cap),
+        )
         relative_error = combined_abs_bias / max(1.0, raw_mu)
 
-        corrected_mu = max(0.0, raw_mu - calibration_bias_weight * combined_bias)
+        corrected_mu = max(0.0, raw_mu)
         shrink_scale = 1.0
         mu = corrected_mu
         sigma = max(
@@ -359,24 +409,9 @@ def _build_demand_profile(
         base_demand = mu + backlog_weight * backlog
         underpredict_ratio = max(0.0, -combined_bias) / max(1.0, raw_mu)
         overpredict_ratio = max(0.0, combined_bias) / max(1.0, raw_mu)
-        risk_scale = float(np.clip(
-            0.25
-            + 0.90 * underpredict_ratio
-            + 0.20 * burst
-            - 0.35 * overpredict_ratio,
-            0.10,
-            1.05,
-        ))
-        uncertainty_component = (
-            uncertainty_weight * sigma
-            + quantile_weight * tail_gap
-            + burst_weight * burst * max(1.0, sigma)
-        )
-        capped_uncertainty = min(
-            risk_scale * uncertainty_component,
-            0.28 * max(1.0, base_demand),
-        )
-        effective = base_demand + capped_uncertainty
+        risk_scale = 0.0
+        capped_uncertainty = 0.0
+        effective = base_demand
         demand_profile[rid] = {
             "mu": mu,
             "sigma": sigma,
@@ -392,6 +427,9 @@ def _build_demand_profile(
             "raw_mu": raw_mu,
             "hist_bias": hist_bias,
             "hist_abs_bias": hist_abs_bias,
+            "bias_cap": bias_cap,
+            "clipped_hist_bias": clipped_hist_bias,
+            "clipped_online_bias": clipped_online_bias,
             "bias_ema": bias_ema,
             "combined_bias": combined_bias,
             "abs_err_ema": abs_err_ema,
@@ -451,6 +489,9 @@ def _select_retained_and_releasable_workers(
     worker_ids: List[str],
     retain_count: int,
     shortage_receivers: List[int],
+    receiver_need: Dict[int, int],
+    demand_profile: Dict[int, Dict[str, float]],
+    selection_action_ratio: float,
     worker_sim,
     centers: Dict[int, Any],
     state: RLRetentionBilateralState,
@@ -459,32 +500,68 @@ def _select_retained_and_releasable_workers(
         return [], []
 
     donor_center = centers[region_id]
-    donor_center_info = worker_sim.worker_positions.get(worker_ids[0])
-    donor_center_lon = donor_center_lat = None
+    donor_profile = demand_profile.get(region_id, {})
+    keep_bias = max(0.0, float(selection_action_ratio))
+    lend_bias = max(0.0, -float(selection_action_ratio))
+    donor_anchor = worker_sim.G.nodes[donor_center]
+    donor_lon = donor_anchor.get("x", donor_anchor.get("lon"))
+    donor_lat = donor_anchor.get("y", donor_anchor.get("lat"))
+    local_need_pressure = (
+        max(0.0, float(receiver_need.get(region_id, 0)))
+        + 0.20 * max(0.0, float(donor_profile.get("backlog", 0.0)))
+        + 0.10 * max(0.0, float(donor_profile.get("burst_prob", 0.0)))
+    )
+    donor_distance_order: List[Tuple[float, str]] = []
+    for wid in worker_ids:
+        _, worker_lon, worker_lat = worker_sim.worker_positions[wid]
+        donor_distance = _euclidean(worker_lon, worker_lat, donor_lon, donor_lat)
+        donor_distance_order.append((donor_distance, wid))
+    donor_distance_order.sort()
+    worker_local_rank = {wid: idx for idx, (_, wid) in enumerate(donor_distance_order)}
+    local_quota = max(1, min(int(retain_count), len(worker_ids)))
     scored_workers: List[Tuple[float, str]] = []
     for wid in worker_ids:
         worker_node, worker_lon, worker_lat = worker_sim.worker_positions[wid]
-        if donor_center_lon is None:
-            donor_center_lon = worker_lon
-            donor_center_lat = worker_lat
-
-        donor_anchor = worker_sim.G.nodes[donor_center]
-        donor_lon = donor_anchor.get("x", donor_anchor.get("lon"))
-        donor_lat = donor_anchor.get("y", donor_anchor.get("lat"))
         donor_distance = _euclidean(worker_lon, worker_lat, donor_lon, donor_lat)
+        donor_proximity = 1.0 / (1.0 + donor_distance)
+        local_rank = int(worker_local_rank.get(wid, len(worker_ids)))
+        local_rank_factor = 1.0 if local_rank < local_quota else max(0.15, 1.0 - 0.12 * (local_rank - local_quota + 1))
+        local_keep_value = (
+            (1.0 + 0.60 * keep_bias)
+            * (1.0 + 0.30 * local_need_pressure)
+            * donor_proximity
+            * local_rank_factor
+        )
 
-        receiver_gain = 0.0
+        best_lend_value = 0.0
         for receiver in shortage_receivers:
             if receiver == region_id:
                 continue
             receiver_anchor = worker_sim.G.nodes[centers[receiver]]
             receiver_lon = receiver_anchor.get("x", receiver_anchor.get("lon"))
             receiver_lat = receiver_anchor.get("y", receiver_anchor.get("lat"))
-            receiver_gain = max(receiver_gain, max(0.0, donor_distance - _euclidean(worker_lon, worker_lat, receiver_lon, receiver_lat)))
+            receiver_distance = _euclidean(worker_lon, worker_lat, receiver_lon, receiver_lat)
+            receiver_profile = demand_profile.get(receiver, {})
+            receiver_priority = (
+                max(0.0, float(receiver_need.get(receiver, 0)))
+                + 0.20 * max(0.0, float(receiver_profile.get("backlog", 0.0)))
+                + 0.10 * max(0.0, float(receiver_profile.get("burst_prob", 0.0)))
+                + 0.10 * max(0.0, state.get_receiver_affinity(region_id, receiver))
+            )
+            receiver_service_value = receiver_priority / (1.0 + receiver_distance)
+            lend_value = max(
+                0.0,
+                receiver_service_value - 0.35 * donor_proximity,
+            )
+            best_lend_value = max(best_lend_value, lend_value)
 
         move_history = state.worker_move_slots.get(wid)
         recent_move_penalty = 0.15 * len(move_history) if move_history is not None else 0.0
-        keep_score = -1.0 * donor_distance - 0.35 * receiver_gain + 0.20 * recent_move_penalty
+        keep_score = (
+            local_keep_value
+            - (0.45 + 0.60 * lend_bias) * best_lend_value
+            + 0.20 * recent_move_penalty
+        )
         scored_workers.append((keep_score, wid))
 
     scored_workers.sort(reverse=True)
@@ -497,6 +574,9 @@ def _choose_worker_for_receiver(
     donor_region: int,
     receiver_region: int,
     releasable_workers: List[str],
+    receiver_need: Dict[int, int],
+    demand_profile: Dict[int, Dict[str, float]],
+    donor_action_ratio: float,
     worker_sim,
     centers: Dict[int, Any],
     state: RLRetentionBilateralState,
@@ -514,13 +594,28 @@ def _choose_worker_for_receiver(
     donor_lat = donor_anchor.get("y", donor_anchor.get("lat"))
 
     ranked: List[Tuple[float, str]] = []
+    receiver_profile = demand_profile.get(receiver_region, {})
+    keep_bias = max(0.0, float(donor_action_ratio))
+    lend_bias = max(0.0, -float(donor_action_ratio))
+    learned_receiver_affinity = state.get_receiver_affinity(donor_region, receiver_region)
+    receiver_priority = (
+        1.0
+        + 0.20 * max(0.0, float(receiver_need.get(receiver_region, 0)))
+        + 0.10 * max(0.0, float(receiver_profile.get("backlog", 0.0)))
+        + 0.08 * max(0.0, float(receiver_profile.get("burst_prob", 0.0)))
+        + 0.10 * max(0.0, learned_receiver_affinity)
+    )
     for wid in releasable_workers:
         _, worker_lon, worker_lat = worker_sim.worker_positions[wid]
         receiver_distance = _euclidean(worker_lon, worker_lat, receiver_lon, receiver_lat)
         donor_distance = _euclidean(worker_lon, worker_lat, donor_lon, donor_lat)
         move_history = state.worker_move_slots.get(wid)
         move_penalty = 0.12 * len(move_history) if move_history is not None else 0.0
-        score = receiver_distance - 0.25 * donor_distance + move_penalty
+        score = (
+            (receiver_distance / (receiver_priority * (1.0 + 0.50 * lend_bias)))
+            - (0.20 + 0.20 * keep_bias) * donor_distance
+            + move_penalty
+        )
         ranked.append((score, wid))
 
     ranked.sort()
@@ -591,7 +686,7 @@ def sample_platform_task_first_control(
         max_tasks_per_worker=max_tasks_per_worker,
     )
     action_idx, action_profile, probs = platform_state.sample_action(features)
-    task_scale, gap_scale, release_scale, keep_scale, need_scale, fairness_weight = action_profile
+    task_scale, gap_scale, release_scale, keep_scale, need_scale, _fairness_weight = action_profile
     return {
         "features": features,
         "probs": probs,
@@ -601,7 +696,7 @@ def sample_platform_task_first_control(
         "release_credit_weight": float(base_platform_release_credit_weight * release_scale),
         "keep_scale": float(keep_scale),
         "need_scale": float(need_scale),
-        "fairness_weight": float(fairness_weight),
+        "fairness_weight": 0.0,
         "desired_workers": desired_workers,
         "demand_profile": demand_profile,
     }
@@ -629,6 +724,7 @@ def rl_retention_bilateral_predispatch_workers(
     platform_task_weight: float = 0.30,
     platform_gap_weight: float = 0.55,
     platform_release_credit_weight: float = 0.35,
+    platform_fairness_weight: float = 0.0,
     platform_keep_scale: float = 1.0,
     platform_need_scale: float = 1.0,
     center_local_task_weight: float = 1.0,
@@ -648,6 +744,7 @@ def rl_retention_bilateral_predispatch_workers(
     distance_penalty: float = 0.003,
     candidate_k: int = 12,
     edge_epsilon: float = 0.05,
+    dispatch_phase: str = "slot_start",
     record_transition: bool = True,
 ) -> Dict[str, Any]:
     max_tasks_per_worker = max(1, int(max_tasks_per_worker))
@@ -676,16 +773,10 @@ def rl_retention_bilateral_predispatch_workers(
         rid: int(math.ceil(demand_profile[rid]["effective_demand"] / max_tasks_per_worker))
         for rid in region_ids
     }
-    normalized_desired_workers = _normalize_worker_targets(
-        region_ids=region_ids,
-        demand_profile=demand_profile,
-        raw_desired_workers=raw_desired_workers,
-        total_available_workers=int(sum(available_workers.values())),
-    )
     stabilized_desired_workers = {
         rid: max(
             int(math.ceil(demand_profile[rid]["backlog"] / max_tasks_per_worker)),
-            normalized_desired_workers[rid] + max(
+            raw_desired_workers[rid] + max(
                 0,
                 int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max_tasks_per_worker * 0.5)),
             ),
@@ -699,6 +790,27 @@ def rl_retention_bilateral_predispatch_workers(
         )
         for rid in region_ids
     }
+    phase = str(dispatch_phase).lower()
+    current_supply_anchor = {
+        rid: max(0, int(available_workers.get(rid, 0)))
+        for rid in region_ids
+    }
+    if phase == "slot_start":
+        slot_start_blend = float(np.clip(
+            getattr(config, 'RBG_SLOT_START_DEMAND_BLEND', 0.60),
+            0.25,
+            1.0,
+        ))
+        desired_workers = {
+            rid: max(
+                0,
+                int(round(
+                    current_supply_anchor[rid] * (1.0 - slot_start_blend)
+                    + desired_workers[rid] * slot_start_blend
+                )),
+            )
+            for rid in region_ids
+        }
     shortage_guess = {
         rid: max(0.0, float(desired_workers[rid] - available_workers.get(rid, 0)))
         for rid in region_ids
@@ -724,18 +836,14 @@ def rl_retention_bilateral_predispatch_workers(
     total_backlog = float(sum(max(0, backlog_counts.get(rid, 0)) for rid in region_ids))
     for rid in region_ids:
         idle_count = available_workers.get(rid, 0)
-        bias_keep_bonus = max(
-            0,
-            int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max_tasks_per_worker * 0.5)),
-        )
         base_keep = min(
             idle_count,
             max(
                 min_buffer_workers,
-                int(math.ceil(desired_workers[rid] * (1.0 + max(0.0, reserve_ratio)))) + bias_keep_bonus,
+                int(math.ceil(desired_workers[rid])),
             ),
         )
-        keep_scale_effective = max(0.75, float(platform_keep_scale))
+        keep_scale_effective = float(np.clip(float(platform_keep_scale), 0.85, 1.15))
         base_keep = min(
             idle_count,
             max(
@@ -755,12 +863,11 @@ def rl_retention_bilateral_predispatch_workers(
             max_tasks_per_worker=max_tasks_per_worker,
         )
         action_idx, action_ratio, probs = state.sample_action(rid, features)
-        delta_keep = int(round(action_ratio * max(1, idle_count)))
-        retain_count = int(np.clip(base_keep + delta_keep, 0, idle_count))
+        retain_count = int(np.clip(base_keep, 0, idle_count))
         retain_count_by_region[rid] = retain_count
         action_ratio_by_region[rid] = action_ratio
         action_index_by_region[rid] = action_idx
-        hoard_penalty_by_region[rid] = max(0.0, retain_count - base_keep) * neighbor_backlog_pressure
+        hoard_penalty_by_region[rid] = 0.0
         platform_reward_weight_by_region[rid] = float(np.clip(
             1.0
             + platform_task_weight * (demand_profile[rid]["effective_demand"] / avg_effective_demand - 1.0)
@@ -768,10 +875,7 @@ def rl_retention_bilateral_predispatch_workers(
             0.70,
             2.50,
         ))
-        platform_release_credit_by_region[rid] = platform_release_credit_weight * max(
-            0.0,
-            idle_count - retain_count,
-        )
+        platform_release_credit_by_region[rid] = 0.0
         if record_transition:
             transitions[rid] = {
                 "features": features,
@@ -789,6 +893,12 @@ def rl_retention_bilateral_predispatch_workers(
             worker_ids=movable_workers[rid],
             retain_count=retain_count_by_region[rid],
             shortage_receivers=shortage_receivers,
+            receiver_need={
+                region: max(0, desired_workers[region] - retain_count_by_region[region])
+                for region in region_ids
+            },
+            demand_profile=demand_profile,
+            selection_action_ratio=action_ratio_by_region[rid],
             worker_sim=worker_sim,
             centers=centers,
             state=state,
@@ -807,6 +917,20 @@ def rl_retention_bilateral_predispatch_workers(
     moves: List[Dict[str, Any]] = []
     move_cost_by_region = {rid: 0.0 for rid in region_ids}
     center_distance_cache: Dict[Tuple[Any, Any], float] = {}
+    total_available_worker_count = int(sum(available_workers.values()))
+    if phase == "micro":
+        max_total_move_share = float(np.clip(
+            getattr(config, 'RBG_MICRO_MAX_MOVE_SHARE', 0.80),
+            0.05,
+            1.0,
+        ))
+    else:
+        max_total_move_share = float(np.clip(
+            getattr(config, 'RBG_SLOT_START_MAX_MOVE_SHARE', 0.45),
+            0.05,
+            1.0,
+        ))
+    max_total_moves = max(1, int(math.ceil(total_available_worker_count * max_total_move_share)))
 
     def get_center_distance(donor_region: int, receiver_region: int) -> float:
         donor_node = centers[donor_region]
@@ -822,6 +946,8 @@ def rl_retention_bilateral_predispatch_workers(
         return distance
 
     while True:
+        if len(moves) >= max_total_moves:
+            break
         best_edge = None
         best_gain = edge_epsilon
         for donor in region_ids:
@@ -842,18 +968,10 @@ def rl_retention_bilateral_predispatch_workers(
                     + platform_reward_weight_by_region[receiver]
                     + bid_shortage_weight * float(receiver_need[receiver])
                     + bid_backlog_weight * receiver_profile["backlog"]
-                    + bid_debt_weight * receiver_profile["debt"]
-                    + bid_burst_weight * receiver_profile["burst_prob"] * max(1.0, receiver_profile["sigma"])
+                    + state.get_receiver_affinity(donor, receiver)
                 )
-                ask = (
-                    center_local_task_weight * local_gap
-                    + ask_shortage_weight * local_gap
-                    + ask_uncertainty_weight * donor_profile["sigma"]
-                    + move_cost_weight * center_distance / 1000.0
-                    - platform_release_credit_by_region.get(donor, 0.0)
-                    - hoard_discount_weight * hoard_penalty_by_region.get(donor, 0.0)
-                )
-                gain = bid - ask - distance_penalty * center_distance / 1000.0
+                ask = center_local_task_weight * local_gap + ask_shortage_weight * local_gap
+                gain = bid - ask
                 if gain > best_gain:
                     best_gain = gain
                     best_edge = (donor, receiver, center_distance)
@@ -866,6 +984,9 @@ def rl_retention_bilateral_predispatch_workers(
             donor_region=donor,
             receiver_region=receiver,
             releasable_workers=releasable_workers_by_region[donor],
+            receiver_need=receiver_need,
+            demand_profile=demand_profile,
+            donor_action_ratio=action_ratio_by_region.get(donor, 0.0),
             worker_sim=worker_sim,
             centers=centers,
             state=state,
@@ -934,28 +1055,30 @@ def update_rl_retention_bilateral_state(
     total_tasks_by_region: Dict[int, int],
     hoard_penalty_by_region: Dict[int, float],
     move_cost_by_region: Dict[int, float],
+    moves: Optional[List[Dict[str, Any]]] = None,
     hoard_penalty_weight: float = 0.02,
     move_cost_weight: float = 0.08,
     unfairness_weight: float = 1.0,
 ) -> Dict[int, float]:
-    service_ratio = _compute_service_ratio(assigned_tasks_by_region, total_tasks_by_region)
-    unfairness_by_region = _compute_pairwise_unfairness(service_ratio)
     reward_by_region: Dict[int, float] = {}
+    total_assigned = float(sum(assigned_tasks_by_region.get(rid, 0) for rid in state.region_ids))
+    global_task_reward_weight = float(
+        getattr(config, 'RBG_GLOBAL_TASK_REWARD_WEIGHT', 0.35)
+    )
     for rid in state.region_ids:
         served = float(assigned_tasks_by_region.get(rid, 0))
-        platform_reward_weight = float(transitions.get(rid, {}).get("platform_reward_weight", 1.0))
-        reward_by_region[rid] = (
-            platform_reward_weight * served
-            - hoard_penalty_weight * float(hoard_penalty_by_region.get(rid, 0.0))
-            - move_cost_weight * float(move_cost_by_region.get(rid, 0.0))
-            - unfairness_weight * float(unfairness_by_region.get(rid, 0.0))
-        )
+        reward_by_region[rid] = served + global_task_reward_weight * total_assigned
     state.update_policy(
         transitions=transitions,
         reward_by_region=reward_by_region,
         total_tasks_by_region=total_tasks_by_region,
         assigned_tasks_by_region=assigned_tasks_by_region,
     )
+    if moves:
+        state.update_receiver_affinity(
+            moves=moves,
+            reward_by_region=reward_by_region,
+        )
     return reward_by_region
 
 
@@ -972,7 +1095,7 @@ def update_platform_task_first_state(
     service_ratio = _compute_service_ratio(assigned_tasks_by_region, total_tasks_by_region)
     unfairness_by_region = _compute_pairwise_unfairness(service_ratio)
     mean_unfairness = float(np.mean(list(unfairness_by_region.values()))) if unfairness_by_region else 0.0
-    reward = total_assigned - float(fairness_secondary_weight) * mean_unfairness
+    reward = total_assigned
     state.update_policy(
         features=transition["features"],
         probs=transition["probs"],

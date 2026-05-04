@@ -2,8 +2,6 @@ import argparse
 import csv
 import os
 
-os.environ["MCTGNET_DISPATCH_FORCE_CPU"] = "1"
-
 import batch as batch_exp
 from small_scale_config import (
     SMALL_SCALE_DOWNLOAD_DIST_M,
