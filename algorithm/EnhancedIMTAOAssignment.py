@@ -353,6 +353,39 @@ def enhanced_imtao_assignment_with_center_pickup(
     slot_assignments = {}
     slot_details = []
     slot_profit = 0.0
+    delayed_departure_enabled = bool(getattr(config, "ASSIGNMENT_DELAYED_DEPARTURE_ENABLED", False))
+    delay_under_cap_only = bool(getattr(config, "ASSIGNMENT_DELAY_UNDER_CAP_ONLY", True))
+    max_tasks_per_worker = int(getattr(config, "MAX_TASKS_PER_WORKER", 4))
+
+    def finalize_round_details(round_details, round_start_time, round_id):
+        if not round_details:
+            return []
+
+        round_size = len(round_details)
+        round_delay = 0.0
+        should_delay = delayed_departure_enabled and (
+            not delay_under_cap_only or round_size < max_tasks_per_worker
+        )
+        if should_delay:
+            task_slack = min(
+                float(detail.get("task_expire_time", float("inf"))) - float(detail.get("service_finish_time", 0.0))
+                for detail in round_details
+            )
+            slot_slack = slot_end_seconds - max(float(detail.get("finish_time", 0.0)) for detail in round_details)
+            round_delay = max(0.0, min(task_slack, slot_slack))
+
+        departure_time = float(round_start_time) + round_delay
+        for detail in round_details:
+            if round_delay > 0.0:
+                detail["service_finish_time"] = float(detail.get("service_finish_time", 0.0)) + round_delay
+                detail["finish_time"] = float(detail.get("finish_time", 0.0)) + round_delay
+                detail["end_time"] = float(detail.get("end_time", 0.0)) + round_delay
+            detail["round_id"] = round_id
+            detail["round_task_count"] = round_size
+            detail["departure_time"] = departure_time
+            detail["round_departure_time"] = departure_time
+
+        return round_details
 
     for c in framework.centers:
         center_node = centers_dict[c.id]
@@ -375,6 +408,9 @@ def enhanced_imtao_assignment_with_center_pickup(
                 current_finish_time = slot_start_seconds
                 first_departure_pending = False
             round_load = 0
+            current_round_id = 0
+            current_round_details = []
+            current_round_start_time = current_finish_time
 
             for task in assigned_tasks:
                 if round_load >= config.MAX_TASKS_PER_WORKER:
@@ -390,6 +426,9 @@ def enhanced_imtao_assignment_with_center_pickup(
                     current_finish_time = return_finish_time
                     current_node = center_node
                     round_load = 0
+
+                if not current_round_details:
+                    current_round_start_time = current_finish_time
 
                 task_node = task_node_map[task.id]
                 try:
@@ -429,7 +468,7 @@ def enhanced_imtao_assignment_with_center_pickup(
                 profit = reward - total_cost
 
                 slot_assignments[(w.id, task.id)] = profit
-                slot_details.append(
+                current_round_details.append(
                     {
                         "region_id": c.id,
                         "wid": w.id,
@@ -446,6 +485,7 @@ def enhanced_imtao_assignment_with_center_pickup(
                         "end_time": end_time,
                         "end_node": end_node,
                         "profit": profit,
+                        "task_expire_time": task_expire_map[task.id],
                     }
                 )
                 slot_profit += profit
@@ -454,6 +494,18 @@ def enhanced_imtao_assignment_with_center_pickup(
                 current_node = end_node
                 round_load = 0 if end_node == center_node else next_round_load
                 first_departure_pending = False
+
+                if end_node == center_node:
+                    slot_details.extend(
+                        finalize_round_details(current_round_details, current_round_start_time, current_round_id)
+                    )
+                    current_round_id += 1
+                    current_round_details = []
+
+            if current_round_details:
+                slot_details.extend(
+                    finalize_round_details(current_round_details, current_round_start_time, current_round_id)
+                )
 
     print(
         f"✅ Enhanced IMTAO-style assignment finished: "

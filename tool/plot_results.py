@@ -22,11 +22,9 @@ DEFAULT_ALGORITHM_ORDER = [
     "IMTAO",
     "IMTAO (Seq-BDC)",
     "NoPred-Game",
-    "Game-Only",
+    "NoPred-RL-Game",
     "Predictive-MCTGNet",
-    "Game-MCTGNet",
     "UABG-MCTGNet",
-    "RBG-MCTGNet",
     "Platform-RL-MCTGNet",
 ]
 

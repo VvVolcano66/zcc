@@ -9,11 +9,10 @@ CENTER_COUNTS = [3, 4, 5, 6, 7]
 ALGORITHMS = [
     ("greedy", "Greedy"),
     ("imtao", "IMTAO (Seq-BDC)"),
-    ("game_only_dispatch", "NoPred-Game"),
+    ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
-    ("predictive_game_mctgnet", "Game-MCTGNet"),
     ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
-    ("predictive_rl_game_mctgnet", "RBG-MCTGNet"),
+    ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
 ]
 
 

@@ -1345,14 +1345,16 @@ def rl_retention_bilateral_predispatch_workers(
     center_distance_cache: Dict[Tuple[Any, Any], float] = {}
     total_available_worker_count = int(sum(available_workers.values()))
     if phase == "micro":
+        move_share_scale_effective = float(np.clip(float(platform_move_share_scale), 0.20, 1.50))
         max_total_move_share = float(np.clip(
-            getattr(config, 'RBG_MICRO_MAX_MOVE_SHARE', 0.80) * max(1.0, float(platform_move_share_scale)),
-            0.05,
+            getattr(config, 'RBG_MICRO_MAX_MOVE_SHARE', 0.15) * move_share_scale_effective,
+            0.02,
             1.0,
         ))
     else:
+        move_share_scale_effective = float(np.clip(float(platform_move_share_scale), 0.70, 1.50))
         max_total_move_share = float(np.clip(
-            getattr(config, 'RBG_SLOT_START_MAX_MOVE_SHARE', 0.45) * max(1.0, float(platform_move_share_scale)),
+            getattr(config, 'RBG_SLOT_START_MAX_MOVE_SHARE', 0.45) * move_share_scale_effective,
             0.05,
             1.0,
         ))
