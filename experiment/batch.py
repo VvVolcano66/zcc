@@ -1,6 +1,8 @@
 import time
 import copy
 import os
+from datetime import datetime, timedelta
+from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -18,6 +20,8 @@ from algorithm.UncertaintyAwareBilateralDispatch import (
 from algorithm.RLRetentionGameDispatch import (
     PlatformTaskFirstRLState,
     RLRetentionBilateralState,
+    hydrate_platform_transition_with_next_state,
+    hydrate_retention_transitions_with_next_state,
     offline_warm_start_retention_policy,
     rl_retention_bilateral_predispatch_workers,
     sample_platform_task_first_control,
@@ -34,6 +38,7 @@ from algorithm.IMTAO import (
     Center as IMTAOCenter,
     IMTAO_Framework,
     IMTAO_MODE_BDC,
+    IMTAO_MODE_RBDC,
     IMTAO_MODE_DC,
     IMTAO_MODE_WO_C,
     IMTAO_SELECT_LOWEST_RHO,
@@ -377,6 +382,77 @@ def _build_rbg_offline_historical_samples(
     return samples
 
 
+def _record_prefix_action_stats(
+        stats_by_action: Dict[int, Dict[str, float]],
+        action_idx: int,
+        reward: float,
+        served: float,
+):
+    bucket = stats_by_action.setdefault(
+        int(action_idx),
+        {
+            'count': 0,
+            'reward_sum': 0.0,
+            'served_sum': 0.0,
+        }
+    )
+    bucket['count'] += 1
+    bucket['reward_sum'] += float(reward)
+    bucket['served_sum'] += float(served)
+
+
+def _summarize_prefix_action_stats(
+        action_ratios: Tuple[float, ...],
+        global_action_stats: Dict[int, Dict[str, float]],
+        region_action_stats: Dict[int, Dict[int, Dict[str, float]]],
+):
+    global_summary = []
+    for action_idx, action_ratio in enumerate(action_ratios):
+        bucket = global_action_stats.get(action_idx, {})
+        count = int(bucket.get('count', 0))
+        if count <= 0:
+            continue
+        global_summary.append(
+            {
+                'action_idx': int(action_idx),
+                'action_ratio': float(action_ratio),
+                'count': count,
+                'avg_reward': float(bucket.get('reward_sum', 0.0)) / count,
+                'avg_served': float(bucket.get('served_sum', 0.0)) / count,
+            }
+        )
+
+    dominant_region_actions = {}
+    for rid, action_map in region_action_stats.items():
+        best_entry = None
+        for action_idx, bucket in action_map.items():
+            count = int(bucket.get('count', 0))
+            if count <= 0:
+                continue
+            avg_reward = float(bucket.get('reward_sum', 0.0)) / count
+            candidate = (
+                count,
+                avg_reward,
+                -abs(float(action_ratios[action_idx])),
+                int(action_idx),
+            )
+            if best_entry is None or candidate > best_entry[0]:
+                best_entry = (
+                    candidate,
+                    {
+                        'action_idx': int(action_idx),
+                        'action_ratio': float(action_ratios[action_idx]),
+                        'count': count,
+                        'avg_reward': avg_reward,
+                        'avg_served': float(bucket.get('served_sum', 0.0)) / count,
+                    }
+                )
+        if best_entry is not None:
+            dominant_region_actions[int(rid)] = best_entry[1]
+
+    return global_summary, dominant_region_actions
+
+
 def _simulate_same_day_prefix_rbg_learning(
         state: RLRetentionBilateralState,
         test_date: str,
@@ -448,6 +524,17 @@ def _simulate_same_day_prefix_rbg_learning(
     rolling_history = {rid: [] for rid in centers.keys()}
     backlog_counts = {rid: 0 for rid in centers.keys()}
     slot_count = max(1, ((test_start_hour - prefix_start_hour) * 60) // int(time_slot_minutes))
+    global_action_stats = {
+        action_idx: {'count': 0, 'reward_sum': 0.0, 'served_sum': 0.0}
+        for action_idx in range(len(state.action_ratios))
+    }
+    region_action_stats = {
+        int(rid): {
+            action_idx: {'count': 0, 'reward_sum': 0.0, 'served_sum': 0.0}
+            for action_idx in range(len(state.action_ratios))
+        }
+        for rid in centers.keys()
+    }
 
     for local_slot_idx in range(slot_count):
         slot_start_seconds = prefix_start_seconds + local_slot_idx * time_slot_minutes * 60
@@ -578,7 +665,23 @@ def _simulate_same_day_prefix_rbg_learning(
             predicted_region_demand=slot_actual_counts,
             actual_region_demand=slot_actual_counts,
         )
-        update_rl_retention_bilateral_state(
+        next_available_workers = {
+            rid: len(prefix_worker_sim.get_available_workers_with_center_info(rid, current_time=slot_end_seconds))
+            for rid in centers.keys()
+        }
+        hydrate_retention_transitions_with_next_state(
+            state=state,
+            transitions=predispatch_result.get('transitions', {}),
+            demand_profile=predispatch_result.get('demand_profile', {}),
+            desired_workers=predispatch_result.get('desired_workers', {}),
+            available_workers=next_available_workers,
+            backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+            max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+            min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+            backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+            done=float(local_slot_idx == slot_count - 1),
+        )
+        reward_by_region = update_rl_retention_bilateral_state(
             state=state,
             transitions=predispatch_result.get('transitions', {}),
             assigned_tasks_by_region=slot_assigned_tasks_per_center,
@@ -590,11 +693,30 @@ def _simulate_same_day_prefix_rbg_learning(
             move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
             unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
         )
+        for rid, transition in predispatch_result.get('transitions', {}).items():
+            action_idx = int(transition.get('action_idx', 0))
+            reward = float(reward_by_region.get(rid, 0.0))
+            served = float(slot_assigned_tasks_per_center.get(rid, 0))
+            _record_prefix_action_stats(global_action_stats, action_idx, reward, served)
+            _record_prefix_action_stats(region_action_stats[int(rid)], action_idx, reward, served)
+
+    extra_replay_stats = state.offline_replay_train(
+        epochs=int(getattr(config, 'RBG_PREFIX_EXTRA_REPLAY_EPOCHS', 0)),
+        updates_per_region=int(getattr(config, 'RBG_PREFIX_REPLAY_UPDATES_PER_REGION', 1)),
+    )
+    global_action_summary, dominant_region_actions = _summarize_prefix_action_stats(
+        action_ratios=state.action_ratios,
+        global_action_stats=global_action_stats,
+        region_action_stats=region_action_stats,
+    )
 
     return {
         'source': 'same_day_prefix_simulation',
         'slot_count': slot_count,
         'worker_count': prefix_worker_count,
+        'extra_replay': extra_replay_stats,
+        'global_action_summary': global_action_summary,
+        'dominant_region_actions': dominant_region_actions,
     }
 
 
@@ -612,6 +734,7 @@ def _offline_warm_start_rbg_state(
         worker_sim,
 ):
     if not bool(getattr(config, 'RBG_OFFLINE_WARM_START', True)):
+        state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
         return None
 
     prefix_sim_stats = _simulate_same_day_prefix_rbg_learning(
@@ -631,6 +754,29 @@ def _offline_warm_start_rbg_state(
             f"   - RBG prefix simulation warm-start ready: slots={prefix_sim_stats['slot_count']}, "
             f"workers={prefix_sim_stats['worker_count']}, source={prefix_sim_stats['source']}"
         )
+        extra_replay = prefix_sim_stats.get('extra_replay', {})
+        if int(extra_replay.get('optimization_steps', 0)) > 0:
+            print(
+                f"   - RBG prefix replay refinement: epochs={extra_replay.get('epochs', 0)}, "
+                f"updates/region={extra_replay.get('updates_per_region', 0)}, "
+                f"opt_steps={extra_replay.get('optimization_steps', 0)}"
+            )
+        global_action_summary = prefix_sim_stats.get('global_action_summary', [])
+        if global_action_summary:
+            action_text = ", ".join(
+                f"{item['action_ratio']:+.2f}: n={item['count']}, "
+                f"avg_reward={item['avg_reward']:.1f}, avg_served={item['avg_served']:.1f}"
+                for item in global_action_summary
+            )
+            print(f"   - RBG prefix action reward: {action_text}")
+        dominant_region_actions = prefix_sim_stats.get('dominant_region_actions', {})
+        if dominant_region_actions:
+            region_text = ", ".join(
+                f"R{rid}: {info['action_ratio']:+.2f} (n={info['count']}, avg_reward={info['avg_reward']:.1f})"
+                for rid, info in sorted(dominant_region_actions.items())
+            )
+            print(f"   - RBG prefix dominant actions: {region_text}")
+        state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
         return prefix_sim_stats
 
     historical_samples = _build_rbg_offline_historical_samples(
@@ -646,6 +792,7 @@ def _offline_warm_start_rbg_state(
     )
     if not historical_samples:
         print("   - RBG offline warm-start skipped: no historical samples")
+        state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
         return None
 
     stats = offline_warm_start_retention_policy(
@@ -664,6 +811,7 @@ def _offline_warm_start_rbg_state(
         f"   - RBG offline warm-start ready: samples={stats['sample_count']}, "
         f"epochs={stats['epochs']}, source={historical_samples[0].get('source', 'unknown')}"
     )
+    state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
     return stats
 
 def _build_simulation_context(
@@ -993,6 +1141,7 @@ def run_imtao_for_slot(
         slot_end_seconds=None,
         collaboration_mode=IMTAO_MODE_BDC,
         center_selection=IMTAO_SELECT_LOWEST_RHO,
+        repartition=False,
 ):
     """
     IMTAO 算法适配器（修复版：强制增加中心取货约束）
@@ -1077,7 +1226,7 @@ def run_imtao_for_slot(
     )
     framework.initialize_existing_partition(center_task_map, center_worker_map)
     framework.algo3_game_theoretic_collaboration(
-        repartition=False,
+        repartition=repartition,
         collaboration_mode=collaboration_mode,
         center_selection=center_selection
     )
@@ -1267,7 +1416,7 @@ def _run_assignment_for_window(
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
             slot_end_seconds=slot_end_seconds,
-            collaboration_mode=IMTAO_MODE_BDC,
+            collaboration_mode=IMTAO_MODE_RBDC,
             center_selection=IMTAO_SELECT_RANDOM,
         )
     if algo_key in ['imtao_seq_dc', 'seq_dc', 'imtao_dc']:
@@ -1471,14 +1620,17 @@ def _run_triggered_micro_predispatch(
         remaining_predicted[rid] = max(0, predicted_total - observed_so_far)
 
     if algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+        batch_fine_tune = bool(getattr(config, 'RBG_BATCH_ONLINE_FINE_TUNE', True))
+        current_slot_platform_transition = None
         platform_task_weight = getattr(config, 'RBG_PLATFORM_TASK_WEIGHT', 0.30)
         platform_gap_weight = getattr(config, 'RBG_PLATFORM_GAP_WEIGHT', 0.55)
         platform_release_credit_weight = getattr(config, 'RBG_PLATFORM_RELEASE_CREDIT_WEIGHT', 0.35)
         predicted_distribution = None
         if hasattr(dispatch_predictor, 'predict_region_distribution'):
+            dispatch_base_date = pd.Timestamp(DEFAULT_TEST_DATE).date()
             predicted_distribution = dispatch_predictor.predict_region_distribution(
                 datetime.combine(
-                    DEFAULT_TEST_DATE,
+                    dispatch_base_date,
                     datetime.min.time(),
                 ) + timedelta(seconds=float(current_time))
             )
@@ -1532,6 +1684,8 @@ def _run_triggered_micro_predispatch(
             platform_fairness_weight=float(current_slot_platform_transition.get('fairness_weight', 0.0)) if current_slot_platform_transition else 0.0,
             platform_keep_scale=float(current_slot_platform_transition.get('keep_scale', 1.0)) if current_slot_platform_transition else 1.0,
             platform_need_scale=float(current_slot_platform_transition.get('need_scale', 1.0)) if current_slot_platform_transition else 1.0,
+            platform_move_share_scale=float(current_slot_platform_transition.get('move_share_scale', 1.0)) if current_slot_platform_transition else 1.0,
+            platform_slot_start_blend_scale=float(current_slot_platform_transition.get('slot_start_blend_scale', 1.0)) if current_slot_platform_transition else 1.0,
             center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
             worker_completion_bonus=getattr(config, 'RBG_WORKER_COMPLETION_BONUS', 0.20),
             worker_distance_penalty=getattr(config, 'RBG_WORKER_DISTANCE_PENALTY', 0.0),
@@ -1550,8 +1704,10 @@ def _run_triggered_micro_predispatch(
             candidate_k=getattr(config, 'UABG_CANDIDATE_K', 16),
             edge_epsilon=getattr(config, 'UABG_EDGE_EPSILON', 0.05),
             dispatch_phase='micro',
-            record_transition=False,
+            record_transition=batch_fine_tune,
         )
+        if current_slot_platform_transition is not None:
+            result['platform_transition'] = current_slot_platform_transition
         label = 'Platform-RL-Micro' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-Micro'
     elif algo_name.lower() in PREDICTIVE_UABG_ALGOS:
         predicted_distribution = None
@@ -1687,13 +1843,22 @@ def _run_microbatch_simulation(
 ):
     algo_key = algo_name.lower()
     slot_duration_seconds = int(time_slot_minutes) * 60
-    is_intrabatch_online = algo_key in INTRABATCH_ONLINE_ALGOS or micro_batch_seconds >= slot_duration_seconds
+    rbg_realtime_dispatch = (
+        algo_key in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]
+        and bool(getattr(config, 'RBG_INTRABATCH_REALTIME_DISPATCH', False))
+    )
+    is_intrabatch_online = (
+        algo_key in INTRABATCH_ONLINE_ALGOS
+        or rbg_realtime_dispatch
+        or micro_batch_seconds >= slot_duration_seconds
+    )
     all_assignments = {}
     all_details = []
     total_profit = 0.0
     total_dist_to_center = 0.0
     total_dist_to_task = 0.0
     total_expired_tasks_global = 0
+    batch_fine_tune_enabled = bool(getattr(config, 'RBG_BATCH_ONLINE_FINE_TUNE', True))
 
     for slot_idx in range(num_slots):
         slot_start_minute = slot_idx * time_slot_minutes
@@ -1716,8 +1881,12 @@ def _run_microbatch_simulation(
         current_slot_rbg_move_cost = {}
         current_slot_rbg_moves = []
         current_slot_rbg_stackelberg_control = {}
+        current_slot_rbg_demand_profile = {}
+        current_slot_rbg_desired_workers = {}
         current_slot_platform_transition = None
         current_slot_platform_fairness_weight = float(getattr(config, 'PFRL_FAIRNESS_SECONDARY_WEIGHT', 0.20))
+        last_rbg_reward_by_region = None
+        last_platform_stats = None
 
         if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', 'predictive_center_lstm', 'predictive_game_center_lstm', *PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
             one_step_predicted_demand = dispatch_predictor.predict_region_demand(slot_timestamp)
@@ -1789,6 +1958,8 @@ def _run_microbatch_simulation(
                         platform_fairness_weight=float(current_slot_platform_transition.get('fairness_weight', 0.0)) if current_slot_platform_transition else 0.0,
                         platform_keep_scale=float(current_slot_platform_transition.get('keep_scale', 1.0)) if current_slot_platform_transition else 1.0,
                         platform_need_scale=float(current_slot_platform_transition.get('need_scale', 1.0)) if current_slot_platform_transition else 1.0,
+                        platform_move_share_scale=float(current_slot_platform_transition.get('move_share_scale', 1.0)) if current_slot_platform_transition else 1.0,
+                        platform_slot_start_blend_scale=float(current_slot_platform_transition.get('slot_start_blend_scale', 1.0)) if current_slot_platform_transition else 1.0,
                         center_local_task_weight=getattr(config, 'RBG_CENTER_LOCAL_TASK_WEIGHT', 1.0),
                         worker_completion_bonus=getattr(config, 'RBG_WORKER_COMPLETION_BONUS', 0.20),
                         worker_distance_penalty=getattr(config, 'RBG_WORKER_DISTANCE_PENALTY', 0.0),
@@ -1814,7 +1985,12 @@ def _run_microbatch_simulation(
                     current_slot_rbg_move_cost = predispatch_result.get('move_cost_by_region', {})
                     current_slot_rbg_moves = predispatch_result.get('moves', [])
                     current_slot_rbg_stackelberg_control = predispatch_result.get('stackelberg_control', {})
-                    predict_label = 'Platform-RL-MCTGNet Predict' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-MCTGNet Predict'
+                    current_slot_rbg_demand_profile = predispatch_result.get('demand_profile', {})
+                    current_slot_rbg_desired_workers = predispatch_result.get('desired_workers', {})
+                    if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
+                        predict_label = 'Platform-RL-MCTGNet Predict' if platform_rl_state is not None else 'Platform-Fixed-MCTGNet Predict'
+                    else:
+                        predict_label = 'RBG-MCTGNet Predict'
                 elif algo_name.lower() in PREDICTIVE_UABG_ALGOS:
                     predispatch_result = uncertainty_aware_bilateral_predispatch_workers(
                         G=G,
@@ -2022,6 +2198,7 @@ def _run_microbatch_simulation(
         slot_worker_ids = set()
         slot_expired_count = 0
         last_micro_redispatch_idx = -999
+        total_micro = len(range(slot_start_seconds, slot_end_seconds, micro_batch_seconds))
         if algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
             redispatch_gap = int(getattr(config, 'RBG_MICROBATCH_REDISPATCH_MIN_GAP', 1))
         else:
@@ -2056,6 +2233,7 @@ def _run_microbatch_simulation(
             for region_id in centers.keys():
                 workers = worker_sim.get_available_workers_with_center_info(region_id, current_time=micro_start_seconds)
                 workers_per_center[region_id] = [(w[0], w[1], w[2], w[3], centers[region_id]) for w in workers]
+            micro_total_tasks_per_center = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
 
             if (
                 micro_idx > 0
@@ -2086,6 +2264,16 @@ def _run_microbatch_simulation(
                 )
                 if micro_dispatch_result is not None:
                     last_micro_redispatch_idx = micro_idx
+                    if algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+                        current_slot_rbg_transitions = micro_dispatch_result.get('transitions', current_slot_rbg_transitions)
+                        current_slot_rbg_hoard_penalty = micro_dispatch_result.get('hoard_penalty', current_slot_rbg_hoard_penalty)
+                        current_slot_rbg_move_cost = micro_dispatch_result.get('move_cost_by_region', current_slot_rbg_move_cost)
+                        current_slot_rbg_moves = micro_dispatch_result.get('moves', current_slot_rbg_moves)
+                        current_slot_rbg_stackelberg_control = micro_dispatch_result.get('stackelberg_control', current_slot_rbg_stackelberg_control)
+                        current_slot_rbg_demand_profile = micro_dispatch_result.get('demand_profile', current_slot_rbg_demand_profile)
+                        current_slot_rbg_desired_workers = micro_dispatch_result.get('desired_workers', current_slot_rbg_desired_workers)
+                        if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
+                            current_slot_platform_transition = micro_dispatch_result.get('platform_transition', current_slot_platform_transition)
                     for region_id in centers.keys():
                         workers = worker_sim.get_available_workers_with_center_info(region_id, current_time=micro_start_seconds)
                         workers_per_center[region_id] = [(w[0], w[1], w[2], w[3], centers[region_id]) for w in workers]
@@ -2103,6 +2291,7 @@ def _run_microbatch_simulation(
             micro_assignments = {}
             micro_profit = 0.0
             micro_details = []
+            micro_assigned_tasks_per_center = {rid: 0 for rid in centers.keys()}
             if total_current_tasks > 0 and total_workers > 0:
                 if is_intrabatch_online:
                     tasks_per_center = _build_intrabatch_online_tasks(
@@ -2136,6 +2325,7 @@ def _run_microbatch_simulation(
                 slot_profit += micro_profit
                 for detail in micro_details:
                     slot_assigned_tasks_per_center[detail['region_id']] += 1
+                    micro_assigned_tasks_per_center[detail['region_id']] += 1
                     slot_worker_ids.add(detail['wid'])
                 if micro_assignments:
                     print(
@@ -2154,6 +2344,77 @@ def _run_microbatch_simulation(
                         continue
                     new_pool.append(t)
                 unassigned_tasks_pool[rid] = new_pool
+
+            if (
+                batch_fine_tune_enabled
+                and total_micro > 1
+                and retention_game_state is not None
+                and algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]
+                and current_slot_rbg_transitions
+                and sum(micro_total_tasks_per_center.values()) > 0
+            ):
+                next_available_workers = {
+                    rid: len(worker_sim.get_available_workers_with_center_info(rid, current_time=micro_end_seconds))
+                    for rid in centers.keys()
+                }
+                hydrate_retention_transitions_with_next_state(
+                    state=retention_game_state,
+                    transitions=current_slot_rbg_transitions,
+                    demand_profile=current_slot_rbg_demand_profile,
+                    desired_workers=current_slot_rbg_desired_workers,
+                    available_workers=next_available_workers,
+                    backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+                    max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                    min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(slot_idx == num_slots - 1 and micro_idx == total_micro - 1),
+                )
+                last_rbg_reward_by_region = update_rl_retention_bilateral_state(
+                    state=retention_game_state,
+                    transitions=current_slot_rbg_transitions,
+                    assigned_tasks_by_region=micro_assigned_tasks_per_center,
+                    total_tasks_by_region=micro_total_tasks_per_center,
+                    hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
+                    move_cost_by_region=current_slot_rbg_move_cost,
+                    moves=current_slot_rbg_moves,
+                    hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                    move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                    unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                )
+                if total_micro > 1:
+                    rl_batch_label = 'Platform-RL-Batch' if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS else 'RBG-Batch'
+                    print(f"   [{rl_batch_label}] updated after batch {micro_idx + 1}/{total_micro}")
+
+            if (
+                batch_fine_tune_enabled
+                and total_micro > 1
+                and platform_rl_state is not None
+                and algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS
+                and current_slot_platform_transition is not None
+                and sum(micro_total_tasks_per_center.values()) > 0
+            ):
+                next_available_workers = {
+                    rid: len(worker_sim.get_available_workers_with_center_info(rid, current_time=micro_end_seconds))
+                    for rid in centers.keys()
+                }
+                hydrate_platform_transition_with_next_state(
+                    state=platform_rl_state,
+                    transition=current_slot_platform_transition,
+                    available_workers=next_available_workers,
+                    backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+                    max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(slot_idx == num_slots - 1 and micro_idx == total_micro - 1),
+                )
+                last_platform_stats = update_platform_task_first_state(
+                    state=platform_rl_state,
+                    transition=current_slot_platform_transition,
+                    assigned_tasks_by_region=micro_assigned_tasks_per_center,
+                    total_tasks_by_region=micro_total_tasks_per_center,
+                    fairness_secondary_weight=current_slot_platform_fairness_weight,
+                )
+                if total_micro > 1:
+                    print(f"   [Platform-RL-Batch] policy updated after batch {micro_idx + 1}/{total_micro}")
 
         total_expired_tasks_global += slot_expired_count
         leftover_count = sum(len(pool) for pool in unassigned_tasks_pool.values())
@@ -2195,18 +2456,37 @@ def _run_microbatch_simulation(
                 assigned_tasks_by_region=slot_assigned_tasks_per_center
             )
         if retention_game_state is not None and algo_name.lower() in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS] and current_slot_rbg_transitions:
-                reward_by_region = update_rl_retention_bilateral_state(
+                next_available_workers = {
+                    rid: len(worker_sim.get_available_workers_with_center_info(rid, current_time=slot_end_seconds))
+                    for rid in centers.keys()
+                }
+                hydrate_retention_transitions_with_next_state(
                     state=retention_game_state,
                     transitions=current_slot_rbg_transitions,
-                    assigned_tasks_by_region=slot_assigned_tasks_per_center,
-                    total_tasks_by_region=slot_total_tasks_per_center,
-                    hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
-                    move_cost_by_region=current_slot_rbg_move_cost,
-                    moves=current_slot_rbg_moves,
-                    hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
-                    move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
-                    unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                    demand_profile=current_slot_rbg_demand_profile,
+                    desired_workers=current_slot_rbg_desired_workers,
+                    available_workers=next_available_workers,
+                    backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+                    max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                    min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(slot_idx == num_slots - 1),
                 )
+                if batch_fine_tune_enabled and total_micro > 1:
+                    reward_by_region = last_rbg_reward_by_region or {}
+                else:
+                    reward_by_region = update_rl_retention_bilateral_state(
+                        state=retention_game_state,
+                        transitions=current_slot_rbg_transitions,
+                        assigned_tasks_by_region=slot_assigned_tasks_per_center,
+                        total_tasks_by_region=slot_total_tasks_per_center,
+                        hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
+                        move_cost_by_region=current_slot_rbg_move_cost,
+                        moves=current_slot_rbg_moves,
+                        hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                        move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                        unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                    )
                 reward_text = ", ".join(
                     [f"R{rid}: reward={reward_by_region.get(rid, 0.0):.2f}" for rid in sorted(centers.keys())]
                 )
@@ -2214,13 +2494,33 @@ def _run_microbatch_simulation(
                 print(f"   [{reward_label}] {reward_text}")
 
         if platform_rl_state is not None and algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS and current_slot_platform_transition is not None:
-            platform_stats = update_platform_task_first_state(
+            next_available_workers = {
+                rid: len(worker_sim.get_available_workers_with_center_info(rid, current_time=slot_end_seconds))
+                for rid in centers.keys()
+            }
+            hydrate_platform_transition_with_next_state(
                 state=platform_rl_state,
                 transition=current_slot_platform_transition,
-                assigned_tasks_by_region=slot_assigned_tasks_per_center,
-                total_tasks_by_region=slot_total_tasks_per_center,
-                fairness_secondary_weight=current_slot_platform_fairness_weight,
+                available_workers=next_available_workers,
+                backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+                max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                done=float(slot_idx == num_slots - 1),
             )
+            if batch_fine_tune_enabled and total_micro > 1:
+                platform_stats = last_platform_stats or {
+                    "platform_reward": 0.0,
+                    "completion_rate": 0.0,
+                    "mean_unfairness": 0.0,
+                }
+            else:
+                platform_stats = update_platform_task_first_state(
+                    state=platform_rl_state,
+                    transition=current_slot_platform_transition,
+                    assigned_tasks_by_region=slot_assigned_tasks_per_center,
+                    total_tasks_by_region=slot_total_tasks_per_center,
+                    fairness_secondary_weight=current_slot_platform_fairness_weight,
+                )
             print(
                 f"   [Platform-RL Policy] reward={platform_stats['platform_reward']:.2f}, "
                 f"completion={platform_stats['completion_rate']:.4f}, "
@@ -2285,6 +2585,11 @@ def run_online_simulation_with_center_pickup(
     algo_key = algo_name.lower()
     execution_mode = "15分钟槽在线"
     effective_micro_batch_minutes = time_slot_minutes
+    if algo_key in [*PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+        effective_micro_batch_minutes = int(
+            getattr(config, 'RBG_INTERNAL_MICRO_BATCH_MINUTES', time_slot_minutes)
+        )
+    effective_micro_batch_minutes = max(1, min(int(time_slot_minutes), int(effective_micro_batch_minutes)))
     micro_batch_seconds = effective_micro_batch_minutes * 60
     compare_slots = max(1, DEFAULT_COMPARE_SLOT_COUNT)
     compare_end_seconds = test_start_hour * 3600 + compare_slots * time_slot_minutes * 60
@@ -2372,6 +2677,11 @@ def run_online_simulation_with_center_pickup(
             learning_rate=float(getattr(config, 'RBG_LEARNING_RATE', 0.03)),
             temperature=float(getattr(config, 'RBG_TEMPERATURE', 0.85)),
             exploration_prob=float(getattr(config, 'RBG_EXPLORATION_PROB', 0.12)),
+            gamma=float(getattr(config, 'RBG_DQN_GAMMA', 0.0)),
+            replay_capacity=int(getattr(config, 'RBG_DQN_REPLAY_CAPACITY', 512)),
+            dqn_batch_size=int(getattr(config, 'RBG_DQN_BATCH_SIZE', 32)),
+            target_sync_interval=int(getattr(config, 'RBG_DQN_TARGET_SYNC_INTERVAL', 32)),
+            hidden_dim=int(getattr(config, 'RBG_POLICY_HIDDEN_DIM', 32)),
             service_debt_decay=float(getattr(config, 'RBG_SERVICE_DEBT_DECAY', 0.85)),
             max_service_debt=float(getattr(config, 'RBG_MAX_SERVICE_DEBT', 4.0)),
             move_history_size=int(getattr(config, 'RBG_MOVE_HISTORY_SIZE', 8)),
@@ -2391,12 +2701,17 @@ def run_online_simulation_with_center_pickup(
             worker_sim=worker_sim,
         )
     platform_rl_state = None
-    if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
+    if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS and bool(getattr(config, 'PFRL_ENABLE_LEARNING', False)):
         platform_rl_state = PlatformTaskFirstRLState(
             region_ids=sorted(centers.keys()),
             learning_rate=float(getattr(config, 'PFRL_LEARNING_RATE', 0.03)),
             temperature=float(getattr(config, 'PFRL_TEMPERATURE', 0.90)),
             exploration_prob=float(getattr(config, 'PFRL_EXPLORATION_PROB', 0.10)),
+            gamma=float(getattr(config, 'PFRL_DQN_GAMMA', 0.6)),
+            replay_capacity=int(getattr(config, 'PFRL_DQN_REPLAY_CAPACITY', 256)),
+            dqn_batch_size=int(getattr(config, 'PFRL_DQN_BATCH_SIZE', 32)),
+            target_sync_interval=int(getattr(config, 'PFRL_DQN_TARGET_SYNC_INTERVAL', 32)),
+            hidden_dim=int(getattr(config, 'PFRL_POLICY_HIDDEN_DIM', getattr(config, 'RBG_POLICY_HIDDEN_DIM', 32))),
             random_seed=int(getattr(config, 'PFRL_RANDOM_SEED', 7)),
         )
 
@@ -2834,7 +3149,7 @@ def run_online_simulation_with_center_pickup(
                 G=G, config=config, centers_dict=centers,
                 workers_per_center=workers_per_center, tasks_per_center=tasks_per_center,
                 slot_start_seconds=slot_start_seconds,
-                collaboration_mode=IMTAO_MODE_BDC,
+                collaboration_mode=IMTAO_MODE_RBDC,
                 center_selection=IMTAO_SELECT_RANDOM
             )
         elif algo_name.lower() in ['imtao_seq_dc', 'seq_dc', 'imtao_dc']:

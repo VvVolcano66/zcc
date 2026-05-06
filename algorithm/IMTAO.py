@@ -8,13 +8,16 @@ import config
 
 
 IMTAO_MODE_BDC = "bdc"
+IMTAO_MODE_RBDC = "rbdc"
 IMTAO_MODE_DC = "dc"
 IMTAO_MODE_WO_C = "wo_c"
-IMTAO_SUPPORTED_MODES = {IMTAO_MODE_BDC, IMTAO_MODE_DC, IMTAO_MODE_WO_C}
+IMTAO_SUPPORTED_MODES = {IMTAO_MODE_BDC, IMTAO_MODE_RBDC, IMTAO_MODE_DC, IMTAO_MODE_WO_C}
 
 IMTAO_SELECT_LOWEST_RHO = "lowest_rho"
 IMTAO_SELECT_RANDOM = "random"
 IMTAO_SUPPORTED_SELECTIONS = {IMTAO_SELECT_LOWEST_RHO, IMTAO_SELECT_RANDOM}
+
+IMTAO_DEFAULT_MAX_COLLAB_ITERATIONS = 20
 
 
 @dataclass(eq=False)
@@ -105,9 +108,12 @@ class IMTAO_Framework:
     """
     IMTAO task-assignment framework.
 
-    The paper includes a Voronoi-style initial partition. In this project we keep the
-    repository's existing region partition and only reuse the paper's assignment and
-    collaboration stages unless repartition=True is explicitly requested.
+    This implementation follows the paper's two-phase structure more closely:
+    1. Center-independent task assignment.
+    2. Game-theoretic multi-center collaboration with explicit BDC / RBDC / DC modes.
+
+    If no partition has been initialized beforehand, the framework falls back to the
+    paper-style Voronoi partition before running the two phases.
     """
 
     def __init__(
@@ -118,6 +124,8 @@ class IMTAO_Framework:
         travel_time_func=None,
         slot_duration_seconds: float = float("inf"),
         random_seed: int = 42,
+        fairness_penalty_weight: float = 1.0,
+        collaboration_max_iterations: int = IMTAO_DEFAULT_MAX_COLLAB_ITERATIONS,
     ):
         self.centers = centers
         self.tasks = tasks
@@ -125,7 +133,10 @@ class IMTAO_Framework:
         self.travel_time_func = travel_time_func
         self.slot_duration_seconds = slot_duration_seconds
         self.rng = random.Random(random_seed)
+        self.fairness_penalty_weight = float(fairness_penalty_weight)
+        self.collaboration_max_iterations = max(1, int(collaboration_max_iterations))
         self.worker_home_center: Dict[str, Center] = {}
+        self.partition_initialized = False
 
     def _travel_time(self, src, dst) -> float:
         src_node = getattr(src, "node", None)
@@ -155,7 +166,8 @@ class IMTAO_Framework:
         other_rhos = [c.rho for c in self.centers if c.id != center_id]
         if not other_rhos:
             return rho_value
-        return rho_value - sum(other_rhos) / len(other_rhos)
+        unfairness_penalty = sum(abs(rho_value - other_rho) for other_rho in other_rhos) / len(other_rhos)
+        return rho_value - self.fairness_penalty_weight * unfairness_penalty
 
     def _calculate_center_utility(self, center: Center) -> float:
         return self._calculate_center_utility_from_rho(center.id, center.rho)
@@ -320,7 +332,14 @@ class IMTAO_Framework:
                 candidate_state = self._run_sequential_assignment(center, candidate_workers)
 
             candidate_utility = self._calculate_center_utility_from_rho(center.id, candidate_state["rho"])
-            if candidate_utility > best_utility:
+            if (
+                candidate_utility > best_utility
+                or (
+                    np.isclose(candidate_utility, best_utility)
+                    and best_state is not None
+                    and candidate_state["rho"] > best_state["rho"]
+                )
+            ):
                 best_worker = worker
                 best_utility = candidate_utility
                 best_state = {
@@ -329,6 +348,33 @@ class IMTAO_Framework:
                 }
 
         return best_worker, best_state
+
+    def _resolve_center_selection(
+        self,
+        collaboration_mode: str,
+        center_selection: Optional[str],
+    ) -> str:
+        if collaboration_mode == IMTAO_MODE_RBDC:
+            return IMTAO_SELECT_RANDOM
+        if center_selection is None:
+            return IMTAO_SELECT_LOWEST_RHO
+        return center_selection
+
+    def _select_recipient_center(
+        self,
+        pending_centers: Sequence[Center],
+        center_selection: str,
+    ) -> Center:
+        if center_selection == IMTAO_SELECT_RANDOM:
+            return self.rng.choice(list(pending_centers))
+        return min(
+            pending_centers,
+            key=lambda center: (
+                self._calculate_center_utility(center),
+                center.rho,
+                center.id,
+            ),
+        )
 
     def algo1_voronoi_partition(self):
         for center in self.centers:
@@ -350,6 +396,7 @@ class IMTAO_Framework:
             center.A = []
             center.rho = 0.0
             center.borrowed_workers = []
+        self.partition_initialized = True
 
     def initialize_existing_partition(
         self,
@@ -367,6 +414,7 @@ class IMTAO_Framework:
             center.borrowed_workers = []
             for worker in center.W:
                 self.worker_home_center[worker.id] = center
+        self.partition_initialized = True
 
     def algo2_sequential_assignment(self, center: Center, workers_to_assign: Optional[Sequence[Worker]] = None):
         candidate_workers = center.W if workers_to_assign is None else list(workers_to_assign)
@@ -383,15 +431,20 @@ class IMTAO_Framework:
         self,
         repartition: bool = False,
         collaboration_mode: str = IMTAO_MODE_BDC,
-        center_selection: str = IMTAO_SELECT_LOWEST_RHO,
+        center_selection: Optional[str] = None,
     ):
         if collaboration_mode not in IMTAO_SUPPORTED_MODES:
             raise ValueError(f"Unsupported IMTAO collaboration mode: {collaboration_mode}")
-        if center_selection not in IMTAO_SUPPORTED_SELECTIONS:
+        if center_selection is not None and center_selection not in IMTAO_SUPPORTED_SELECTIONS:
             raise ValueError(f"Unsupported IMTAO center selection mode: {center_selection}")
 
-        if repartition:
+        if repartition or not self.partition_initialized:
             self.algo1_voronoi_partition()
+
+        effective_center_selection = self._resolve_center_selection(
+            collaboration_mode=collaboration_mode,
+            center_selection=center_selection,
+        )
 
         for center in self.centers:
             center.borrowed_workers = []
@@ -403,17 +456,19 @@ class IMTAO_Framework:
 
         pending_centers = [center for center in self.centers if center.rho < 1.0]
         global_w_left = [worker for center in self.centers for worker in center.W_left]
+        iteration_count = 0
 
-        while pending_centers and global_w_left:
-            if center_selection == IMTAO_SELECT_RANDOM:
-                current_center = self.rng.choice(pending_centers)
-            else:
-                current_center = min(pending_centers, key=lambda center: (center.rho, center.id))
+        while pending_centers and global_w_left and iteration_count < self.collaboration_max_iterations:
+            iteration_count += 1
+            current_center = self._select_recipient_center(
+                pending_centers=pending_centers,
+                center_selection=effective_center_selection,
+            )
 
             worker_to_move, best_state = self._select_best_worker_for_center(
                 current_center,
                 global_w_left,
-                collaboration_mode=collaboration_mode,
+                collaboration_mode=IMTAO_MODE_DC if collaboration_mode == IMTAO_MODE_DC else IMTAO_MODE_BDC,
             )
 
             if worker_to_move is None or best_state is None or best_state["rho"] <= current_center.rho:

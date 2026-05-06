@@ -5,6 +5,9 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import config
 
 
@@ -58,6 +61,21 @@ def _compute_pairwise_unfairness(service_ratio: Dict[int, float]) -> Dict[int, f
     return unfairness
 
 
+class RetentionPolicyNetwork(nn.Module):
+    def __init__(self, feature_dim: int, action_count: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_count),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features)
+
+
 @dataclass
 class RLRetentionBilateralState:
     region_ids: List[int]
@@ -65,6 +83,10 @@ class RLRetentionBilateralState:
     learning_rate: float = 0.03
     temperature: float = 0.85
     exploration_prob: float = 0.12
+    gamma: float = 0.0
+    replay_capacity: int = 512
+    dqn_batch_size: int = 32
+    target_sync_interval: int = 32
     service_debt_decay: float = 0.85
     max_service_debt: float = 4.0
     move_history_size: int = 8
@@ -74,9 +96,14 @@ class RLRetentionBilateralState:
     prediction_bias_clip_ratio: float = 0.75
     affinity_decay: float = 0.92
     affinity_learning_rate: float = 0.12
+    hidden_dim: int = 32
     prediction_bias_ema: Dict[int, float] = field(default_factory=dict)
     prediction_abs_error_ema: Dict[int, float] = field(default_factory=dict)
-    policy_weights: Dict[int, np.ndarray] = field(default_factory=dict)
+    q_networks: Dict[int, RetentionPolicyNetwork] = field(default_factory=dict)
+    target_q_networks: Dict[int, RetentionPolicyNetwork] = field(default_factory=dict)
+    q_optimizers: Dict[int, torch.optim.Optimizer] = field(default_factory=dict)
+    replay_buffers: Dict[int, Deque[Dict[str, Any]]] = field(default_factory=dict)
+    update_steps: Dict[int, int] = field(default_factory=dict)
     reward_baseline: Dict[int, float] = field(default_factory=dict)
     service_debt: Dict[int, float] = field(default_factory=dict)
     receiver_affinity: Dict[int, Dict[int, float]] = field(default_factory=dict)
@@ -87,7 +114,26 @@ class RLRetentionBilateralState:
         self.rng = np.random.default_rng(self.random_seed)
         action_count = len(self.action_ratios)
         for rid in self.region_ids:
-            self.policy_weights.setdefault(rid, np.zeros((action_count, self.feature_dim), dtype=np.float32))
+            if rid not in self.q_networks:
+                network = RetentionPolicyNetwork(
+                    feature_dim=self.feature_dim,
+                    action_count=action_count,
+                    hidden_dim=max(8, int(self.hidden_dim)),
+                )
+                target_network = RetentionPolicyNetwork(
+                    feature_dim=self.feature_dim,
+                    action_count=action_count,
+                    hidden_dim=max(8, int(self.hidden_dim)),
+                )
+                target_network.load_state_dict(network.state_dict())
+                self.q_networks[rid] = network
+                self.target_q_networks[rid] = target_network
+            self.q_optimizers.setdefault(
+                rid,
+                torch.optim.Adam(self.q_networks[rid].parameters(), lr=self.learning_rate),
+            )
+            self.replay_buffers.setdefault(rid, deque(maxlen=max(32, int(self.replay_capacity))))
+            self.update_steps.setdefault(rid, 0)
             self.reward_baseline.setdefault(rid, 0.0)
             self.service_debt.setdefault(rid, 0.0)
             self.prediction_bias_ema.setdefault(rid, 0.0)
@@ -97,6 +143,9 @@ class RLRetentionBilateralState:
                 if target_rid == rid:
                     continue
                 affinity_row.setdefault(target_rid, 0.0)
+
+    def set_exploration_prob(self, exploration_prob: float) -> None:
+        self.exploration_prob = float(np.clip(float(exploration_prob), 0.0, 1.0))
 
     def record_moves(self, slot_idx: int, moved_workers: Iterable[str]) -> None:
         for wid in moved_workers:
@@ -192,15 +241,55 @@ class RLRetentionBilateralState:
         )
         return features
 
+    def _q_values(self, region_id: int, features: np.ndarray) -> torch.Tensor:
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        return self.q_networks[region_id](feature_tensor).squeeze(0)
+
     def sample_action(self, region_id: int, features: np.ndarray) -> Tuple[int, float, np.ndarray]:
-        weights = self.policy_weights[region_id]
-        logits = weights @ features
-        probs = _softmax(logits, self.temperature)
+        with torch.no_grad():
+            q_values = self._q_values(region_id, features)
+            probs_tensor = torch.softmax(q_values / max(1e-6, float(self.temperature)), dim=-1)
+        probs = probs_tensor.cpu().numpy().astype(np.float32)
         if self.rng.random() < self.exploration_prob:
             action_idx = int(self.rng.integers(0, len(self.action_ratios)))
         else:
-            action_idx = int(self.rng.choice(len(self.action_ratios), p=probs))
+            action_idx = int(torch.argmax(q_values).item())
         return action_idx, float(self.action_ratios[action_idx]), probs
+
+    def _sync_target_network(self, region_id: int) -> None:
+        self.target_q_networks[region_id].load_state_dict(self.q_networks[region_id].state_dict())
+
+    def _train_region_q_network(self, region_id: int) -> None:
+        replay_buffer = self.replay_buffers[region_id]
+        batch_size = min(len(replay_buffer), max(1, int(self.dqn_batch_size)))
+        if batch_size <= 0:
+            return
+
+        sample_indices = self.rng.choice(len(replay_buffer), size=batch_size, replace=False)
+        batch = [replay_buffer[int(idx)] for idx in sample_indices]
+
+        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32)
+        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long)
+        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32)
+        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32)
+        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32)
+
+        q_values = self.q_networks[region_id](states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            online_next_q = self.q_networks[region_id](next_states)
+            next_actions = torch.argmax(online_next_q, dim=1)
+            target_next_q = self.target_q_networks[region_id](next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            targets = rewards + (1.0 - dones) * float(self.gamma) * target_next_q
+
+        optimizer = self.q_optimizers[region_id]
+        optimizer.zero_grad()
+        loss = F.smooth_l1_loss(q_values, targets)
+        loss.backward()
+        optimizer.step()
+
+        self.update_steps[region_id] += 1
+        if self.update_steps[region_id] % max(1, int(self.target_sync_interval)) == 0:
+            self._sync_target_network(region_id)
 
     def update_policy(
         self,
@@ -221,17 +310,46 @@ class RLRetentionBilateralState:
         for rid, transition in transitions.items():
             reward = float(reward_by_region.get(rid, 0.0))
             baseline = float(self.reward_baseline.get(rid, 0.0))
-            advantage = reward - baseline
             self.reward_baseline[rid] = 0.9 * baseline + 0.1 * reward
 
-            features = transition["features"]
-            probs = transition["probs"]
-            chosen_idx = int(transition["action_idx"])
-            weights = self.policy_weights[rid]
-            for action_idx in range(weights.shape[0]):
-                indicator = 1.0 if action_idx == chosen_idx else 0.0
-                grad_scale = (indicator - float(probs[action_idx])) * advantage
-                weights[action_idx] += self.learning_rate * grad_scale * features
+            features = np.asarray(transition["features"], dtype=np.float32)
+            next_features = np.asarray(transition.get("next_features", features), dtype=np.float32)
+            self.replay_buffers[rid].append(
+                {
+                    "features": features,
+                    "action_idx": int(transition["action_idx"]),
+                    "reward": reward,
+                    "next_features": next_features,
+                    "done": float(transition.get("done", 1.0)),
+                }
+            )
+            self._train_region_q_network(rid)
+
+    def offline_replay_train(
+        self,
+        epochs: int = 1,
+        updates_per_region: int = 1,
+    ) -> Dict[str, int]:
+        epochs = max(0, int(epochs))
+        updates_per_region = max(1, int(updates_per_region))
+        optimization_steps = 0
+        trained_regions = set()
+
+        for _ in range(epochs):
+            for rid in self.region_ids:
+                if not self.replay_buffers.get(rid):
+                    continue
+                trained_regions.add(rid)
+                for _ in range(updates_per_region):
+                    self._train_region_q_network(rid)
+                    optimization_steps += 1
+
+        return {
+            "epochs": epochs,
+            "updates_per_region": updates_per_region,
+            "trained_region_count": len(trained_regions),
+            "optimization_steps": optimization_steps,
+        }
 
     def imitation_update(
         self,
@@ -240,13 +358,15 @@ class RLRetentionBilateralState:
         target_action_idx: int,
         strength: float = 1.0,
     ) -> None:
-        weights = self.policy_weights[region_id]
-        logits = weights @ features
-        probs = _softmax(logits, self.temperature)
-        for action_idx in range(weights.shape[0]):
-            indicator = 1.0 if action_idx == int(target_action_idx) else 0.0
-            grad_scale = (indicator - float(probs[action_idx])) * float(strength)
-            weights[action_idx] += self.learning_rate * grad_scale * features
+        optimizer = self.q_optimizers[region_id]
+        optimizer.zero_grad()
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        logits = self.q_networks[region_id](feature_tensor)
+        target_tensor = torch.as_tensor([int(target_action_idx)], dtype=torch.long)
+        loss = F.cross_entropy(logits, target_tensor) * float(strength)
+        loss.backward()
+        optimizer.step()
+        self._sync_target_network(region_id)
 
 
 @dataclass
@@ -261,17 +381,45 @@ class PlatformTaskFirstRLState:
     learning_rate: float = 0.03
     temperature: float = 0.90
     exploration_prob: float = 0.10
+    gamma: float = 0.6
+    replay_capacity: int = 256
+    dqn_batch_size: int = 32
+    target_sync_interval: int = 32
+    hidden_dim: int = 32
     random_seed: int = 7
     feature_dim: int = 9
     reward_baseline: float = 0.0
     completion_rate_ema: float = 0.0
     unfairness_ema: float = 0.0
-    policy_weights: np.ndarray = field(init=False)
+    q_network: Optional[RetentionPolicyNetwork] = None
+    target_q_network: Optional[RetentionPolicyNetwork] = None
+    q_optimizer: Optional[torch.optim.Optimizer] = None
+    replay_buffer: Deque[Dict[str, Any]] = field(default_factory=deque)
+    update_steps: int = 0
     rng: np.random.Generator = field(init=False)
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.random_seed)
-        self.policy_weights = np.zeros((len(self.action_profiles), self.feature_dim), dtype=np.float32)
+        action_count = len(self.action_profiles)
+        if self.q_network is None:
+            self.q_network = RetentionPolicyNetwork(
+                feature_dim=self.feature_dim,
+                action_count=action_count,
+                hidden_dim=max(8, int(self.hidden_dim)),
+            )
+        if self.target_q_network is None:
+            self.target_q_network = RetentionPolicyNetwork(
+                feature_dim=self.feature_dim,
+                action_count=action_count,
+                hidden_dim=max(8, int(self.hidden_dim)),
+            )
+            self.target_q_network.load_state_dict(self.q_network.state_dict())
+        if self.q_optimizer is None:
+            self.q_optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
+        if not isinstance(self.replay_buffer, deque):
+            self.replay_buffer = deque(self.replay_buffer, maxlen=max(32, int(self.replay_capacity)))
+        else:
+            self.replay_buffer = deque(self.replay_buffer, maxlen=max(32, int(self.replay_capacity)))
 
     def build_features(
         self,
@@ -304,34 +452,112 @@ class PlatformTaskFirstRLState:
         )
         return features
 
+    def set_exploration_prob(self, exploration_prob: float) -> None:
+        self.exploration_prob = float(np.clip(float(exploration_prob), 0.0, 1.0))
+
+    def _q_values(self, features: np.ndarray) -> torch.Tensor:
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        return self.q_network(feature_tensor).squeeze(0)
+
     def sample_action(self, features: np.ndarray) -> Tuple[int, Tuple[float, float, float, float, float, float], np.ndarray]:
-        logits = self.policy_weights @ features
-        probs = _softmax(logits, self.temperature)
+        with torch.no_grad():
+            q_values = self._q_values(features)
+            probs_tensor = torch.softmax(q_values / max(1e-6, float(self.temperature)), dim=-1)
+        probs = probs_tensor.cpu().numpy().astype(np.float32)
         if self.rng.random() < self.exploration_prob:
             action_idx = int(self.rng.integers(0, len(self.action_profiles)))
         else:
-            action_idx = int(self.rng.choice(len(self.action_profiles), p=probs))
+            action_idx = int(torch.argmax(q_values).item())
         return action_idx, self.action_profiles[action_idx], probs
+
+    def _sync_target_network(self) -> None:
+        self.target_q_network.load_state_dict(self.q_network.state_dict())
+
+    def _train_q_network(self) -> None:
+        batch_size = min(len(self.replay_buffer), max(1, int(self.dqn_batch_size)))
+        if batch_size <= 0:
+            return
+
+        sample_indices = self.rng.choice(len(self.replay_buffer), size=batch_size, replace=False)
+        batch = [self.replay_buffer[int(idx)] for idx in sample_indices]
+
+        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32)
+        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long)
+        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32)
+        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32)
+        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32)
+
+        q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            online_next_q = self.q_network(next_states)
+            next_actions = torch.argmax(online_next_q, dim=1)
+            target_next_q = self.target_q_network(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            targets = rewards + (1.0 - dones) * float(self.gamma) * target_next_q
+
+        self.q_optimizer.zero_grad()
+        loss = F.smooth_l1_loss(q_values, targets)
+        loss.backward()
+        self.q_optimizer.step()
+
+        self.update_steps += 1
+        if self.update_steps % max(1, int(self.target_sync_interval)) == 0:
+            self._sync_target_network()
 
     def update_policy(
         self,
         features: np.ndarray,
-        probs: np.ndarray,
         action_idx: int,
         reward: float,
         completion_rate: float,
         unfairness: float,
+        next_features: Optional[np.ndarray] = None,
+        done: float = 1.0,
     ) -> None:
         baseline = float(self.reward_baseline)
-        advantage = float(reward) - baseline
         self.reward_baseline = 0.9 * baseline + 0.1 * float(reward)
         self.completion_rate_ema = 0.85 * float(self.completion_rate_ema) + 0.15 * float(completion_rate)
         self.unfairness_ema = 0.85 * float(self.unfairness_ema) + 0.15 * float(unfairness)
+        next_features = np.asarray(next_features if next_features is not None else features, dtype=np.float32)
+        self.replay_buffer.append(
+            {
+                "features": np.asarray(features, dtype=np.float32),
+                "action_idx": int(action_idx),
+                "reward": float(reward),
+                "next_features": next_features,
+                "done": float(done),
+            }
+        )
+        self._train_q_network()
 
-        for idx in range(self.policy_weights.shape[0]):
-            indicator = 1.0 if idx == int(action_idx) else 0.0
-            grad_scale = (indicator - float(probs[idx])) * advantage
-            self.policy_weights[idx] += self.learning_rate * grad_scale * features
+
+def hydrate_platform_transition_with_next_state(
+    state: PlatformTaskFirstRLState,
+    transition: Dict[str, Any],
+    available_workers: Dict[int, int],
+    backlog_counts: Dict[int, int],
+    max_tasks_per_worker: int,
+    backlog_weight: float = 1.0,
+    done: float = 0.0,
+) -> Dict[str, Any]:
+    if not transition:
+        return transition
+
+    demand_profile = {rid: dict(profile) for rid, profile in transition.get("demand_profile", {}).items()}
+    desired_workers = dict(transition.get("desired_workers", {}))
+    for rid, profile in demand_profile.items():
+        backlog = float(max(0, int(backlog_counts.get(rid, 0))))
+        profile["backlog"] = backlog
+        profile["base_demand"] = float(profile.get("mu", 0.0)) + float(backlog_weight) * backlog
+        profile["effective_demand"] = profile["base_demand"]
+
+    transition["next_features"] = state.build_features(
+        demand_profile=demand_profile,
+        available_workers=available_workers,
+        desired_workers=desired_workers,
+        max_tasks_per_worker=max_tasks_per_worker,
+    )
+    transition["done"] = float(done)
+    return transition
 
 
 def _build_movable_workers(
@@ -482,6 +708,102 @@ def _normalize_worker_targets(
         remaining -= 1
 
     return normalized_targets
+
+
+def _compute_task_max_abundance_controls(
+    total_available_workers: int,
+    total_desired_workers: int,
+) -> Dict[str, float]:
+    controls = {
+        "abundance_ratio": 1.0,
+        "abundance_strength": 0.0,
+        "task_weight_scale": 1.0,
+        "gap_weight_scale": 1.0,
+        "keep_scale": 1.0,
+        "need_scale": 1.0,
+        "slot_start_blend_scale": 1.0,
+        "move_share_scale": 1.0,
+    }
+    if not bool(getattr(config, "RBG_TASK_MAX_MODE", False)):
+        return controls
+
+    total_desired_workers = max(1, int(total_desired_workers))
+    abundance_ratio = float(total_available_workers) / float(total_desired_workers)
+    threshold = float(getattr(config, "RBG_TASK_MAX_ABUNDANCE_THRESHOLD", 1.05))
+    ramp = max(0.05, float(getattr(config, "RBG_TASK_MAX_ABUNDANCE_RAMP", 0.30)))
+    abundance_strength = float(np.clip((abundance_ratio - threshold) / ramp, 0.0, 1.0))
+
+    controls["abundance_ratio"] = abundance_ratio
+    controls["abundance_strength"] = abundance_strength
+    if abundance_strength <= 0.0:
+        return controls
+
+    controls["task_weight_scale"] = 1.0 + abundance_strength * float(
+        getattr(config, "RBG_TASK_MAX_TASK_WEIGHT_BOOST", 0.40)
+    )
+    controls["gap_weight_scale"] = 1.0 + abundance_strength * float(
+        getattr(config, "RBG_TASK_MAX_GAP_WEIGHT_BOOST", 0.30)
+    )
+    controls["keep_scale"] = max(
+        0.70,
+        1.0 - abundance_strength * float(getattr(config, "RBG_TASK_MAX_KEEP_SCALE_DROP", 0.15)),
+    )
+    controls["need_scale"] = 1.0 + abundance_strength * float(
+        getattr(config, "RBG_TASK_MAX_NEED_SCALE_BOOST", 0.18)
+    )
+    controls["slot_start_blend_scale"] = 1.0 + abundance_strength * float(
+        getattr(config, "RBG_TASK_MAX_SLOT_BLEND_BOOST", 0.08)
+    )
+    controls["move_share_scale"] = 1.0 + abundance_strength * float(
+        getattr(config, "RBG_TASK_MAX_MOVE_SHARE_BOOST", 0.20)
+    )
+    return controls
+
+
+def hydrate_retention_transitions_with_next_state(
+    state: RLRetentionBilateralState,
+    transitions: Dict[int, Dict[str, Any]],
+    demand_profile: Dict[int, Dict[str, float]],
+    desired_workers: Dict[int, int],
+    available_workers: Dict[int, int],
+    backlog_counts: Dict[int, int],
+    max_tasks_per_worker: int,
+    min_buffer_workers: int = 1,
+    backlog_weight: float = 1.0,
+    done: float = 0.0,
+) -> Dict[int, Dict[str, Any]]:
+    if not transitions:
+        return transitions
+
+    total_backlog = float(sum(max(0, int(backlog_counts.get(rid, 0))) for rid in transitions.keys()))
+    for rid, transition in transitions.items():
+        profile = dict(demand_profile.get(rid, {}))
+        backlog = float(max(0, int(backlog_counts.get(rid, 0))))
+        profile["backlog"] = backlog
+        profile["base_demand"] = float(profile.get("mu", 0.0)) + float(backlog_weight) * backlog
+        profile["effective_demand"] = profile["base_demand"]
+
+        idle_count = max(0, int(available_workers.get(rid, 0)))
+        desired = max(0, int(desired_workers.get(rid, 0)))
+        base_keep = min(
+            idle_count,
+            max(int(min_buffer_workers), int(math.ceil(desired))),
+        )
+        shortage_workers = max(0.0, float(desired - idle_count))
+        neighbor_backlog_pressure = max(0.0, total_backlog - backlog)
+        next_features = state.build_features(
+            region_id=rid,
+            demand_profile={rid: profile},
+            available_workers=available_workers,
+            base_keep=base_keep,
+            shortage_workers=shortage_workers,
+            neighbor_backlog_pressure=neighbor_backlog_pressure,
+            max_tasks_per_worker=max_tasks_per_worker,
+        )
+        transition["next_features"] = next_features
+        transition["done"] = float(done)
+
+    return transitions
 
 
 def _select_retained_and_releasable_workers(
@@ -679,6 +1001,10 @@ def sample_platform_task_first_control(
         )
         for rid in region_ids
     }
+    abundance_controls = _compute_task_max_abundance_controls(
+        total_available_workers=int(sum(max(0, int(available_workers.get(rid, 0))) for rid in region_ids)),
+        total_desired_workers=int(sum(max(0, int(desired_workers.get(rid, 0))) for rid in region_ids)),
+    )
     features = platform_state.build_features(
         demand_profile=demand_profile,
         available_workers=available_workers,
@@ -687,6 +1013,10 @@ def sample_platform_task_first_control(
     )
     action_idx, action_profile, probs = platform_state.sample_action(features)
     task_scale, gap_scale, release_scale, keep_scale, need_scale, _fairness_weight = action_profile
+    task_scale *= abundance_controls["task_weight_scale"]
+    gap_scale *= abundance_controls["gap_weight_scale"]
+    keep_scale *= abundance_controls["keep_scale"]
+    need_scale *= abundance_controls["need_scale"]
     return {
         "features": features,
         "probs": probs,
@@ -699,6 +1029,10 @@ def sample_platform_task_first_control(
         "fairness_weight": 0.0,
         "desired_workers": desired_workers,
         "demand_profile": demand_profile,
+        "move_share_scale": float(abundance_controls["move_share_scale"]),
+        "slot_start_blend_scale": float(abundance_controls["slot_start_blend_scale"]),
+        "abundance_ratio": float(abundance_controls["abundance_ratio"]),
+        "abundance_strength": float(abundance_controls["abundance_strength"]),
     }
 
 
@@ -727,6 +1061,8 @@ def rl_retention_bilateral_predispatch_workers(
     platform_fairness_weight: float = 0.0,
     platform_keep_scale: float = 1.0,
     platform_need_scale: float = 1.0,
+    platform_move_share_scale: float = 1.0,
+    platform_slot_start_blend_scale: float = 1.0,
     center_local_task_weight: float = 1.0,
     worker_completion_bonus: float = 0.20,
     worker_distance_penalty: float = 0.015,
@@ -773,10 +1109,16 @@ def rl_retention_bilateral_predispatch_workers(
         rid: int(math.ceil(demand_profile[rid]["effective_demand"] / max_tasks_per_worker))
         for rid in region_ids
     }
+    allocation_target_workers = _normalize_worker_targets(
+        region_ids=region_ids,
+        demand_profile=demand_profile,
+        raw_desired_workers=raw_desired_workers,
+        total_available_workers=int(sum(available_workers.values())),
+    )
     stabilized_desired_workers = {
         rid: max(
             int(math.ceil(demand_profile[rid]["backlog"] / max_tasks_per_worker)),
-            raw_desired_workers[rid] + max(
+            allocation_target_workers[rid] + max(
                 0,
                 int(math.ceil(max(0.0, -demand_profile[rid].get("combined_bias", 0.0)) / max_tasks_per_worker * 0.5)),
             ),
@@ -797,7 +1139,7 @@ def rl_retention_bilateral_predispatch_workers(
     }
     if phase == "slot_start":
         slot_start_blend = float(np.clip(
-            getattr(config, 'RBG_SLOT_START_DEMAND_BLEND', 0.60),
+            getattr(config, 'RBG_SLOT_START_DEMAND_BLEND', 0.60) * max(0.85, float(platform_slot_start_blend_scale)),
             0.25,
             1.0,
         ))
@@ -844,6 +1186,7 @@ def rl_retention_bilateral_predispatch_workers(
             ),
         )
         keep_scale_effective = float(np.clip(float(platform_keep_scale), 0.85, 1.15))
+        keep_scale_effective = float(np.clip(keep_scale_effective, 0.70, 1.20))
         base_keep = min(
             idle_count,
             max(
@@ -920,13 +1263,13 @@ def rl_retention_bilateral_predispatch_workers(
     total_available_worker_count = int(sum(available_workers.values()))
     if phase == "micro":
         max_total_move_share = float(np.clip(
-            getattr(config, 'RBG_MICRO_MAX_MOVE_SHARE', 0.80),
+            getattr(config, 'RBG_MICRO_MAX_MOVE_SHARE', 0.80) * max(1.0, float(platform_move_share_scale)),
             0.05,
             1.0,
         ))
     else:
         max_total_move_share = float(np.clip(
-            getattr(config, 'RBG_SLOT_START_MAX_MOVE_SHARE', 0.45),
+            getattr(config, 'RBG_SLOT_START_MAX_MOVE_SHARE', 0.45) * max(1.0, float(platform_move_share_scale)),
             0.05,
             1.0,
         ))
@@ -1030,6 +1373,8 @@ def rl_retention_bilateral_predispatch_workers(
         "available_workers": available_workers,
         "desired_workers": desired_workers,
         "retain_count": retain_count_by_region,
+        "raw_desired_workers": raw_desired_workers,
+        "allocation_target_workers": allocation_target_workers,
         "retained_workers": retained_workers_by_region,
         "releasable_workers": releasable_workers_by_region,
         "demand_profile": demand_profile,
@@ -1098,9 +1443,10 @@ def update_platform_task_first_state(
     reward = total_assigned
     state.update_policy(
         features=transition["features"],
-        probs=transition["probs"],
         action_idx=int(transition["action_idx"]),
         reward=reward,
+        next_features=transition.get("next_features"),
+        done=float(transition.get("done", 1.0)),
         completion_rate=completion_rate,
         unfairness=mean_unfairness,
     )
