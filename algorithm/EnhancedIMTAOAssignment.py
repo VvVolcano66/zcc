@@ -28,6 +28,7 @@ class EnhancedIMTAOAssignmentFramework(IMTAO_Framework):
         worker_completion_bonus: float = 0.0,
         worker_distance_penalty: float = 0.0,
         same_worker_chain_bonus: float = 0.0,
+        force_center_pickup_on_first_departure: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -37,6 +38,7 @@ class EnhancedIMTAOAssignmentFramework(IMTAO_Framework):
         self.worker_distance_penalty = float(worker_distance_penalty)
         self.same_worker_chain_bonus = float(same_worker_chain_bonus)
         self.use_stackelberg_worker_utility = bool(self.region_priority_weight)
+        self.force_center_pickup_on_first_departure = bool(force_center_pickup_on_first_departure)
 
     def _stackelberg_task_score(
         self,
@@ -167,11 +169,14 @@ class EnhancedIMTAOAssignmentFramework(IMTAO_Framework):
         worker: IMTAOWorker,
         candidate_tasks: Sequence[IMTAOTask],
     ) -> Tuple[List[IMTAOTask], float]:
-        current_time = self._travel_time(worker, center)
-        if not np.isfinite(current_time) or current_time > self.slot_duration_seconds:
-            return [], current_time
-
-        current_ref = center
+        if self.force_center_pickup_on_first_departure:
+            current_time = self._travel_time(worker, center)
+            if not np.isfinite(current_time) or current_time > self.slot_duration_seconds:
+                return [], current_time
+            current_ref = center
+        else:
+            current_time = 0.0
+            current_ref = worker
         remaining_tasks = list(candidate_tasks)
         selected_tasks: List[IMTAOTask] = []
         round_load = 0
@@ -219,7 +224,7 @@ class EnhancedIMTAOAssignmentFramework(IMTAO_Framework):
         workers_sorted = sorted(
             workers_to_assign,
             key=lambda worker: (
-                self._travel_time(worker, center),
+                self._travel_time(worker, center) if self.force_center_pickup_on_first_departure else 0.0,
                 str(worker.id),
             ),
         )
@@ -251,6 +256,7 @@ def enhanced_imtao_assignment_with_center_pickup(
     slot_start_seconds,
     slot_end_seconds=None,
     stackelberg_control=None,
+    force_center_pickup_on_first_departure=True,
 ):
     if slot_end_seconds is None:
         slot_end_seconds = slot_start_seconds + float(getattr(config, "EXPERIMENT_TIME_SLOT_MINUTES", 15)) * 60
@@ -337,6 +343,7 @@ def enhanced_imtao_assignment_with_center_pickup(
         worker_completion_bonus=stackelberg_control.get("worker_completion_bonus", 0.0),
         worker_distance_penalty=stackelberg_control.get("worker_distance_penalty", 0.0),
         same_worker_chain_bonus=stackelberg_control.get("same_worker_chain_bonus", 0.0),
+        force_center_pickup_on_first_departure=force_center_pickup_on_first_departure,
     )
     framework.initialize_existing_partition(center_task_map, center_worker_map)
 
@@ -354,15 +361,20 @@ def enhanced_imtao_assignment_with_center_pickup(
                 continue
 
             worker_node = worker_node_map[w.id]
-            try:
-                dist_to_center = nx.shortest_path_length(G, worker_node, center_node, weight="length")
-            except nx.NetworkXNoPath:
-                continue
-
-            current_node = center_node
-            current_finish_time = slot_start_seconds + dist_to_center / config.WORKER_SPEED_MS
+            if force_center_pickup_on_first_departure:
+                try:
+                    dist_to_center = nx.shortest_path_length(G, worker_node, center_node, weight="length")
+                except nx.NetworkXNoPath:
+                    continue
+                current_node = center_node
+                current_finish_time = slot_start_seconds + dist_to_center / config.WORKER_SPEED_MS
+                first_departure_pending = True
+            else:
+                dist_to_center = 0.0
+                current_node = worker_node
+                current_finish_time = slot_start_seconds
+                first_departure_pending = False
             round_load = 0
-            first_departure_pending = True
 
             for task in assigned_tasks:
                 if round_load >= config.MAX_TASKS_PER_WORKER:

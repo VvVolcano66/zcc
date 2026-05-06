@@ -97,6 +97,7 @@ class RLRetentionBilateralState:
     affinity_decay: float = 0.92
     affinity_learning_rate: float = 0.12
     hidden_dim: int = 32
+    device: Optional[str] = None
     prediction_bias_ema: Dict[int, float] = field(default_factory=dict)
     prediction_abs_error_ema: Dict[int, float] = field(default_factory=dict)
     q_networks: Dict[int, RetentionPolicyNetwork] = field(default_factory=dict)
@@ -112,6 +113,10 @@ class RLRetentionBilateralState:
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.random_seed)
+        resolved_device = self.device or getattr(config, "TORCH_DEVICE_PREFERENCE", None)
+        self.device = str(
+            torch.device(resolved_device if resolved_device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        )
         action_count = len(self.action_ratios)
         for rid in self.region_ids:
             if rid not in self.q_networks:
@@ -119,15 +124,18 @@ class RLRetentionBilateralState:
                     feature_dim=self.feature_dim,
                     action_count=action_count,
                     hidden_dim=max(8, int(self.hidden_dim)),
-                )
+                ).to(self.device)
                 target_network = RetentionPolicyNetwork(
                     feature_dim=self.feature_dim,
                     action_count=action_count,
                     hidden_dim=max(8, int(self.hidden_dim)),
-                )
+                ).to(self.device)
                 target_network.load_state_dict(network.state_dict())
                 self.q_networks[rid] = network
                 self.target_q_networks[rid] = target_network
+            else:
+                self.q_networks[rid] = self.q_networks[rid].to(self.device)
+                self.target_q_networks[rid] = self.target_q_networks[rid].to(self.device)
             self.q_optimizers.setdefault(
                 rid,
                 torch.optim.Adam(self.q_networks[rid].parameters(), lr=self.learning_rate),
@@ -242,7 +250,7 @@ class RLRetentionBilateralState:
         return features
 
     def _q_values(self, region_id: int, features: np.ndarray) -> torch.Tensor:
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
         return self.q_networks[region_id](feature_tensor).squeeze(0)
 
     def sample_action(self, region_id: int, features: np.ndarray) -> Tuple[int, float, np.ndarray]:
@@ -268,11 +276,11 @@ class RLRetentionBilateralState:
         sample_indices = self.rng.choice(len(replay_buffer), size=batch_size, replace=False)
         batch = [replay_buffer[int(idx)] for idx in sample_indices]
 
-        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32)
-        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long)
-        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32)
-        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32)
-        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32)
+        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long, device=self.device)
+        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32, device=self.device)
 
         q_values = self.q_networks[region_id](states).gather(1, actions.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
@@ -360,9 +368,9 @@ class RLRetentionBilateralState:
     ) -> None:
         optimizer = self.q_optimizers[region_id]
         optimizer.zero_grad()
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
         logits = self.q_networks[region_id](feature_tensor)
-        target_tensor = torch.as_tensor([int(target_action_idx)], dtype=torch.long)
+        target_tensor = torch.as_tensor([int(target_action_idx)], dtype=torch.long, device=self.device)
         loss = F.cross_entropy(logits, target_tensor) * float(strength)
         loss.backward()
         optimizer.step()
@@ -386,6 +394,7 @@ class PlatformTaskFirstRLState:
     dqn_batch_size: int = 32
     target_sync_interval: int = 32
     hidden_dim: int = 32
+    device: Optional[str] = None
     random_seed: int = 7
     feature_dim: int = 9
     reward_baseline: float = 0.0
@@ -400,20 +409,28 @@ class PlatformTaskFirstRLState:
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.random_seed)
+        resolved_device = self.device or getattr(config, "TORCH_DEVICE_PREFERENCE", None)
+        self.device = str(
+            torch.device(resolved_device if resolved_device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        )
         action_count = len(self.action_profiles)
         if self.q_network is None:
             self.q_network = RetentionPolicyNetwork(
                 feature_dim=self.feature_dim,
                 action_count=action_count,
                 hidden_dim=max(8, int(self.hidden_dim)),
-            )
+            ).to(self.device)
+        else:
+            self.q_network = self.q_network.to(self.device)
         if self.target_q_network is None:
             self.target_q_network = RetentionPolicyNetwork(
                 feature_dim=self.feature_dim,
                 action_count=action_count,
                 hidden_dim=max(8, int(self.hidden_dim)),
-            )
+            ).to(self.device)
             self.target_q_network.load_state_dict(self.q_network.state_dict())
+        else:
+            self.target_q_network = self.target_q_network.to(self.device)
         if self.q_optimizer is None:
             self.q_optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
         if not isinstance(self.replay_buffer, deque):
@@ -456,7 +473,7 @@ class PlatformTaskFirstRLState:
         self.exploration_prob = float(np.clip(float(exploration_prob), 0.0, 1.0))
 
     def _q_values(self, features: np.ndarray) -> torch.Tensor:
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32).unsqueeze(0)
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
         return self.q_network(feature_tensor).squeeze(0)
 
     def sample_action(self, features: np.ndarray) -> Tuple[int, Tuple[float, float, float, float, float, float], np.ndarray]:
@@ -481,11 +498,11 @@ class PlatformTaskFirstRLState:
         sample_indices = self.rng.choice(len(self.replay_buffer), size=batch_size, replace=False)
         batch = [self.replay_buffer[int(idx)] for idx in sample_indices]
 
-        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32)
-        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long)
-        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32)
-        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32)
-        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32)
+        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long, device=self.device)
+        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32, device=self.device)
 
         q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
@@ -528,6 +545,35 @@ class PlatformTaskFirstRLState:
             }
         )
         self._train_q_network()
+
+    def offline_replay_train(
+        self,
+        epochs: int = 1,
+        updates_per_epoch: int = 1,
+    ) -> Dict[str, int]:
+        epochs = max(0, int(epochs))
+        updates_per_epoch = max(1, int(updates_per_epoch))
+        optimization_steps = 0
+
+        if not self.replay_buffer:
+            return {
+                "epochs": epochs,
+                "updates_per_epoch": updates_per_epoch,
+                "optimization_steps": 0,
+                "buffer_size": 0,
+            }
+
+        for _ in range(epochs):
+            for _ in range(updates_per_epoch):
+                self._train_q_network()
+                optimization_steps += 1
+
+        return {
+            "epochs": epochs,
+            "updates_per_epoch": updates_per_epoch,
+            "optimization_steps": optimization_steps,
+            "buffer_size": len(self.replay_buffer),
+        }
 
 
 def hydrate_platform_transition_with_next_state(
@@ -1133,6 +1179,15 @@ def rl_retention_bilateral_predispatch_workers(
         for rid in region_ids
     }
     phase = str(dispatch_phase).lower()
+    slot_minutes = max(1e-6, float(getattr(config, 'EXPERIMENT_TIME_SLOT_MINUTES', 15)))
+    retain_horizon_minutes = float(np.clip(
+        getattr(config, 'RBG_REALTIME_RETAIN_HORIZON_MINUTES', 1.0),
+        0.0,
+        slot_minutes,
+    ))
+    backlog_guard_weight = max(0.0, float(getattr(config, 'RBG_RETAIN_BACKLOG_GUARD_WEIGHT', 1.0)))
+    uncertainty_buffer_weight = max(0.0, float(getattr(config, 'RBG_RETAIN_UNCERTAINTY_BUFFER_WEIGHT', 0.50)))
+    micro_guard_multiplier = max(1.0, float(getattr(config, 'RBG_MICRO_RETENTION_GUARD_MULTIPLIER', 1.15)))
     current_supply_anchor = {
         rid: max(0, int(available_workers.get(rid, 0)))
         for rid in region_ids
@@ -1178,6 +1233,7 @@ def rl_retention_bilateral_predispatch_workers(
     total_backlog = float(sum(max(0, backlog_counts.get(rid, 0)) for rid in region_ids))
     for rid in region_ids:
         idle_count = available_workers.get(rid, 0)
+        profile = demand_profile[rid]
         base_keep = min(
             idle_count,
             max(
@@ -1194,7 +1250,27 @@ def rl_retention_bilateral_predispatch_workers(
                 int(round(base_keep * keep_scale_effective)),
             ),
         )
-        safe_reserve_by_region[rid] = base_keep
+        current_backlog_tasks = max(0.0, float(backlog_counts.get(rid, 0))) * backlog_guard_weight
+        near_future_arrivals = max(
+            0.0,
+            float(predicted_demand.get(rid, 0)) * (retain_horizon_minutes / slot_minutes),
+        )
+        abs_err_ema = max(0.0, float(profile.get("abs_err_ema", 0.0)))
+        underpredict_bias = max(0.0, -float(profile.get("combined_bias", 0.0)))
+        guard_task_pressure = current_backlog_tasks + near_future_arrivals + uncertainty_buffer_weight * (
+            abs_err_ema + underpredict_bias
+        )
+        if phase != "slot_start":
+            guard_task_pressure *= micro_guard_multiplier
+        guard_keep_floor = min(
+            idle_count,
+            max(
+                min_buffer_workers,
+                int(math.ceil(guard_task_pressure / max_tasks_per_worker)),
+            ),
+        )
+        base_keep = max(base_keep, guard_keep_floor)
+        safe_reserve_by_region[rid] = guard_keep_floor
         neighbor_backlog_pressure = max(0.0, total_backlog - float(backlog_counts.get(rid, 0)))
         features = state.build_features(
             region_id=rid,
@@ -1206,7 +1282,13 @@ def rl_retention_bilateral_predispatch_workers(
             max_tasks_per_worker=max_tasks_per_worker,
         )
         action_idx, action_ratio, probs = state.sample_action(rid, features)
-        retain_count = int(np.clip(base_keep, 0, idle_count))
+        retain_anchor = max(base_keep, guard_keep_floor)
+        retain_slack = max(0, idle_count - retain_anchor)
+        retain_count = int(np.clip(
+            retain_anchor + round(float(action_ratio) * max(1, retain_slack)),
+            guard_keep_floor,
+            idle_count,
+        ))
         retain_count_by_region[rid] = retain_count
         action_ratio_by_region[rid] = action_ratio
         action_index_by_region[rid] = action_idx
@@ -1226,6 +1308,7 @@ def rl_retention_bilateral_predispatch_workers(
                 "action_idx": action_idx,
                 "retain_count": retain_count,
                 "base_keep": base_keep,
+                "guard_keep_floor": guard_keep_floor,
                 "platform_reward_weight": platform_reward_weight_by_region[rid],
             }
 
