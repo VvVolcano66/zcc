@@ -3,6 +3,7 @@ import os
 
 import batch as batch_exp
 from small_scale_config import (
+    SMALL_SCALE_CENTER_COUNT,
     SMALL_SCALE_DOWNLOAD_DIST_M,
     SMALL_SCALE_SIDE_LENGTH_KM,
     SMALL_SCALE_WORKER_COUNTS,
@@ -15,7 +16,6 @@ ALGORITHMS = [
     ("imtao", "IMTAO (Seq-BDC)"),
     ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
-    ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
     ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
 ]
 
@@ -30,7 +30,9 @@ def run_single_setting(worker_count: int):
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
 
     original_download_dist = batch_exp.config.DOWNLOAD_DIST
+    original_num_zones = batch_exp.config.NUM_ZONES
     batch_exp.config.DOWNLOAD_DIST = SMALL_SCALE_DOWNLOAD_DIST_M
+    batch_exp.config.NUM_ZONES = SMALL_SCALE_CENTER_COUNT
     try:
         results = {}
         for algo_name, display_name in ALGORITHMS:
@@ -45,6 +47,7 @@ def run_single_setting(worker_count: int):
         return results
     finally:
         batch_exp.config.DOWNLOAD_DIST = original_download_dist
+        batch_exp.config.NUM_ZONES = original_num_zones
 
 
 def write_csv(results_by_worker_count, output_path: str):
@@ -87,7 +90,7 @@ def print_summary(results_by_worker_count):
     print("\n" + "=" * 150)
     print(
         f"Small-Scale Worker Sweep | Map Size = {SMALL_SCALE_SIDE_LENGTH_KM}km x {SMALL_SCALE_SIDE_LENGTH_KM}km "
-        f"| dist = {SMALL_SCALE_DOWNLOAD_DIST_M}m"
+        f"| dist = {SMALL_SCALE_DOWNLOAD_DIST_M}m | centers = {SMALL_SCALE_CENTER_COUNT}"
     )
     print("=" * 150)
     for worker_count, algo_results in results_by_worker_count.items():
@@ -118,7 +121,7 @@ def main():
         print("\n" + "#" * 90)
         print(
             f"Running small-scale worker sweep | map={SMALL_SCALE_SIDE_LENGTH_KM}km x {SMALL_SCALE_SIDE_LENGTH_KM}km "
-            f"| workers={worker_count}"
+            f"| centers={SMALL_SCALE_CENTER_COUNT} | workers={worker_count}"
         )
         print("#" * 90)
         results_by_worker_count[worker_count] = run_single_setting(worker_count)

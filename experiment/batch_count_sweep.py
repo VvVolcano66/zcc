@@ -9,9 +9,8 @@ BATCH_COUNTS = [2, 4, 6, 8, 10]
 ALGORITHMS = [
     ("greedy", "Greedy"),
     ("imtao", "IMTAO (Seq-BDC)"),
-    ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
-    ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
+    ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
 ]
 

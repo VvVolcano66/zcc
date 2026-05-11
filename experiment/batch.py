@@ -12,7 +12,7 @@ from scipy.spatial import KDTree
 
 import config
 from algorithm.Greedy import greedy_assignment_with_center_pickup
-from algorithm.EnhancedIMTAOAssignment import enhanced_imtao_assignment_with_center_pickup
+from algorithm.CenterPrepackedAssignment import center_prepacked_assignment_with_center_pickup
 from algorithm.PredictiveDispatch import predict_next_slot_demand, predispatch_workers_for_next_slot
 from algorithm.GameTheoreticPredictiveDispatch import game_theoretic_predispatch_workers
 from algorithm.UncertaintyAwareBilateralDispatch import (
@@ -1675,7 +1675,7 @@ def _run_assignment_for_window(
             slot_end_seconds=slot_end_seconds,
         )
     if algo_key in ROUTE_ILP_ASSIGNMENT_ALGOS:
-        return enhanced_imtao_assignment_with_center_pickup(
+        return center_prepacked_assignment_with_center_pickup(
             G=G,
             config=config,
             centers_dict=centers,
@@ -3797,7 +3797,7 @@ def run_online_simulation_with_center_pickup(
                 slot_start_seconds=slot_start_seconds  # 💡 补全了这个漏掉的参数！
             )
         elif algo_name.lower() in ROUTE_ILP_ASSIGNMENT_ALGOS:
-            slot_assignments, slot_profit, slot_details = enhanced_imtao_assignment_with_center_pickup(
+            slot_assignments, slot_profit, slot_details = center_prepacked_assignment_with_center_pickup(
                 G=G, config=config, centers_dict=centers,
                 workers_per_center=workers_per_center, tasks_per_center=tasks_per_center,
                 slot_start_seconds=slot_start_seconds,

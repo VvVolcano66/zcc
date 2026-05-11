@@ -26,14 +26,6 @@ class CenterTokenExtractor(nn.Module):
 
 
 class MCTGNet(nn.Module):
-    """
-    Multi-Center Trend-Gated Network
-
-    Innovations tailored to the user's dispatch problem:
-    1. Center-aware tokens summarize grid demand into dispatch-center level latent states.
-    2. Grid-to-center cross attention decodes center collaboration back to each cell.
-    3. Residual delta prediction and recent-trend gating preserve local bursts.
-    """
 
     def __init__(
         self,

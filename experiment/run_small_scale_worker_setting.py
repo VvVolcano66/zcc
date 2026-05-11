@@ -4,6 +4,7 @@ import os
 
 import batch as batch_exp
 from small_scale_config import (
+    SMALL_SCALE_CENTER_COUNT,
     SMALL_SCALE_DOWNLOAD_DIST_M,
     SMALL_SCALE_SIDE_LENGTH_KM,
     WORKER_RESULT_DIR,
@@ -15,7 +16,6 @@ ALGORITHMS = [
     ("imtao", "IMTAO (Seq-BDC)"),
     ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
-    ("predictive_uabg_mctgnet", "UABG-MCTGNet"),
     ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
 ]
 
@@ -26,8 +26,10 @@ def main_for_worker_count(worker_count: int, output_dir: str = None):
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
 
     original_download_dist = batch_exp.config.DOWNLOAD_DIST
+    original_num_zones = batch_exp.config.NUM_ZONES
     try:
         batch_exp.config.DOWNLOAD_DIST = SMALL_SCALE_DOWNLOAD_DIST_M
+        batch_exp.config.NUM_ZONES = SMALL_SCALE_CENTER_COUNT
         algo_results = {}
         for algo_name, display_name in ALGORITHMS:
             _, _, metrics = batch_exp.run_online_simulation_with_center_pickup(
@@ -40,6 +42,7 @@ def main_for_worker_count(worker_count: int, output_dir: str = None):
             algo_results[display_name] = metrics
     finally:
         batch_exp.config.DOWNLOAD_DIST = original_download_dist
+        batch_exp.config.NUM_ZONES = original_num_zones
 
     resolved_output_dir = output_dir or WORKER_RESULT_DIR
     os.makedirs(resolved_output_dir, exist_ok=True)
