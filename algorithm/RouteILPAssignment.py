@@ -156,10 +156,8 @@ def _assign_single_region_route_ilp(
             center_dist = center_to_task_dist[tid]
             if center_dist == float("inf"):
                 continue
-            first_arrival = max(
-                worker_center_arrival + center_dist / config.WORKER_SPEED_MS,
-                task_releases[tid],
-            )
+            first_departure = max(worker_center_arrival, task_releases[tid])
+            first_arrival = first_departure + center_dist / config.WORKER_SPEED_MS
             if first_arrival > task_expires[tid]:
                 continue
             feasible_first_tasks.append(
@@ -373,7 +371,8 @@ def _enumerate_worker_routes(
             if dist_to_task == float("inf"):
                 continue
 
-            arrival_time = max(current_time + dist_to_task / speed_ms, task_releases[tid])
+            departure_time = max(current_time, task_releases[tid])
+            arrival_time = departure_time + dist_to_task / speed_ms
             if arrival_time > task_expires[tid]:
                 continue
 

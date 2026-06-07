@@ -19,11 +19,14 @@ ALGORITHMS = [
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
+    ("predictive_event_rl_game", "Event-RL-Game"),
 ]
 
 
 def main_for_batch_count(batch_count: int, output_dir: str = None):
     batch_exp._MCTG_PREDICTOR_CACHE.clear()
+    original_worker_limit = batch_exp.DEFAULT_WORKER_LIMIT
+    original_compare_slot_count = batch_exp.DEFAULT_COMPARE_SLOT_COUNT
     batch_exp.DEFAULT_WORKER_LIMIT = SMALL_SCALE_FIXED_WORKER_COUNT
     batch_exp.DEFAULT_COMPARE_SLOT_COUNT = batch_count
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
@@ -44,8 +47,11 @@ def main_for_batch_count(batch_count: int, output_dir: str = None):
             )
             algo_results[display_name] = metrics
     finally:
+        batch_exp.DEFAULT_WORKER_LIMIT = original_worker_limit
+        batch_exp.DEFAULT_COMPARE_SLOT_COUNT = original_compare_slot_count
         batch_exp.config.DOWNLOAD_DIST = original_download_dist
         batch_exp.config.NUM_ZONES = original_num_zones
+        batch_exp._SIMULATION_CONTEXT_CACHE.clear()
 
     resolved_output_dir = output_dir or BATCH_RESULT_DIR
     os.makedirs(resolved_output_dir, exist_ok=True)
@@ -54,10 +60,14 @@ def main_for_batch_count(batch_count: int, output_dir: str = None):
     fieldnames = [
         "map_size_km",
         "download_dist_m",
+        "center_count",
         "worker_count",
         "batch_count",
+        "worker_speed_kmh",
+        "worker_speed_ms",
         "algorithm",
         "assigned_tasks",
+        "total_tasks",
         "task_completion_rate",
         "u_rho",
         "cpu_time",
@@ -71,11 +81,15 @@ def main_for_batch_count(batch_count: int, output_dir: str = None):
             writer.writerow(
                 {
                     "map_size_km": SMALL_SCALE_SIDE_LENGTH_KM,
-                    "download_dist_m": SMALL_SCALE_DOWNLOAD_DIST_M,
+                    "download_dist_m": metrics.get("download_dist_m", SMALL_SCALE_DOWNLOAD_DIST_M),
+                    "center_count": metrics.get("center_count", SMALL_SCALE_CENTER_COUNT),
                     "worker_count": SMALL_SCALE_FIXED_WORKER_COUNT,
                     "batch_count": batch_count,
+                    "worker_speed_kmh": metrics.get("worker_speed_kmh"),
+                    "worker_speed_ms": metrics.get("worker_speed_ms"),
                     "algorithm": algorithm,
                     "assigned_tasks": metrics["assigned_tasks"],
+                    "total_tasks": metrics.get("total_tasks"),
                     "task_completion_rate": metrics["task_completion_rate"],
                     "u_rho": metrics["u_rho"],
                     "cpu_time": metrics["cpu_time"],

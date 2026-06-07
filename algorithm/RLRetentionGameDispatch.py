@@ -11,16 +11,6 @@ import torch.nn.functional as F
 import config
 
 
-def _softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
-    temperature = max(1e-6, float(temperature))
-    shifted = (logits - np.max(logits)) / temperature
-    exp_values = np.exp(shifted)
-    total = float(np.sum(exp_values))
-    if total <= 0.0:
-        return np.ones_like(exp_values) / max(1, exp_values.size)
-    return exp_values / total
-
-
 def _safe_std(values: Iterable[float]) -> float:
     arr = np.asarray(list(values), dtype=np.float32)
     if arr.size <= 1:
@@ -61,32 +51,219 @@ def _compute_pairwise_unfairness(service_ratio: Dict[int, float]) -> Dict[int, f
     return unfairness
 
 
-class RetentionPolicyNetwork(nn.Module):
-    def __init__(self, feature_dim: int, action_count: int, hidden_dim: int) -> None:
+class ContinuousPolicyNetwork(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
+        self.body = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_count),
+        )
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.body(features)
+        return self.mean(hidden), self.log_std(hidden).clamp(-5.0, 2.0)
+
+
+class ContinuousCriticNetwork(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.net(features)
+    def forward(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([features, actions], dim=-1)).squeeze(-1)
+
+
+class ContinuousSACAgent:
+    """Continuous Soft Actor-Critic with bounded dispatch control outputs."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        action_bounds: Tuple[Tuple[float, float], ...],
+        hidden_dim: int,
+        device: str,
+        actor_learning_rate: float,
+        critic_learning_rate: float,
+        alpha_learning_rate: float,
+        gamma: float,
+        tau: float,
+        initial_alpha: float,
+        auto_entropy: bool,
+        target_entropy_scale: float,
+    ) -> None:
+        self.device = str(device)
+        self.action_bounds = tuple((float(low), float(high)) for low, high in action_bounds)
+        if not self.action_bounds or any(high <= low for low, high in self.action_bounds):
+            raise ValueError("Continuous SAC requires non-empty action bounds with high > low.")
+        self.action_dim = len(self.action_bounds)
+        self.gamma = float(gamma)
+        self.tau = float(np.clip(float(tau), 1e-6, 1.0))
+        self.auto_entropy = bool(auto_entropy)
+        self.target_entropy = -float(target_entropy_scale) * float(self.action_dim)
+        self.action_low = torch.as_tensor(
+            [bound[0] for bound in self.action_bounds], dtype=torch.float32, device=self.device
+        )
+        self.action_high = torch.as_tensor(
+            [bound[1] for bound in self.action_bounds], dtype=torch.float32, device=self.device
+        )
+
+        hidden_dim = max(8, int(hidden_dim))
+        self.actor = ContinuousPolicyNetwork(feature_dim, self.action_dim, hidden_dim).to(self.device)
+        self.critic1 = ContinuousCriticNetwork(feature_dim, self.action_dim, hidden_dim).to(self.device)
+        self.critic2 = ContinuousCriticNetwork(feature_dim, self.action_dim, hidden_dim).to(self.device)
+        self.target_critic1 = ContinuousCriticNetwork(feature_dim, self.action_dim, hidden_dim).to(self.device)
+        self.target_critic2 = ContinuousCriticNetwork(feature_dim, self.action_dim, hidden_dim).to(self.device)
+        self.target_critic1.load_state_dict(self.critic1.state_dict())
+        self.target_critic2.load_state_dict(self.critic2.state_dict())
+
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=float(actor_learning_rate))
+        self.critic1_optimizer = torch.optim.Adam(self.critic1.parameters(), lr=float(critic_learning_rate))
+        self.critic2_optimizer = torch.optim.Adam(self.critic2.parameters(), lr=float(critic_learning_rate))
+        self.log_alpha = torch.tensor(
+            math.log(max(1e-6, float(initial_alpha))),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=self.auto_entropy,
+        )
+        self.alpha_optimizer = (
+            torch.optim.Adam([self.log_alpha], lr=float(alpha_learning_rate))
+            if self.auto_entropy
+            else None
+        )
+        self.update_steps = 0
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp().clamp(1e-6, 100.0)
+
+    def _to_physical(self, normalized_actions: torch.Tensor) -> torch.Tensor:
+        return self.action_low + 0.5 * (normalized_actions + 1.0) * (self.action_high - self.action_low)
+
+    def _to_normalized(self, physical_actions: torch.Tensor) -> torch.Tensor:
+        scale = (self.action_high - self.action_low).clamp_min(1e-6)
+        return (2.0 * (physical_actions - self.action_low) / scale - 1.0).clamp(-1.0, 1.0)
+
+    def _sample_policy(
+        self,
+        states: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        means, log_stds = self.actor(states)
+        if deterministic:
+            pre_tanh = means
+        else:
+            pre_tanh = torch.distributions.Normal(means, log_stds.exp()).rsample()
+        normalized_actions = torch.tanh(pre_tanh)
+        normal = torch.distributions.Normal(means, log_stds.exp())
+        log_prob = normal.log_prob(pre_tanh) - torch.log(1.0 - normalized_actions.pow(2) + 1e-6)
+        return normalized_actions, log_prob.sum(dim=-1)
+
+    def sample_action(
+        self,
+        features: np.ndarray,
+        exploration_noise: float = 0.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            normalized, _ = self._sample_policy(feature_tensor)
+            if exploration_noise > 0.0:
+                normalized = (normalized + torch.randn_like(normalized) * float(exploration_noise)).clamp(-1.0, 1.0)
+            physical = self._to_physical(normalized)
+        return (
+            physical.squeeze(0).cpu().numpy().astype(np.float32),
+            normalized.squeeze(0).cpu().numpy().astype(np.float32),
+        )
+
+    def _soft_update_targets(self) -> None:
+        with torch.no_grad():
+            for target_param, source_param in zip(self.target_critic1.parameters(), self.critic1.parameters()):
+                target_param.mul_(1.0 - self.tau).add_(source_param, alpha=self.tau)
+            for target_param, source_param in zip(self.target_critic2.parameters(), self.critic2.parameters()):
+                target_param.mul_(1.0 - self.tau).add_(source_param, alpha=self.tau)
+
+    def train_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, float]:
+        if not batch:
+            return {}
+        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32, device=self.device)
+        physical_actions = torch.as_tensor(np.stack([item["action"] for item in batch]), dtype=torch.float32, device=self.device)
+        actions = self._to_normalized(physical_actions)
+        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            next_actions, next_log_prob = self._sample_policy(next_states)
+            next_min_q = torch.minimum(
+                self.target_critic1(next_states, next_actions),
+                self.target_critic2(next_states, next_actions),
+            )
+            targets = rewards + (1.0 - dones) * self.gamma * (next_min_q - self.alpha.detach() * next_log_prob)
+
+        critic1_loss = F.smooth_l1_loss(self.critic1(states, actions), targets)
+        critic2_loss = F.smooth_l1_loss(self.critic2(states, actions), targets)
+        self.critic1_optimizer.zero_grad()
+        critic1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 10.0)
+        self.critic1_optimizer.step()
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 10.0)
+        self.critic2_optimizer.step()
+
+        sampled_actions, log_prob = self._sample_policy(states)
+        min_q = torch.minimum(self.critic1(states, sampled_actions), self.critic2(states, sampled_actions))
+        actor_loss = (self.alpha.detach() * log_prob - min_q).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        self.actor_optimizer.step()
+
+        alpha_loss_value = 0.0
+        if self.alpha_optimizer is not None:
+            alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            with torch.no_grad():
+                self.log_alpha.clamp_(-8.0, 4.0)
+            alpha_loss_value = float(alpha_loss.detach().item())
+
+        self._soft_update_targets()
+        self.update_steps += 1
+        return {
+            "actor_loss": float(actor_loss.detach().item()),
+            "critic1_loss": float(critic1_loss.detach().item()),
+            "critic2_loss": float(critic2_loss.detach().item()),
+            "alpha_loss": alpha_loss_value,
+            "alpha": float(self.alpha.detach().item()),
+            "entropy": float((-log_prob).mean().detach().item()),
+        }
 
 
 @dataclass
 class RLRetentionBilateralState:
     region_ids: List[int]
-    action_ratios: Tuple[float, ...] = (-0.30, -0.15, 0.0, 0.15, 0.30)
+    action_bounds: Tuple[Tuple[float, float], ...] = (
+        (-0.35, 0.35),
+        (0.75, 1.45),
+        (0.65, 1.45),
+        (0.50, 1.50),
+    )
     learning_rate: float = 0.03
-    temperature: float = 0.85
     exploration_prob: float = 0.12
     gamma: float = 0.0
     replay_capacity: int = 512
-    dqn_batch_size: int = 32
-    target_sync_interval: int = 32
+    batch_size: int = 32
     service_debt_decay: float = 0.85
     max_service_debt: float = 4.0
     move_history_size: int = 8
@@ -97,12 +274,16 @@ class RLRetentionBilateralState:
     affinity_decay: float = 0.92
     affinity_learning_rate: float = 0.12
     hidden_dim: int = 32
+    critic_learning_rate: Optional[float] = None
+    alpha_learning_rate: float = 0.001
+    sac_tau: float = 0.01
+    sac_initial_alpha: float = 0.20
+    sac_auto_entropy: bool = True
+    sac_target_entropy_scale: float = 0.98
     device: Optional[str] = None
     prediction_bias_ema: Dict[int, float] = field(default_factory=dict)
     prediction_abs_error_ema: Dict[int, float] = field(default_factory=dict)
-    q_networks: Dict[int, RetentionPolicyNetwork] = field(default_factory=dict)
-    target_q_networks: Dict[int, RetentionPolicyNetwork] = field(default_factory=dict)
-    q_optimizers: Dict[int, torch.optim.Optimizer] = field(default_factory=dict)
+    sac_agents: Dict[int, ContinuousSACAgent] = field(default_factory=dict)
     replay_buffers: Dict[int, Deque[Dict[str, Any]]] = field(default_factory=dict)
     update_steps: Dict[int, int] = field(default_factory=dict)
     reward_baseline: Dict[int, float] = field(default_factory=dict)
@@ -113,35 +294,29 @@ class RLRetentionBilateralState:
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.random_seed)
+        self.action_bounds = tuple((float(low), float(high)) for low, high in self.action_bounds)
         resolved_device = self.device or getattr(config, "TORCH_DEVICE_PREFERENCE", None)
         self.device = str(
             torch.device(resolved_device if resolved_device else ("cuda" if torch.cuda.is_available() else "cpu"))
         )
-        action_count = len(self.action_ratios)
         for rid in self.region_ids:
-            if rid not in self.q_networks:
-                network = RetentionPolicyNetwork(
+            if rid not in self.sac_agents:
+                self.sac_agents[rid] = ContinuousSACAgent(
                     feature_dim=self.feature_dim,
-                    action_count=action_count,
+                    action_bounds=self.action_bounds,
                     hidden_dim=max(8, int(self.hidden_dim)),
-                ).to(self.device)
-                target_network = RetentionPolicyNetwork(
-                    feature_dim=self.feature_dim,
-                    action_count=action_count,
-                    hidden_dim=max(8, int(self.hidden_dim)),
-                ).to(self.device)
-                target_network.load_state_dict(network.state_dict())
-                self.q_networks[rid] = network
-                self.target_q_networks[rid] = target_network
-            else:
-                self.q_networks[rid] = self.q_networks[rid].to(self.device)
-                self.target_q_networks[rid] = self.target_q_networks[rid].to(self.device)
-            self.q_optimizers.setdefault(
-                rid,
-                torch.optim.Adam(self.q_networks[rid].parameters(), lr=self.learning_rate),
-            )
+                    device=self.device,
+                    actor_learning_rate=self.learning_rate,
+                    critic_learning_rate=self.critic_learning_rate or self.learning_rate,
+                    alpha_learning_rate=self.alpha_learning_rate,
+                    gamma=self.gamma,
+                    tau=self.sac_tau,
+                    initial_alpha=self.sac_initial_alpha,
+                    auto_entropy=self.sac_auto_entropy,
+                    target_entropy_scale=self.sac_target_entropy_scale,
+                )
             self.replay_buffers.setdefault(rid, deque(maxlen=max(32, int(self.replay_capacity))))
-            self.update_steps.setdefault(rid, 0)
+            self.update_steps.setdefault(rid, self.sac_agents[rid].update_steps)
             self.reward_baseline.setdefault(rid, 0.0)
             self.service_debt.setdefault(rid, 0.0)
             self.prediction_bias_ema.setdefault(rid, 0.0)
@@ -164,6 +339,19 @@ class RLRetentionBilateralState:
         if donor_region == receiver_region:
             return 0.0
         return float(self.receiver_affinity.get(donor_region, {}).get(receiver_region, 0.0))
+
+    @property
+    def action_labels(self) -> Tuple[str, ...]:
+        return ("retention_ratio", "receive_bid_scale", "release_ask_scale", "distance_aversion_scale")
+
+    def get_action_profile(self, action: np.ndarray) -> Dict[str, Any]:
+        return {
+            "name": "continuous",
+            "retention_ratio": float(action[0]),
+            "receive_bid_scale": float(action[1]),
+            "release_ask_scale": float(action[2]),
+            "distance_aversion_scale": float(action[3]),
+        }
 
     def update_receiver_affinity(
         self,
@@ -249,55 +437,23 @@ class RLRetentionBilateralState:
         )
         return features
 
-    def _q_values(self, region_id: int, features: np.ndarray) -> torch.Tensor:
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        return self.q_networks[region_id](feature_tensor).squeeze(0)
+    def sample_action(self, region_id: int, features: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
+        action, normalized_action = self.sac_agents[region_id].sample_action(
+            features=features,
+            exploration_noise=self.exploration_prob,
+        )
+        return action, self.get_action_profile(action), normalized_action
 
-    def sample_action(self, region_id: int, features: np.ndarray) -> Tuple[int, float, np.ndarray]:
-        with torch.no_grad():
-            q_values = self._q_values(region_id, features)
-            probs_tensor = torch.softmax(q_values / max(1e-6, float(self.temperature)), dim=-1)
-        probs = probs_tensor.cpu().numpy().astype(np.float32)
-        if self.rng.random() < self.exploration_prob:
-            action_idx = int(self.rng.integers(0, len(self.action_ratios)))
-        else:
-            action_idx = int(torch.argmax(q_values).item())
-        return action_idx, float(self.action_ratios[action_idx]), probs
-
-    def _sync_target_network(self, region_id: int) -> None:
-        self.target_q_networks[region_id].load_state_dict(self.q_networks[region_id].state_dict())
-
-    def _train_region_q_network(self, region_id: int) -> None:
+    def _train_region_sac(self, region_id: int) -> None:
         replay_buffer = self.replay_buffers[region_id]
-        batch_size = min(len(replay_buffer), max(1, int(self.dqn_batch_size)))
+        batch_size = min(len(replay_buffer), max(1, int(self.batch_size)))
         if batch_size <= 0:
             return
 
         sample_indices = self.rng.choice(len(replay_buffer), size=batch_size, replace=False)
         batch = [replay_buffer[int(idx)] for idx in sample_indices]
-
-        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long, device=self.device)
-        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32, device=self.device)
-        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32, device=self.device)
-        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32, device=self.device)
-
-        q_values = self.q_networks[region_id](states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        with torch.no_grad():
-            online_next_q = self.q_networks[region_id](next_states)
-            next_actions = torch.argmax(online_next_q, dim=1)
-            target_next_q = self.target_q_networks[region_id](next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            targets = rewards + (1.0 - dones) * float(self.gamma) * target_next_q
-
-        optimizer = self.q_optimizers[region_id]
-        optimizer.zero_grad()
-        loss = F.smooth_l1_loss(q_values, targets)
-        loss.backward()
-        optimizer.step()
-
-        self.update_steps[region_id] += 1
-        if self.update_steps[region_id] % max(1, int(self.target_sync_interval)) == 0:
-            self._sync_target_network(region_id)
+        self.sac_agents[region_id].train_batch(batch)
+        self.update_steps[region_id] = self.sac_agents[region_id].update_steps
 
     def update_policy(
         self,
@@ -325,13 +481,13 @@ class RLRetentionBilateralState:
             self.replay_buffers[rid].append(
                 {
                     "features": features,
-                    "action_idx": int(transition["action_idx"]),
+                    "action": np.asarray(transition["action"], dtype=np.float32),
                     "reward": reward,
                     "next_features": next_features,
                     "done": float(transition.get("done", 1.0)),
                 }
             )
-            self._train_region_q_network(rid)
+            self._train_region_sac(rid)
 
     def offline_replay_train(
         self,
@@ -349,7 +505,7 @@ class RLRetentionBilateralState:
                     continue
                 trained_regions.add(rid)
                 for _ in range(updates_per_region):
-                    self._train_region_q_network(rid)
+                    self._train_region_sac(rid)
                     optimization_steps += 1
 
         return {
@@ -359,50 +515,36 @@ class RLRetentionBilateralState:
             "optimization_steps": optimization_steps,
         }
 
-    def imitation_update(
-        self,
-        region_id: int,
-        features: np.ndarray,
-        target_action_idx: int,
-        strength: float = 1.0,
-    ) -> None:
-        optimizer = self.q_optimizers[region_id]
-        optimizer.zero_grad()
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits = self.q_networks[region_id](feature_tensor)
-        target_tensor = torch.as_tensor([int(target_action_idx)], dtype=torch.long, device=self.device)
-        loss = F.cross_entropy(logits, target_tensor) * float(strength)
-        loss.backward()
-        optimizer.step()
-        self._sync_target_network(region_id)
-
-
 @dataclass
 class PlatformTaskFirstRLState:
     region_ids: List[int]
-    action_profiles: Tuple[Tuple[float, float, float, float, float, float], ...] = (
-        (1.30, 1.20, 0.95, 0.82, 1.18, 0.10),
-        (1.15, 1.10, 1.00, 0.92, 1.08, 0.18),
-        (1.00, 1.00, 1.08, 1.00, 0.98, 0.28),
-        (0.92, 0.95, 1.20, 1.10, 0.88, 0.40),
+    action_bounds: Tuple[Tuple[float, float], ...] = (
+        (0.75, 1.40),
+        (0.75, 1.35),
+        (0.80, 1.30),
+        (0.75, 1.25),
+        (0.75, 1.30),
+        (0.00, 0.50),
     )
     learning_rate: float = 0.03
-    temperature: float = 0.90
     exploration_prob: float = 0.10
     gamma: float = 0.6
     replay_capacity: int = 256
-    dqn_batch_size: int = 32
-    target_sync_interval: int = 32
+    batch_size: int = 32
     hidden_dim: int = 32
+    critic_learning_rate: Optional[float] = None
+    alpha_learning_rate: float = 0.001
+    sac_tau: float = 0.01
+    sac_initial_alpha: float = 0.20
+    sac_auto_entropy: bool = True
+    sac_target_entropy_scale: float = 0.98
     device: Optional[str] = None
     random_seed: int = 7
     feature_dim: int = 9
     reward_baseline: float = 0.0
     completion_rate_ema: float = 0.0
     unfairness_ema: float = 0.0
-    q_network: Optional[RetentionPolicyNetwork] = None
-    target_q_network: Optional[RetentionPolicyNetwork] = None
-    q_optimizer: Optional[torch.optim.Optimizer] = None
+    sac_agent: Optional[ContinuousSACAgent] = None
     replay_buffer: Deque[Dict[str, Any]] = field(default_factory=deque)
     update_steps: int = 0
     rng: np.random.Generator = field(init=False)
@@ -413,26 +555,22 @@ class PlatformTaskFirstRLState:
         self.device = str(
             torch.device(resolved_device if resolved_device else ("cuda" if torch.cuda.is_available() else "cpu"))
         )
-        action_count = len(self.action_profiles)
-        if self.q_network is None:
-            self.q_network = RetentionPolicyNetwork(
+        self.action_bounds = tuple((float(low), float(high)) for low, high in self.action_bounds)
+        if self.sac_agent is None:
+            self.sac_agent = ContinuousSACAgent(
                 feature_dim=self.feature_dim,
-                action_count=action_count,
+                action_bounds=self.action_bounds,
                 hidden_dim=max(8, int(self.hidden_dim)),
-            ).to(self.device)
-        else:
-            self.q_network = self.q_network.to(self.device)
-        if self.target_q_network is None:
-            self.target_q_network = RetentionPolicyNetwork(
-                feature_dim=self.feature_dim,
-                action_count=action_count,
-                hidden_dim=max(8, int(self.hidden_dim)),
-            ).to(self.device)
-            self.target_q_network.load_state_dict(self.q_network.state_dict())
-        else:
-            self.target_q_network = self.target_q_network.to(self.device)
-        if self.q_optimizer is None:
-            self.q_optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
+                device=self.device,
+                actor_learning_rate=self.learning_rate,
+                critic_learning_rate=self.critic_learning_rate or self.learning_rate,
+                alpha_learning_rate=self.alpha_learning_rate,
+                gamma=self.gamma,
+                tau=self.sac_tau,
+                initial_alpha=self.sac_initial_alpha,
+                auto_entropy=self.sac_auto_entropy,
+                target_entropy_scale=self.sac_target_entropy_scale,
+            )
         if not isinstance(self.replay_buffer, deque):
             self.replay_buffer = deque(self.replay_buffer, maxlen=max(32, int(self.replay_capacity)))
         else:
@@ -472,58 +610,27 @@ class PlatformTaskFirstRLState:
     def set_exploration_prob(self, exploration_prob: float) -> None:
         self.exploration_prob = float(np.clip(float(exploration_prob), 0.0, 1.0))
 
-    def _q_values(self, features: np.ndarray) -> torch.Tensor:
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        return self.q_network(feature_tensor).squeeze(0)
+    def sample_action(self, features: np.ndarray) -> Tuple[np.ndarray, Tuple[float, ...], np.ndarray]:
+        action, normalized_action = self.sac_agent.sample_action(
+            features=features,
+            exploration_noise=self.exploration_prob,
+        )
+        return action, tuple(float(value) for value in action), normalized_action
 
-    def sample_action(self, features: np.ndarray) -> Tuple[int, Tuple[float, float, float, float, float, float], np.ndarray]:
-        with torch.no_grad():
-            q_values = self._q_values(features)
-            probs_tensor = torch.softmax(q_values / max(1e-6, float(self.temperature)), dim=-1)
-        probs = probs_tensor.cpu().numpy().astype(np.float32)
-        if self.rng.random() < self.exploration_prob:
-            action_idx = int(self.rng.integers(0, len(self.action_profiles)))
-        else:
-            action_idx = int(torch.argmax(q_values).item())
-        return action_idx, self.action_profiles[action_idx], probs
-
-    def _sync_target_network(self) -> None:
-        self.target_q_network.load_state_dict(self.q_network.state_dict())
-
-    def _train_q_network(self) -> None:
-        batch_size = min(len(self.replay_buffer), max(1, int(self.dqn_batch_size)))
+    def _train_sac(self) -> None:
+        batch_size = min(len(self.replay_buffer), max(1, int(self.batch_size)))
         if batch_size <= 0:
             return
 
         sample_indices = self.rng.choice(len(self.replay_buffer), size=batch_size, replace=False)
         batch = [self.replay_buffer[int(idx)] for idx in sample_indices]
-
-        states = torch.as_tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor([int(item["action_idx"]) for item in batch], dtype=torch.long, device=self.device)
-        rewards = torch.as_tensor([float(item["reward"]) for item in batch], dtype=torch.float32, device=self.device)
-        dones = torch.as_tensor([float(item.get("done", 1.0)) for item in batch], dtype=torch.float32, device=self.device)
-        next_states = torch.as_tensor(np.stack([item["next_features"] for item in batch]), dtype=torch.float32, device=self.device)
-
-        q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        with torch.no_grad():
-            online_next_q = self.q_network(next_states)
-            next_actions = torch.argmax(online_next_q, dim=1)
-            target_next_q = self.target_q_network(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            targets = rewards + (1.0 - dones) * float(self.gamma) * target_next_q
-
-        self.q_optimizer.zero_grad()
-        loss = F.smooth_l1_loss(q_values, targets)
-        loss.backward()
-        self.q_optimizer.step()
-
-        self.update_steps += 1
-        if self.update_steps % max(1, int(self.target_sync_interval)) == 0:
-            self._sync_target_network()
+        self.sac_agent.train_batch(batch)
+        self.update_steps = self.sac_agent.update_steps
 
     def update_policy(
         self,
         features: np.ndarray,
-        action_idx: int,
+        action: np.ndarray,
         reward: float,
         completion_rate: float,
         unfairness: float,
@@ -538,13 +645,13 @@ class PlatformTaskFirstRLState:
         self.replay_buffer.append(
             {
                 "features": np.asarray(features, dtype=np.float32),
-                "action_idx": int(action_idx),
+                "action": np.asarray(action, dtype=np.float32),
                 "reward": float(reward),
                 "next_features": next_features,
                 "done": float(done),
             }
         )
-        self._train_q_network()
+        self._train_sac()
 
     def offline_replay_train(
         self,
@@ -565,7 +672,7 @@ class PlatformTaskFirstRLState:
 
         for _ in range(epochs):
             for _ in range(updates_per_epoch):
-                self._train_q_network()
+                self._train_sac()
                 optimization_steps += 1
 
         return {
@@ -1057,7 +1164,7 @@ def sample_platform_task_first_control(
         desired_workers=desired_workers,
         max_tasks_per_worker=max_tasks_per_worker,
     )
-    action_idx, action_profile, probs = platform_state.sample_action(features)
+    action, action_profile, normalized_action = platform_state.sample_action(features)
     task_scale, gap_scale, release_scale, keep_scale, need_scale, _fairness_weight = action_profile
     task_scale *= abundance_controls["task_weight_scale"]
     gap_scale *= abundance_controls["gap_weight_scale"]
@@ -1065,14 +1172,14 @@ def sample_platform_task_first_control(
     need_scale *= abundance_controls["need_scale"]
     return {
         "features": features,
-        "probs": probs,
-        "action_idx": action_idx,
+        "action": action,
+        "normalized_action": normalized_action,
         "task_weight": float(base_platform_task_weight * task_scale),
         "gap_weight": float(base_platform_gap_weight * gap_scale),
         "release_credit_weight": float(base_platform_release_credit_weight * release_scale),
         "keep_scale": float(keep_scale),
         "need_scale": float(need_scale),
-        "fairness_weight": 0.0,
+        "fairness_weight": float(_fairness_weight),
         "desired_workers": desired_workers,
         "demand_profile": demand_profile,
         "move_share_scale": float(abundance_controls["move_share_scale"]),
@@ -1220,7 +1327,8 @@ def rl_retention_bilateral_predispatch_workers(
     safe_reserve_by_region: Dict[int, int] = {}
     hoard_penalty_by_region: Dict[int, float] = {}
     action_ratio_by_region: Dict[int, float] = {}
-    action_index_by_region: Dict[int, int] = {}
+    action_profile_by_region: Dict[int, Dict[str, Any]] = {}
+    action_vector_by_region: Dict[int, List[float]] = {}
     platform_reward_weight_by_region: Dict[int, float] = {}
     platform_release_credit_by_region: Dict[int, float] = {}
 
@@ -1281,7 +1389,24 @@ def rl_retention_bilateral_predispatch_workers(
             neighbor_backlog_pressure=neighbor_backlog_pressure,
             max_tasks_per_worker=max_tasks_per_worker,
         )
-        action_idx, action_ratio, probs = state.sample_action(rid, features)
+        action, chosen_action, normalized_action = state.sample_action(rid, features)
+        if isinstance(chosen_action, dict):
+            action_profile = {
+                "name": str(chosen_action.get("name", "continuous")),
+                "retention_ratio": float(chosen_action.get("retention_ratio", 0.0)),
+                "receive_bid_scale": float(chosen_action.get("receive_bid_scale", 1.0)),
+                "release_ask_scale": float(chosen_action.get("release_ask_scale", 1.0)),
+                "distance_aversion_scale": float(chosen_action.get("distance_aversion_scale", 1.0)),
+            }
+        else:
+            action_profile = {
+                "name": f"retain_{float(chosen_action):+.2f}",
+                "retention_ratio": float(chosen_action),
+                "receive_bid_scale": 1.0,
+                "release_ask_scale": 1.0,
+                "distance_aversion_scale": 1.0,
+            }
+        action_ratio = float(action_profile["retention_ratio"])
         retain_anchor = max(base_keep, guard_keep_floor)
         retain_slack = max(0, idle_count - retain_anchor)
         retain_count = int(np.clip(
@@ -1291,7 +1416,8 @@ def rl_retention_bilateral_predispatch_workers(
         ))
         retain_count_by_region[rid] = retain_count
         action_ratio_by_region[rid] = action_ratio
-        action_index_by_region[rid] = action_idx
+        action_profile_by_region[rid] = action_profile
+        action_vector_by_region[rid] = [float(value) for value in action]
         hoard_penalty_by_region[rid] = 0.0
         platform_reward_weight_by_region[rid] = float(np.clip(
             1.0
@@ -1304,8 +1430,9 @@ def rl_retention_bilateral_predispatch_workers(
         if record_transition:
             transitions[rid] = {
                 "features": features,
-                "probs": probs,
-                "action_idx": action_idx,
+                "action": action,
+                "normalized_action": normalized_action,
+                "action_profile": action_profile,
                 "retain_count": retain_count,
                 "base_keep": base_keep,
                 "guard_keep_floor": guard_keep_floor,
@@ -1391,15 +1518,29 @@ def rl_retention_bilateral_predispatch_workers(
 
                 receiver_profile = demand_profile[receiver]
                 donor_profile = demand_profile[donor]
-                bid = (
+                receiver_action = action_profile_by_region[receiver]
+                donor_action = action_profile_by_region[donor]
+                bid = float(receiver_action["receive_bid_scale"]) * (
                     center_local_task_weight * float(receiver_need[receiver])
                     + platform_reward_weight_by_region[receiver]
                     + bid_shortage_weight * float(receiver_need[receiver])
                     + bid_backlog_weight * receiver_profile["backlog"]
                     + state.get_receiver_affinity(donor, receiver)
                 )
-                ask = center_local_task_weight * local_gap + ask_shortage_weight * local_gap
-                gain = bid - ask
+                ask = float(donor_action["release_ask_scale"]) * (
+                    center_local_task_weight * local_gap + ask_shortage_weight * local_gap
+                )
+                distance_weight = max(
+                    float(distance_penalty),
+                    float(getattr(config, "RBG_TRADE_DISTANCE_PENALTY_PER_KM", 0.0)),
+                )
+                distance_cost = (
+                    distance_weight
+                    * float(donor_action["distance_aversion_scale"])
+                    * center_distance
+                    / 1000.0
+                )
+                gain = bid - ask - distance_cost
                 if gain > best_gain:
                     best_gain = gain
                     best_edge = (donor, receiver, center_distance)
@@ -1448,7 +1589,8 @@ def rl_retention_bilateral_predispatch_workers(
         "donor_supply_after_trade": donor_supply,
         "hoard_penalty": hoard_penalty_by_region,
         "action_ratio": action_ratio_by_region,
-        "action_index": action_index_by_region,
+        "action_profile": action_profile_by_region,
+        "action_vector": action_vector_by_region,
         "platform_reward_weight": platform_reward_weight_by_region,
         "platform_release_credit": platform_release_credit_by_region,
     }
@@ -1467,6 +1609,7 @@ def rl_retention_bilateral_predispatch_workers(
         "hoard_penalty": hoard_penalty_by_region,
         "move_cost_by_region": move_cost_by_region,
         "transitions": transitions,
+        "action_profile": action_profile_by_region,
         "diagnostics": diagnostics,
         "stackelberg_control": {
             "region_priority_weight": platform_reward_weight_by_region,
@@ -1492,12 +1635,23 @@ def update_rl_retention_bilateral_state(
 ) -> Dict[int, float]:
     reward_by_region: Dict[int, float] = {}
     total_assigned = float(sum(assigned_tasks_by_region.get(rid, 0) for rid in state.region_ids))
+    service_ratio = _compute_service_ratio(assigned_tasks_by_region, total_tasks_by_region)
+    unfairness_by_region = _compute_pairwise_unfairness(service_ratio)
     global_task_reward_weight = float(
         getattr(config, 'RBG_GLOBAL_TASK_REWARD_WEIGHT', 0.35)
     )
     for rid in state.region_ids:
         served = float(assigned_tasks_by_region.get(rid, 0))
-        reward_by_region[rid] = served + global_task_reward_weight * total_assigned
+        hoard_penalty = float(hoard_penalty_by_region.get(rid, 0.0))
+        move_cost = float(move_cost_by_region.get(rid, 0.0))
+        unfairness = float(unfairness_by_region.get(rid, 0.0))
+        reward_by_region[rid] = (
+            served
+            + global_task_reward_weight * total_assigned
+            - float(hoard_penalty_weight) * hoard_penalty
+            - float(move_cost_weight) * move_cost
+            - float(unfairness_weight) * unfairness * total_assigned
+        )
     state.update_policy(
         transitions=transitions,
         reward_by_region=reward_by_region,
@@ -1525,10 +1679,16 @@ def update_platform_task_first_state(
     service_ratio = _compute_service_ratio(assigned_tasks_by_region, total_tasks_by_region)
     unfairness_by_region = _compute_pairwise_unfairness(service_ratio)
     mean_unfairness = float(np.mean(list(unfairness_by_region.values()))) if unfairness_by_region else 0.0
-    reward = total_assigned
+    loan_distance_km = float(transition.get("loan_distance_km", 0.0))
+    loan_distance_weight = float(getattr(config, "PFRL_LOAN_DISTANCE_REWARD_WEIGHT", 0.0))
+    reward = (
+        total_assigned
+        - float(fairness_secondary_weight) * mean_unfairness * total_assigned
+        - loan_distance_weight * loan_distance_km
+    )
     state.update_policy(
         features=transition["features"],
-        action_idx=int(transition["action_idx"]),
+        action=np.asarray(transition["action"], dtype=np.float32),
         reward=reward,
         next_features=transition.get("next_features"),
         done=float(transition.get("done", 1.0)),
@@ -1539,6 +1699,7 @@ def update_platform_task_first_state(
         "platform_reward": reward,
         "completion_rate": completion_rate,
         "mean_unfairness": mean_unfairness,
+        "loan_distance_km": loan_distance_km,
     }
 
 
@@ -1554,10 +1715,19 @@ def offline_warm_start_retention_policy(
     burst_weight: float = 1.2,
     epochs: int = 3,
 ) -> Dict[str, Any]:
+    # Continuous SAC learns from replayed dispatch rewards. Do not inject
+    # hand-authored discrete action labels into its initial policy.
+    return {
+        "sample_count": len(historical_samples),
+        "epochs": 0,
+        "continuous_sac": True,
+        "reason": "rule-based imitation warm-start disabled",
+    }
+
     if not historical_samples:
         return {"sample_count": 0, "epochs": 0, "action_histogram": {}}
 
-    action_histogram = {idx: 0 for idx in range(len(state.action_ratios))}
+    action_histogram = {idx: 0 for idx in range(len(state.action_profiles))}
     max_tasks_per_worker = max(1, int(max_tasks_per_worker))
     epochs = max(1, int(epochs))
 
@@ -1675,7 +1845,7 @@ def offline_warm_start_retention_policy(
                         else:
                             target_ratio = -0.15
 
-                action_idx = int(np.argmin(np.abs(np.asarray(state.action_ratios) - target_ratio)))
+                action_idx = state.closest_action_index(target_ratio)
                 action_histogram[action_idx] += 1
                 confidence = 1.0 + abs(target_ratio) * 2.0
                 state.imitation_update(
@@ -1686,7 +1856,7 @@ def offline_warm_start_retention_policy(
                 )
 
                 retain_count = int(np.clip(
-                    base_keep + round(float(state.action_ratios[action_idx]) * max(1, idle_count)),
+                    base_keep + round(float(state.action_profiles[action_idx][1]) * max(1, idle_count)),
                     0,
                     idle_count,
                 ))

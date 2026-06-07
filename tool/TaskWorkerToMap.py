@@ -230,19 +230,36 @@ class WorkerSimulator:
         print(
             f"   - 使用时间窗口：{start_timestamp // 3600:02d}:{start_timestamp % 3600 // 60:02d} - {end_timestamp // 3600:02d}:{end_timestamp % 3600 // 60:02d}")
 
-        df = pd.read_csv(file_path)
-        df['seconds_of_day'] = pd.to_datetime(df['time_str']).dt.hour * 3600 + \
-                               pd.to_datetime(df['time_str']).dt.minute * 60 + \
-                               pd.to_datetime(df['time_str']).dt.second
+        required_columns = ['wid', 'timestamp', 'time_str', 'lon_gcj', 'lat_gcj']
+        latest_positions = None
+        chunk_rows = int(getattr(config, 'WORKER_INIT_READ_CHUNK_ROWS', 100000))
+        for chunk in pd.read_csv(file_path, usecols=required_columns, chunksize=chunk_rows):
+            parsed_time = pd.to_datetime(chunk['time_str'], format='%Y-%m-%d %H:%M:%S')
+            chunk['seconds_of_day'] = (
+                parsed_time.dt.hour * 3600
+                + parsed_time.dt.minute * 60
+                + parsed_time.dt.second
+            )
+            selected = chunk[chunk['seconds_of_day'] <= start_timestamp]
+            if selected.empty:
+                continue
+            selected = (
+                selected.sort_values('timestamp')
+                .drop_duplicates(subset='wid', keep='last')
+            )
+            if latest_positions is None:
+                latest_positions = selected.copy()
+            else:
+                latest_positions = (
+                    pd.concat([latest_positions, selected], ignore_index=True)
+                    .sort_values('timestamp')
+                    .drop_duplicates(subset='wid', keep='last')
+                )
 
-        # 筛选时间窗口内的数据
-        workers_in_window = df[df['seconds_of_day'] <= start_timestamp].copy()
-
-        if len(workers_in_window) == 0:
+        if latest_positions is None or latest_positions.empty:
             raise ValueError(f"在时间窗口内没有找到工人数据")
 
-        # 取每个工人的最后一个位置
-        latest_positions = workers_in_window.sort_values('timestamp').groupby('wid').last().reset_index()
+        latest_positions = latest_positions.reset_index(drop=True)
 
         # 🚀 性能优化：在循环外统一构建 KDTree 并批量查询所有工人的最近路网节点
         if coords is not None and nodes is not None:

@@ -26,6 +26,7 @@ CURRENT_ALGORITHM_ORDER = [
     "Predictive-MCTGNet",
     "NoPred-RL-Game",
     "Platform-RL-MCTGNet",
+    "Event-RL-Game",
 ]
 ALGORITHM_STYLE_MAP = {
     "Greedy": {"marker": "o", "color": "#4E79A7"},
@@ -33,6 +34,7 @@ ALGORITHM_STYLE_MAP = {
     "Predictive-MCTGNet": {"marker": "^", "color": "#59A14F"},
     "NoPred-RL-Game": {"marker": "D", "color": "#E15759"},
     "Platform-RL-MCTGNet": {"marker": "P", "color": "#76B7B2"},
+    "Event-RL-Game": {"marker": "X", "color": "#B07AA1"},
 }
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_CONFIG_PATH = PROJECT_ROOT / "config.py"

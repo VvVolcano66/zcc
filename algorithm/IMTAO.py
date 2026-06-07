@@ -211,7 +211,8 @@ class IMTAO_Framework:
             if not np.isfinite(travel_t):
                 continue
 
-            finish_time = max(current_time + travel_t, task.r)
+            depart_time = max(current_time, task.r)
+            finish_time = depart_time + travel_t
             deadline = min(task.e, hard_deadline)
             if finish_time > deadline:
                 continue

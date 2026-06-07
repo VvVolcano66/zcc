@@ -2,8 +2,10 @@ import time
 import copy
 import os
 import math
+import contextlib
+import io
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -13,6 +15,11 @@ from scipy.spatial import KDTree
 import config
 from algorithm.Greedy import greedy_assignment_with_center_pickup
 from algorithm.CenterPrepackedAssignment import center_prepacked_assignment_with_center_pickup
+from algorithm.EventTaskRLGameDispatch import (
+    CenterTaskAllocationRLState,
+    event_task_rl_game_predispatch_workers,
+    update_center_task_allocation_state,
+)
 from algorithm.PredictiveDispatch import predict_next_slot_demand, predispatch_workers_for_next_slot
 from algorithm.GameTheoreticPredictiveDispatch import game_theoretic_predispatch_workers
 from algorithm.UncertaintyAwareBilateralDispatch import (
@@ -32,6 +39,7 @@ from algorithm.RLRetentionGameDispatch import (
 )
 from predicate.MCTGNetDispatchPredictor import MCTGNetDispatchPredictor
 from predicate.CenterPatternLSTMDispatchPredictor import CenterPatternLSTMDispatchPredictor
+from predicate.EventTaskDispatchPredictor import EventTaskDispatchPredictor
 from tool.TaskWorkerToMap import WorkerSimulator
 from tool.data_loader import get_real_road_network
 from tool.map_algorithms import run_kmeans_baseline, run_rcc_algorithm, find_region_centers
@@ -66,6 +74,7 @@ DEFAULT_WORKER_SAMPLE_SEED = int(getattr(config, 'EXPERIMENT_WORKER_SAMPLE_SEED'
 _SIMULATION_CONTEXT_CACHE = {}
 _MCTG_PREDICTOR_CACHE = {}
 _CENTER_LSTM_PREDICTOR_CACHE = {}
+_EVENT_TASK_PREDICTOR_CACHE = {}
 PREDICTIVE_UABG_ALGOS = {
     'predictive_uabg_mctgnet',
     'predictive_uncertainty_game_mctgnet',
@@ -85,6 +94,12 @@ PREDICTIVE_PLATFORM_RL_ALGOS = {
     'predictive_platform_rl_mctgnet',
     'platform_rl_mctgnet',
     'predictive_taskfirst_platform_mctgnet',
+    'predictive_event_rl_game',
+    'event_task_rl_game',
+}
+PREDICTIVE_EVENT_RL_GAME_ALGOS = {
+    'predictive_event_rl_game',
+    'event_task_rl_game',
 }
 NO_PRED_GAME_ALGOS = {'game_only_dispatch', 'game_only', 'no_pred_game'}
 RETENTION_RL_ALGOS = {
@@ -161,6 +176,39 @@ def _filter_df_by_map_bbox(df, lon_col: str, lat_col: str):
         & df[lat_col].between(min_lat, max_lat)
     )
     return df[mask].copy(), int((~mask).sum())
+
+
+def _current_scope_metadata():
+    download_dist_m = int(config.DOWNLOAD_DIST)
+    worker_speed_ms = float(getattr(config, 'WORKER_SPEED_MS', 0.0))
+    worker_speed_kmh = float(getattr(config, 'WORKER_SPEED_KMH', worker_speed_ms * 3.6))
+    return {
+        'map_center_lat': float(config.CHENGDU_CENTER[0]),
+        'map_center_lon': float(config.CHENGDU_CENTER[1]),
+        'download_dist_m': download_dist_m,
+        'map_download_dist_m': download_dist_m,
+        'map_size_km': 2.0 * download_dist_m / 1000.0,
+        'map_side_km': 2.0 * download_dist_m / 1000.0,
+        'center_count': int(config.NUM_ZONES),
+        'worker_speed_kmh': worker_speed_kmh,
+        'worker_speed_ms': worker_speed_ms,
+    }
+
+
+def _print_scope_metadata(scope):
+    expected_speed_ms = scope['worker_speed_kmh'] / 3.6
+    speed_note = ""
+    if abs(expected_speed_ms - scope['worker_speed_ms']) > 1e-6:
+        speed_note = " [WARNING: WORKER_SPEED_KMH and WORKER_SPEED_MS differ]"
+    print(
+        "   - Scope: "
+        f"center=({scope['map_center_lat']:.5f}, {scope['map_center_lon']:.5f}), "
+        f"dist={scope['download_dist_m']}m, "
+        f"approx_map={scope['map_size_km']:.1f}km x {scope['map_size_km']:.1f}km, "
+        f"centers={scope['center_count']}, "
+        f"worker_speed={scope['worker_speed_kmh']:.2f}km/h ({scope['worker_speed_ms']:.4f}m/s)"
+        f"{speed_note}"
+    )
 
 
 def build_prediction_date_split(test_date: str, data_dir: str):
@@ -427,6 +475,7 @@ def _summarize_prefix_action_stats(
         action_ratios: Tuple[float, ...],
         global_action_stats: Dict[int, Dict[str, float]],
         region_action_stats: Dict[int, Dict[int, Dict[str, float]]],
+        action_labels: Optional[Tuple[str, ...]] = None,
 ):
     global_summary = []
     for action_idx, action_ratio in enumerate(action_ratios):
@@ -438,6 +487,11 @@ def _summarize_prefix_action_stats(
             {
                 'action_idx': int(action_idx),
                 'action_ratio': float(action_ratio),
+                'action_label': (
+                    str(action_labels[action_idx])
+                    if action_labels is not None and action_idx < len(action_labels)
+                    else f"{float(action_ratio):+.2f}"
+                ),
                 'count': count,
                 'avg_reward': float(bucket.get('reward_sum', 0.0)) / count,
                 'avg_served': float(bucket.get('served_sum', 0.0)) / count,
@@ -464,6 +518,11 @@ def _summarize_prefix_action_stats(
                     {
                         'action_idx': int(action_idx),
                         'action_ratio': float(action_ratios[action_idx]),
+                        'action_label': (
+                            str(action_labels[action_idx])
+                            if action_labels is not None and action_idx < len(action_labels)
+                            else f"{float(action_ratios[action_idx]):+.2f}"
+                        ),
                         'count': count,
                         'avg_reward': avg_reward,
                         'avg_served': float(bucket.get('served_sum', 0.0)) / count,
@@ -551,27 +610,14 @@ def _simulate_same_day_prefix_rbg_learning(
     prefix_micro_batch_minutes = max(1, min(int(time_slot_minutes), prefix_micro_batch_minutes))
     micro_batch_seconds = prefix_micro_batch_minutes * 60
     slot_duration_seconds = int(time_slot_minutes) * 60
-    commit_next_step_only = micro_batch_seconds < slot_duration_seconds
+    commit_next_step_only = bool(getattr(config, 'ONLINE_COMMIT_ONE_TASK_AT_A_TIME', True))
     batch_fine_tune_enabled = bool(getattr(config, 'RBG_BATCH_ONLINE_FINE_TUNE', True))
-    global_action_stats = {
-        action_idx: {'count': 0, 'reward_sum': 0.0, 'served_sum': 0.0}
-        for action_idx in range(len(state.action_ratios))
-    }
-    region_action_stats = {
-        int(rid): {
-            action_idx: {'count': 0, 'reward_sum': 0.0, 'served_sum': 0.0}
-            for action_idx in range(len(state.action_ratios))
-        }
-        for rid in centers.keys()
-    }
+    fast_proxy_enabled = bool(getattr(config, 'RBG_PREFIX_FAST_PROXY', True))
+    global_action_stats = {}
+    region_action_stats = {}
 
     def _record_retention_update(transitions, reward_by_region, served_by_region):
-        for rid, transition in transitions.items():
-            action_idx = int(transition.get('action_idx', 0))
-            reward = float(reward_by_region.get(rid, 0.0))
-            served = float(served_by_region.get(rid, 0))
-            _record_prefix_action_stats(global_action_stats, action_idx, reward, served)
-            _record_prefix_action_stats(region_action_stats[int(rid)], action_idx, reward, served)
+        return None
 
     for local_slot_idx in range(slot_count):
         slot_start_seconds = prefix_start_seconds + local_slot_idx * time_slot_minutes * 60
@@ -714,6 +760,88 @@ def _simulate_same_day_prefix_rbg_learning(
         current_slot_rbg_stackelberg_control = predispatch_result.get('stackelberg_control', {})
         current_slot_rbg_demand_profile = predispatch_result.get('demand_profile', {})
         current_slot_rbg_desired_workers = predispatch_result.get('desired_workers', {})
+        _prepare_and_log_opportunistic_support_tasks(
+            G=G,
+            worker_sim=prefix_worker_sim,
+            centers=centers,
+            unassigned_tasks_pool=unassigned_tasks_pool,
+            moves=current_slot_rbg_moves,
+            current_time=slot_start_seconds,
+            stackelberg_control=current_slot_rbg_stackelberg_control,
+            label='RBG-Prefix 顺路支援',
+        )
+
+        if fast_proxy_enabled:
+            max_tasks = max(1, int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)))
+            proxy_total_tasks = {
+                rid: int(backlog_counts.get(rid, 0)) + int(slot_actual_counts.get(rid, 0))
+                for rid in centers.keys()
+            }
+            retain_count = predispatch_result.get('retain_count', {})
+            proxy_assigned_tasks = {
+                rid: min(
+                    proxy_total_tasks[rid],
+                    max(0, int(retain_count.get(rid, 0))) * max_tasks,
+                )
+                for rid in centers.keys()
+            }
+            backlog_counts = {
+                rid: max(0, proxy_total_tasks[rid] - proxy_assigned_tasks[rid])
+                for rid in centers.keys()
+            }
+            next_available_workers = {
+                rid: max(0, int(retain_count.get(rid, 0)))
+                for rid in centers.keys()
+            }
+            if current_slot_rbg_transitions:
+                hydrate_retention_transitions_with_next_state(
+                    state=state,
+                    transitions=current_slot_rbg_transitions,
+                    demand_profile=current_slot_rbg_demand_profile,
+                    desired_workers=current_slot_rbg_desired_workers,
+                    available_workers=next_available_workers,
+                    backlog_counts=backlog_counts,
+                    max_tasks_per_worker=max_tasks,
+                    min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(local_slot_idx == slot_count - 1),
+                )
+                update_rl_retention_bilateral_state(
+                    state=state,
+                    transitions=current_slot_rbg_transitions,
+                    assigned_tasks_by_region=proxy_assigned_tasks,
+                    total_tasks_by_region=proxy_total_tasks,
+                    hoard_penalty_by_region=current_slot_rbg_hoard_penalty,
+                    move_cost_by_region=current_slot_rbg_move_cost,
+                    moves=current_slot_rbg_moves,
+                    hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                    move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                    unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                )
+            if platform_state is not None and current_slot_platform_transition is not None:
+                hydrate_platform_transition_with_next_state(
+                    state=platform_state,
+                    transition=current_slot_platform_transition,
+                    available_workers=next_available_workers,
+                    backlog_counts=backlog_counts,
+                    max_tasks_per_worker=max_tasks,
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(local_slot_idx == slot_count - 1),
+                )
+                update_platform_task_first_state(
+                    state=platform_state,
+                    transition=current_slot_platform_transition,
+                    assigned_tasks_by_region=proxy_assigned_tasks,
+                    total_tasks_by_region=proxy_total_tasks,
+                    fairness_secondary_weight=current_slot_platform_fairness_weight,
+                )
+            for rid in centers.keys():
+                rolling_history[rid].append(slot_actual_counts[rid])
+            state.record_prediction_feedback(
+                predicted_region_demand=slot_actual_counts,
+                actual_region_demand=slot_actual_counts,
+            )
+            continue
 
         algo_name = 'predictive_platform_rl_mctgnet' if platform_state is not None else 'predictive_rl_game_mctgnet'
         last_micro_redispatch_idx = 0
@@ -728,29 +856,15 @@ def _simulate_same_day_prefix_rbg_learning(
             prefix_worker_sim.advance_workers_to_time(centers, micro_start_seconds)
 
             micro_new_tasks = 0
-            if not slot_df.empty:
-                current_tasks = slot_df[
-                    (slot_df['seconds_of_day'] >= micro_start_seconds) & (slot_df['seconds_of_day'] < micro_end_seconds)
-                ]
-                for _, row in current_tasks.iterrows():
-                    rid = int(row['region_id'])
-                    task = (
-                        row['nearest_node'],
-                        row['task_id'],
-                        config.TASK_BASE_REWARD,
-                        row['seconds_of_day'] + config.TASK_EXPIRE_MINUTES * 60,
-                        row['seconds_of_day'],
-                    )
-                    unassigned_tasks_pool[rid].append(task)
-                    slot_new_tasks_per_center[rid] += 1
-                    slot_total_tasks_per_center[rid] += 1
-                    micro_new_tasks += 1
+            micro_assignments = {}
+            micro_details = []
+            micro_assigned_tasks_per_center = {rid: 0 for rid in centers.keys()}
+            micro_total_tasks_per_center = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
 
             workers_per_center = {}
             for rid in centers.keys():
                 workers = prefix_worker_sim.get_available_workers_with_center_info(rid, current_time=micro_start_seconds)
                 workers_per_center[rid] = [(w[0], w[1], w[2], w[3], centers[rid]) for w in workers]
-            micro_total_tasks_per_center = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
 
             if (
                 total_micro > 1
@@ -786,58 +900,136 @@ def _simulate_same_day_prefix_rbg_learning(
                     current_slot_rbg_desired_workers = micro_dispatch_result.get('desired_workers', current_slot_rbg_desired_workers)
                     if platform_state is not None:
                         current_slot_platform_transition = micro_dispatch_result.get('platform_transition', current_slot_platform_transition)
+                    _prepare_and_log_opportunistic_support_tasks(
+                        G=G,
+                        worker_sim=prefix_worker_sim,
+                        centers=centers,
+                        unassigned_tasks_pool=unassigned_tasks_pool,
+                        moves=current_slot_rbg_moves,
+                        current_time=micro_start_seconds,
+                        stackelberg_control=current_slot_rbg_stackelberg_control,
+                        label='RBG-Prefix-Micro 顺路支援',
+                    )
                     for rid in centers.keys():
                         workers = prefix_worker_sim.get_available_workers_with_center_info(rid, current_time=micro_start_seconds)
                         workers_per_center[rid] = [(w[0], w[1], w[2], w[3], centers[rid]) for w in workers]
 
-            total_workers = sum(len(w) for w in workers_per_center.values())
-            total_current_tasks = sum(len(unassigned_tasks_pool[rid]) for rid in centers.keys())
-            micro_assignments = {}
-            micro_details = []
-            micro_assigned_tasks_per_center = {rid: 0 for rid in centers.keys()}
-            if total_current_tasks > 0 and total_workers > 0:
-                tasks_per_center = _build_intrabatch_online_tasks(
-                    unassigned_tasks_pool=unassigned_tasks_pool,
-                    current_time=micro_start_seconds,
+            def run_prefix_visible_assignment(decision_time, force=False):
+                _release_stale_pending_support_transfers(
+                    prefix_worker_sim,
+                    unassigned_tasks_pool,
+                    decision_time,
                 )
-                micro_assignments, _, micro_details = _run_assignment_for_window(
+                workers_snapshot = {}
+                total_workers = 0
+                for rid in centers.keys():
+                    workers = prefix_worker_sim.get_available_workers_with_center_info(rid, current_time=decision_time)
+                    workers_snapshot[rid] = [(w[0], w[1], w[2], w[3], centers[rid]) for w in workers]
+                    total_workers += len(workers)
+
+                total_current_tasks = sum(len(unassigned_tasks_pool[rid]) for rid in centers.keys())
+                if total_current_tasks <= 0 or total_workers <= 0:
+                    return 0
+                if (
+                    not force
+                    and _should_defer_online_dispatch(
+                        algo_key=algo_name,
+                        unassigned_tasks_pool=unassigned_tasks_pool,
+                        total_workers=total_workers,
+                        current_time=decision_time,
+                    )
+                ):
+                    return 0
+
+                tasks_per_center = _build_microbatch_candidate_tasks(
+                    unassigned_tasks_pool=unassigned_tasks_pool,
+                    workers_per_center=workers_snapshot,
+                    current_time=decision_time,
+                    slot_end_seconds=slot_end_seconds,
+                )
+                assignment_kwargs = dict(
                     algo_name=algo_name,
                     G=G,
                     config=config,
                     centers=centers,
                     rcc_partition=rcc_partition,
-                    workers_per_center=workers_per_center,
+                    workers_per_center=workers_snapshot,
                     tasks_per_center=tasks_per_center,
-                    slot_start_seconds=micro_start_seconds,
+                    slot_start_seconds=decision_time,
                     slot_end_seconds=slot_end_seconds,
                     stackelberg_control=current_slot_rbg_stackelberg_control,
-                    force_center_pickup_on_first_departure=not commit_next_step_only,
+                    force_center_pickup_on_first_departure=_online_force_center_pickup(commit_next_step_only),
                 )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    event_assignments, _, event_details = _run_assignment_for_window(**assignment_kwargs)
                 if commit_next_step_only:
-                    micro_assignments, _, micro_details = _reduce_microbatch_results_for_online_replanning(
-                        micro_assignments=micro_assignments,
-                        micro_details=micro_details,
-                        commit_horizon_seconds=micro_end_seconds,
+                    event_assignments, _, event_details = _reduce_microbatch_results_for_online_replanning(
+                        micro_assignments=event_assignments,
+                        micro_details=event_details,
+                        commit_horizon_seconds=decision_time,
                     )
                 _apply_assignment_results_to_workers(
                     G,
                     prefix_worker_sim,
-                    micro_details,
-                    commit_service_only=(
-                        commit_next_step_only
-                        and not bool(getattr(config, 'MICROBATCH_LATEST_DEPARTURE_COMMIT', False))
-                    ),
+                    event_details,
+                    commit_service_only=commit_next_step_only,
                 )
-                for detail in micro_details:
+                micro_assignments.update(event_assignments)
+                micro_details.extend(event_details)
+                for detail in event_details:
                     slot_assigned_tasks_per_center[detail['region_id']] += 1
                     micro_assigned_tasks_per_center[detail['region_id']] += 1
 
-            assigned_task_ids = {k[1] for k in micro_assignments.keys()}
+                assigned_task_ids = {k[1] for k in event_assignments.keys()}
+                if not assigned_task_ids:
+                    return 0
+                for rid in centers.keys():
+                    new_pool = []
+                    for t in unassigned_tasks_pool[rid]:
+                        if t[1] in assigned_task_ids:
+                            continue
+                        if decision_time >= t[3]:
+                            continue
+                        new_pool.append(t)
+                    unassigned_tasks_pool[rid] = new_pool
+                    backlog_counts[rid] = len(new_pool)
+                return len(assigned_task_ids)
+
+            run_prefix_visible_assignment(micro_start_seconds)
+
+            if not slot_df.empty:
+                current_tasks = slot_df[
+                    (slot_df['seconds_of_day'] >= micro_start_seconds)
+                    & (slot_df['seconds_of_day'] < micro_end_seconds)
+                ].sort_values(['seconds_of_day', 'task_id'])
+                for release_time, event_rows in current_tasks.groupby('seconds_of_day', sort=True):
+                    decision_time = float(release_time)
+                    prefix_worker_sim.advance_workers_to_time(centers, decision_time)
+                    event_new_tasks = 0
+                    for _, row in event_rows.iterrows():
+                        rid = int(row['region_id'])
+                        task = (
+                            row['nearest_node'],
+                            row['task_id'],
+                            config.TASK_BASE_REWARD,
+                            decision_time + config.TASK_EXPIRE_MINUTES * 60,
+                            decision_time,
+                        )
+                        unassigned_tasks_pool[rid].append(task)
+                        slot_new_tasks_per_center[rid] += 1
+                        slot_total_tasks_per_center[rid] += 1
+                        micro_total_tasks_per_center[rid] += 1
+                        micro_new_tasks += 1
+                        event_new_tasks += 1
+                    if event_new_tasks > 0:
+                        run_prefix_visible_assignment(decision_time)
+
+            prefix_worker_sim.advance_workers_to_time(centers, micro_end_seconds)
+            run_prefix_visible_assignment(micro_end_seconds)
+
             for rid in centers.keys():
                 new_pool = []
                 for t in unassigned_tasks_pool[rid]:
-                    if t[1] in assigned_task_ids:
-                        continue
                     if micro_end_seconds >= t[3]:
                         continue
                     new_pool.append(t)
@@ -974,14 +1166,10 @@ def _simulate_same_day_prefix_rbg_learning(
             epochs=int(getattr(config, 'PFRL_PREFIX_EXTRA_REPLAY_EPOCHS', 0)),
             updates_per_epoch=int(getattr(config, 'PFRL_PREFIX_REPLAY_UPDATES', 1)),
         )
-    global_action_summary, dominant_region_actions = _summarize_prefix_action_stats(
-        action_ratios=state.action_ratios,
-        global_action_stats=global_action_stats,
-        region_action_stats=region_action_stats,
-    )
+    global_action_summary, dominant_region_actions = [], {}
 
     return {
-        'source': 'same_day_prefix_simulation',
+        'source': 'same_day_prefix_proxy' if fast_proxy_enabled else 'same_day_prefix_simulation',
         'slot_count': slot_count,
         'worker_count': prefix_worker_count,
         'micro_batch_minutes': prefix_micro_batch_minutes,
@@ -992,9 +1180,481 @@ def _simulate_same_day_prefix_rbg_learning(
     }
 
 
+def _load_event_rl_warm_start_tasks(
+        history_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        coords,
+        nodes,
+        rcc_partition,
+):
+    task_file = os.path.join(config.TASK_DATA_DIR, f"tasks_{history_date}.csv")
+    if not os.path.exists(task_file):
+        return None
+
+    df = pd.read_csv(
+        task_file,
+        usecols=['task_id', 'first_time', 'first_lon', 'first_lat'],
+    )
+    if df.empty:
+        return None
+    df, _ = _filter_df_by_map_bbox(df, 'first_lon', 'first_lat')
+    if df.empty:
+        return None
+
+    df['first_time'] = pd.to_datetime(df['first_time'])
+    history_day = pd.Timestamp(history_date).normalize()
+    df = df[df['first_time'].dt.normalize() == history_day].copy()
+    if df.empty:
+        return None
+    df['seconds_of_day'] = (
+        df['first_time'].dt.hour * 3600
+        + df['first_time'].dt.minute * 60
+        + df['first_time'].dt.second
+    )
+    start_seconds = int(test_start_hour) * 3600
+    end_seconds = int(test_end_hour) * 3600
+    df = df[
+        (df['seconds_of_day'] >= start_seconds)
+        & (df['seconds_of_day'] < end_seconds)
+    ].copy()
+    if df.empty:
+        return None
+
+    _, idxs = KDTree(coords).query(df[['first_lon', 'first_lat']].values)
+    df['nearest_node'] = [nodes[i] for i in idxs]
+    df = df[df['nearest_node'].isin(rcc_partition)].copy()
+    if df.empty:
+        return None
+    df['region_id'] = df['nearest_node'].map(rcc_partition)
+    return df
+
+
+def _simulate_historical_event_task_rl_warm_start(
+        state: RLRetentionBilateralState,
+        platform_state,
+        center_task_state,
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        G,
+        coords,
+        nodes,
+        rcc_partition,
+        centers,
+        reference_worker_sim,
+):
+    if not bool(getattr(config, 'EVENT_RL_WARM_START_USE_TASK_EVENTS', True)):
+        return None
+
+    try:
+        train_dates, val_dates = build_prediction_date_split(test_date, config.TASK_DATA_DIR)
+    except ValueError:
+        return None
+    history_dates = train_dates + val_dates
+    warm_days = max(1, int(getattr(config, 'EVENT_RL_WARM_START_DAYS', 3)))
+    history_dates = history_dates[-warm_days:]
+    if not history_dates:
+        return None
+
+    region_ids = sorted(centers.keys())
+    worker_count = len(reference_worker_sim.worker_positions)
+    slot_duration_seconds = int(time_slot_minutes) * 60
+    start_seconds = int(test_start_hour) * 3600
+    slot_count_per_day = max(
+        1,
+        ((int(test_end_hour) - int(test_start_hour)) * 60) // int(time_slot_minutes),
+    )
+    completed_days = 0
+    completed_slots = 0
+    replayed_tasks = 0
+    precommit_tasks = 0
+
+    for day_idx, history_date in enumerate(history_dates):
+        df = _load_event_rl_warm_start_tasks(
+            history_date=history_date,
+            test_start_hour=test_start_hour,
+            test_end_hour=test_end_hour,
+            coords=coords,
+            nodes=nodes,
+            rcc_partition=rcc_partition,
+        )
+        if df is None or df.empty:
+            continue
+
+        warm_worker_sim = WorkerSimulator(G, config)
+        try:
+            warm_worker_sim.initialize_from_real_data(
+                date=history_date,
+                test_start_hour=test_start_hour,
+                prep_minutes=FIXED_INIT_PREP_MINUTES,
+                coords=coords,
+                nodes=nodes,
+                partition=rcc_partition,
+                centers=centers,
+                max_workers=worker_count,
+                sampling_mode=DEFAULT_WORKER_SAMPLING_MODE,
+                random_seed=DEFAULT_WORKER_SAMPLE_SEED,
+            )
+        except (FileNotFoundError, ValueError):
+            continue
+
+        unassigned_tasks_pool = {rid: [] for rid in region_ids}
+        for slot_idx in range(slot_count_per_day):
+            slot_start_seconds = start_seconds + slot_idx * slot_duration_seconds
+            slot_end_seconds = slot_start_seconds + slot_duration_seconds
+            warm_worker_sim.advance_workers_to_time(centers, slot_start_seconds)
+            slot_df = df[
+                (df['seconds_of_day'] >= slot_start_seconds)
+                & (df['seconds_of_day'] < slot_end_seconds)
+            ]
+
+            predicted_tasks = {rid: [] for rid in region_ids}
+            actual_tasks = {rid: [] for rid in region_ids}
+            for _, row in slot_df.iterrows():
+                rid = int(row['region_id'])
+                release_time = float(row['seconds_of_day'])
+                expiry_time = release_time + float(config.TASK_EXPIRE_MINUTES) * 60
+                task_id = str(row['task_id'])
+                predicted_tasks[rid].append(
+                    (
+                        row['nearest_node'],
+                        f"warm_pred:{history_date}:{task_id}",
+                        1.0,
+                        expiry_time,
+                        release_time,
+                    )
+                )
+                actual_tasks[rid].append(
+                    (
+                        row['nearest_node'],
+                        f"warm_actual:{history_date}:{task_id}",
+                        config.TASK_BASE_REWARD,
+                        expiry_time,
+                        release_time,
+                    )
+                )
+
+            actual_counts = {rid: len(actual_tasks[rid]) for rid in region_ids}
+            predicted_distribution = {
+                rid: {
+                    'mu': float(actual_counts[rid]),
+                    'sigma': 0.0,
+                    'q90': float(actual_counts[rid]),
+                    'burst_prob': 0.0,
+                }
+                for rid in region_ids
+            }
+            dispatch_result = event_task_rl_game_predispatch_workers(
+                G=G,
+                worker_sim=warm_worker_sim,
+                centers=centers,
+                predicted_tasks=predicted_tasks,
+                backlog_tasks=unassigned_tasks_pool,
+                predicted_distribution=predicted_distribution,
+                state=state,
+                platform_state=platform_state,
+                center_task_state=center_task_state,
+                slot_idx=day_idx * slot_count_per_day + slot_idx,
+                slot_start_seconds=slot_start_seconds,
+                slot_end_seconds=slot_end_seconds,
+            )
+            precommit_tasks += sum(dispatch_result.get('precommit_planned_by_region', {}).values())
+            replayed_tasks += sum(actual_counts.values())
+
+            slot_total_tasks = {
+                rid: len(unassigned_tasks_pool[rid]) + actual_counts[rid]
+                for rid in region_ids
+            }
+            if bool(getattr(config, 'EVENT_RL_WARM_START_FAST_PROXY', True)):
+                max_tasks = max(1, int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)))
+                assigned_counts = {rid: 0 for rid in region_ids}
+                retain_count = dispatch_result.get('retain_count', {})
+                for rid in region_ids:
+                    visible_tasks = sorted(
+                        list(unassigned_tasks_pool[rid]) + list(actual_tasks[rid]),
+                        key=lambda task: (float(task[3]), float(task[4]), str(task[1])),
+                    )
+                    worker_capacity = max(0, int(retain_count.get(rid, 0))) * max_tasks
+                    assigned_counts[rid] = min(len(visible_tasks), worker_capacity)
+                    unassigned_tasks_pool[rid] = [
+                        task for task in visible_tasks[assigned_counts[rid]:]
+                        if slot_end_seconds < task[3]
+                    ]
+
+                transitions = dispatch_result.get('transitions', {})
+                next_available_workers = {
+                    rid: max(0, int(retain_count.get(rid, 0)))
+                    for rid in region_ids
+                }
+                if transitions:
+                    hydrate_retention_transitions_with_next_state(
+                        state=state,
+                        transitions=transitions,
+                        demand_profile=dispatch_result.get('demand_profile', {}),
+                        desired_workers=dispatch_result.get('desired_workers', {}),
+                        available_workers=next_available_workers,
+                        backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                        max_tasks_per_worker=max_tasks,
+                        min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+                        backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                        done=float(slot_idx == slot_count_per_day - 1),
+                    )
+                    update_rl_retention_bilateral_state(
+                        state=state,
+                        transitions=transitions,
+                        assigned_tasks_by_region=assigned_counts,
+                        total_tasks_by_region=slot_total_tasks,
+                        hoard_penalty_by_region=dispatch_result.get('hoard_penalty', {}),
+                        move_cost_by_region=dispatch_result.get('move_cost_by_region', {}),
+                        moves=dispatch_result.get('moves', []),
+                        hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                        move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                        unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                    )
+                center_transitions = dispatch_result.get('center_transitions', {})
+                if center_task_state is not None and center_transitions:
+                    update_center_task_allocation_state(
+                        state=center_task_state,
+                        transitions=center_transitions,
+                        assigned_tasks_by_region=assigned_counts,
+                        total_tasks_by_region=slot_total_tasks,
+                        remaining_tasks_by_region={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                        actual_arrivals_by_region=actual_counts,
+                        predicted_demand_by_region={rid: len(predicted_tasks.get(rid, [])) for rid in region_ids},
+                    )
+                platform_transition = dispatch_result.get('platform_transition')
+                if platform_state is not None and platform_transition is not None:
+                    hydrate_platform_transition_with_next_state(
+                        state=platform_state,
+                        transition=platform_transition,
+                        available_workers=next_available_workers,
+                        backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                        max_tasks_per_worker=max_tasks,
+                        backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                        done=float(slot_idx == slot_count_per_day - 1),
+                    )
+                    update_platform_task_first_state(
+                        state=platform_state,
+                        transition=platform_transition,
+                        assigned_tasks_by_region=assigned_counts,
+                        total_tasks_by_region=slot_total_tasks,
+                        fairness_secondary_weight=float(
+                            getattr(config, 'PFRL_FAIRNESS_SECONDARY_WEIGHT', 0.20)
+                        ),
+                    )
+                state.record_prediction_feedback(
+                    predicted_region_demand=actual_counts,
+                    actual_region_demand=actual_counts,
+                )
+                completed_slots += 1
+                continue
+
+            assignments = {}
+            details = []
+
+            def run_warm_visible_assignment(decision_time):
+                workers_per_center = {}
+                for rid in region_ids:
+                    workers = warm_worker_sim.get_available_workers_with_center_info(
+                        rid,
+                        current_time=decision_time,
+                    )
+                    workers_per_center[rid] = [
+                        (w[0], w[1], w[2], w[3], centers[rid]) for w in workers
+                    ]
+                if (
+                    sum(len(unassigned_tasks_pool[rid]) for rid in region_ids) <= 0
+                    or sum(len(v) for v in workers_per_center.values()) <= 0
+                ):
+                    return
+                if _should_defer_online_dispatch(
+                    algo_key='predictive_event_rl_game',
+                    unassigned_tasks_pool=unassigned_tasks_pool,
+                    total_workers=sum(len(v) for v in workers_per_center.values()),
+                    current_time=decision_time,
+                ):
+                    return
+                tasks_per_center = _build_microbatch_candidate_tasks(
+                    unassigned_tasks_pool=unassigned_tasks_pool,
+                    workers_per_center=workers_per_center,
+                    current_time=decision_time,
+                    slot_end_seconds=slot_end_seconds,
+                )
+                assignment_kwargs = dict(
+                    algo_name='predictive_event_rl_game',
+                    G=G,
+                    config=config,
+                    centers=centers,
+                    rcc_partition=rcc_partition,
+                    workers_per_center=workers_per_center,
+                    tasks_per_center=tasks_per_center,
+                    slot_start_seconds=decision_time,
+                    slot_end_seconds=slot_end_seconds,
+                    stackelberg_control=dispatch_result.get('stackelberg_control', {}),
+                    force_center_pickup_on_first_departure=True,
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    event_assignments, _, event_details = _run_assignment_for_window(**assignment_kwargs)
+                _apply_assignment_results_to_workers(G, warm_worker_sim, event_details)
+                assignments.update(event_assignments)
+                details.extend(event_details)
+
+                assigned_task_ids = {key[1] for key in event_assignments.keys()}
+                if not assigned_task_ids:
+                    return
+                for rid in region_ids:
+                    unassigned_tasks_pool[rid] = [
+                        task for task in unassigned_tasks_pool[rid]
+                        if task[1] not in assigned_task_ids and decision_time < task[3]
+                    ]
+
+            run_warm_visible_assignment(slot_start_seconds)
+
+            slot_events = slot_df.sort_values(['seconds_of_day', 'task_id'])
+            for release_time, event_rows in slot_events.groupby('seconds_of_day', sort=True):
+                decision_time = float(release_time)
+                warm_worker_sim.advance_workers_to_time(centers, decision_time)
+                for _, row in event_rows.iterrows():
+                    rid = int(row['region_id'])
+                    task_id = str(row['task_id'])
+                    unassigned_tasks_pool[rid].append(
+                        (
+                            row['nearest_node'],
+                            f"warm_actual:{history_date}:{task_id}",
+                            config.TASK_BASE_REWARD,
+                            decision_time + float(config.TASK_EXPIRE_MINUTES) * 60,
+                            decision_time,
+                        )
+                    )
+                run_warm_visible_assignment(decision_time)
+
+            warm_worker_sim.advance_workers_to_time(centers, slot_end_seconds)
+            run_warm_visible_assignment(slot_end_seconds)
+
+            assigned_counts = {rid: 0 for rid in region_ids}
+            for detail in details:
+                assigned_counts[int(detail['region_id'])] += 1
+            assigned_task_ids = {key[1] for key in assignments.keys()}
+            for rid in region_ids:
+                unassigned_tasks_pool[rid] = [
+                    task for task in unassigned_tasks_pool[rid]
+                    if task[1] not in assigned_task_ids and slot_end_seconds < task[3]
+                ]
+
+            transitions = dispatch_result.get('transitions', {})
+            next_available_workers = {
+                rid: len(
+                    warm_worker_sim.get_available_workers_with_center_info(
+                        rid,
+                        current_time=slot_end_seconds,
+                    )
+                )
+                for rid in region_ids
+            }
+            if transitions:
+                hydrate_retention_transitions_with_next_state(
+                    state=state,
+                    transitions=transitions,
+                    demand_profile=dispatch_result.get('demand_profile', {}),
+                    desired_workers=dispatch_result.get('desired_workers', {}),
+                    available_workers=next_available_workers,
+                    backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                    max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                    min_buffer_workers=int(getattr(config, 'UABG_MIN_BUFFER_WORKERS', 1)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(slot_idx == slot_count_per_day - 1),
+                )
+                update_rl_retention_bilateral_state(
+                    state=state,
+                    transitions=transitions,
+                    assigned_tasks_by_region=assigned_counts,
+                    total_tasks_by_region=slot_total_tasks,
+                    hoard_penalty_by_region=dispatch_result.get('hoard_penalty', {}),
+                    move_cost_by_region=dispatch_result.get('move_cost_by_region', {}),
+                    moves=dispatch_result.get('moves', []),
+                    hoard_penalty_weight=float(getattr(config, 'RBG_REWARD_HOARD_WEIGHT', 0.02)),
+                    move_cost_weight=float(getattr(config, 'RBG_REWARD_MOVE_WEIGHT', 0.08)),
+                    unfairness_weight=float(getattr(config, 'RBG_REWARD_UNFAIRNESS_WEIGHT', 1.0)),
+                )
+            center_transitions = dispatch_result.get('center_transitions', {})
+            if center_task_state is not None and center_transitions:
+                update_center_task_allocation_state(
+                    state=center_task_state,
+                    transitions=center_transitions,
+                    assigned_tasks_by_region=assigned_counts,
+                    total_tasks_by_region=slot_total_tasks,
+                    remaining_tasks_by_region={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                    actual_arrivals_by_region=actual_counts,
+                    predicted_demand_by_region={rid: len(predicted_tasks.get(rid, [])) for rid in region_ids},
+                )
+            platform_transition = dispatch_result.get('platform_transition')
+            if platform_state is not None and platform_transition is not None:
+                hydrate_platform_transition_with_next_state(
+                    state=platform_state,
+                    transition=platform_transition,
+                    available_workers=next_available_workers,
+                    backlog_counts={rid: len(unassigned_tasks_pool[rid]) for rid in region_ids},
+                    max_tasks_per_worker=int(getattr(config, 'MAX_TASKS_PER_WORKER', 4)),
+                    backlog_weight=float(getattr(config, 'UABG_BACKLOG_WEIGHT', 1.0)),
+                    done=float(slot_idx == slot_count_per_day - 1),
+                )
+                update_platform_task_first_state(
+                    state=platform_state,
+                    transition=platform_transition,
+                    assigned_tasks_by_region=assigned_counts,
+                    total_tasks_by_region=slot_total_tasks,
+                    fairness_secondary_weight=float(
+                        getattr(config, 'PFRL_FAIRNESS_SECONDARY_WEIGHT', 0.20)
+                    ),
+                )
+            state.record_prediction_feedback(
+                predicted_region_demand=actual_counts,
+                actual_region_demand=actual_counts,
+            )
+            completed_slots += 1
+        completed_days += 1
+
+    if completed_days <= 0 or completed_slots <= 0:
+        return None
+    extra_replay = state.offline_replay_train(
+        epochs=int(getattr(config, 'RBG_PREFIX_EXTRA_REPLAY_EPOCHS', 0)),
+        updates_per_region=int(getattr(config, 'RBG_PREFIX_REPLAY_UPDATES_PER_REGION', 1)),
+    )
+    platform_extra_replay = {}
+    if platform_state is not None:
+        platform_extra_replay = platform_state.offline_replay_train(
+            epochs=int(getattr(config, 'PFRL_PREFIX_EXTRA_REPLAY_EPOCHS', 0)),
+            updates_per_epoch=int(getattr(config, 'PFRL_PREFIX_REPLAY_UPDATES', 1)),
+        )
+    center_extra_replay = {}
+    if center_task_state is not None:
+        center_extra_replay = center_task_state.offline_replay_train(
+            epochs=int(getattr(config, 'EVENT_CENTER_PREFIX_EXTRA_REPLAY_EPOCHS', 0)),
+            updates_per_region=int(getattr(config, 'EVENT_CENTER_PREFIX_REPLAY_UPDATES_PER_REGION', 1)),
+        )
+    return {
+        'source': (
+            'historical_event_task_proxy'
+            if bool(getattr(config, 'EVENT_RL_WARM_START_FAST_PROXY', True))
+            else 'historical_event_task_replay'
+        ),
+        'history_days': completed_days,
+        'slot_count': completed_slots,
+        'worker_count': worker_count,
+        'replayed_tasks': replayed_tasks,
+        'precommit_tasks': precommit_tasks,
+        'extra_replay': extra_replay,
+        'platform_extra_replay': platform_extra_replay,
+        'center_extra_replay': center_extra_replay,
+    }
+
+
 def _offline_warm_start_rbg_state(
         state: RLRetentionBilateralState,
         platform_state,
+        center_task_state,
         test_date: str,
         test_start_hour: int,
         test_end_hour: int,
@@ -1005,10 +1665,45 @@ def _offline_warm_start_rbg_state(
         rcc_partition,
         centers,
         worker_sim,
+        algo_name=None,
 ):
     if not bool(getattr(config, 'RBG_OFFLINE_WARM_START', True)):
         state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
         return None
+
+    if str(algo_name).lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+        event_task_stats = _simulate_historical_event_task_rl_warm_start(
+            state=state,
+            platform_state=platform_state,
+            center_task_state=center_task_state,
+            test_date=test_date,
+            test_start_hour=test_start_hour,
+            test_end_hour=test_end_hour,
+            time_slot_minutes=time_slot_minutes,
+            G=G,
+            coords=coords,
+            nodes=nodes,
+            rcc_partition=rcc_partition,
+            centers=centers,
+            reference_worker_sim=worker_sim,
+        )
+        if event_task_stats is not None:
+            print(
+                f"   - Event-task RL warm-start ready: days={event_task_stats['history_days']}, "
+                f"slots={event_task_stats['slot_count']}, tasks={event_task_stats['replayed_tasks']}, "
+                f"precommit={event_task_stats['precommit_tasks']}, source={event_task_stats['source']}"
+            )
+            extra_replay = event_task_stats.get('extra_replay', {})
+            platform_extra_replay = event_task_stats.get('platform_extra_replay', {})
+            center_extra_replay = event_task_stats.get('center_extra_replay', {})
+            print(
+                f"   - Continuous SAC warm-start optimization: "
+                f"retention={extra_replay.get('optimization_steps', 0)}, "
+                f"platform={platform_extra_replay.get('optimization_steps', 0)}, "
+                f"center={center_extra_replay.get('optimization_steps', 0)} steps"
+            )
+            state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
+            return event_task_stats
 
     prefix_sim_stats = _simulate_same_day_prefix_rbg_learning(
         state=state,
@@ -1025,7 +1720,7 @@ def _offline_warm_start_rbg_state(
     )
     if prefix_sim_stats is not None:
         print(
-            f"   - RBG prefix simulation warm-start ready: slots={prefix_sim_stats['slot_count']}, "
+            f"   - RBG continuous replay warm-start ready: slots={prefix_sim_stats['slot_count']}, "
             f"workers={prefix_sim_stats['worker_count']}, source={prefix_sim_stats['source']}, "
             f"micro={prefix_sim_stats.get('micro_batch_minutes', time_slot_minutes)}min"
         )
@@ -1046,7 +1741,7 @@ def _offline_warm_start_rbg_state(
         global_action_summary = prefix_sim_stats.get('global_action_summary', [])
         if global_action_summary:
             action_text = ", ".join(
-                f"{item['action_ratio']:+.2f}: n={item['count']}, "
+                f"{item['action_label']}({item['action_ratio']:+.2f}): n={item['count']}, "
                 f"avg_reward={item['avg_reward']:.1f}, avg_served={item['avg_served']:.1f}"
                 for item in global_action_summary
             )
@@ -1054,7 +1749,8 @@ def _offline_warm_start_rbg_state(
         dominant_region_actions = prefix_sim_stats.get('dominant_region_actions', {})
         if dominant_region_actions:
             region_text = ", ".join(
-                f"R{rid}: {info['action_ratio']:+.2f} (n={info['count']}, avg_reward={info['avg_reward']:.1f})"
+                f"R{rid}: {info['action_label']}({info['action_ratio']:+.2f}) "
+                f"(n={info['count']}, avg_reward={info['avg_reward']:.1f})"
                 for rid, info in sorted(dominant_region_actions.items())
             )
             print(f"   - RBG prefix dominant actions: {region_text}")
@@ -1089,6 +1785,13 @@ def _offline_warm_start_rbg_state(
         burst_weight=float(getattr(config, 'UABG_BURST_WEIGHT', 1.2)),
         epochs=int(getattr(config, 'RBG_OFFLINE_EPOCHS', 3)),
     )
+    if bool(stats.get('continuous_sac')) and int(stats.get('epochs', 0)) <= 0:
+        print(
+            f"   - Continuous SAC offline fallback skipped: "
+            f"{stats.get('reason', 'no replay transitions')}"
+        )
+        state.set_exploration_prob(float(getattr(config, 'RBG_ONLINE_EXPLORATION_PROB', state.exploration_prob)))
+        return stats
     print(
         f"   - RBG offline warm-start ready: samples={stats['sample_count']}, "
         f"epochs={stats['epochs']}, source={historical_samples[0].get('source', 'unknown')}"
@@ -1104,6 +1807,7 @@ def _build_simulation_context(
         slots_to_run: int
 ):
     compare_end_seconds = test_start_hour * 3600 + slots_to_run * time_slot_minutes * 60
+    scope = _current_scope_metadata()
     cache_key = (
         test_date,
         test_start_hour,
@@ -1117,9 +1821,11 @@ def _build_simulation_context(
     )
     if cache_key in _SIMULATION_CONTEXT_CACHE:
         print("\n【阶段 1-4】复用缓存的地图、订单与工人初始数据...")
+        _print_scope_metadata(_SIMULATION_CONTEXT_CACHE[cache_key].get('scope', scope))
         return _SIMULATION_CONTEXT_CACHE[cache_key]
 
     print("\n【阶段 1-3】加载路网数据与中心划分...")
+    _print_scope_metadata(scope)
     G, coords, nodes = get_real_road_network(config.CHENGDU_CENTER, dist=config.DOWNLOAD_DIST)
     kmeans_partition = run_kmeans_baseline(coords, nodes, k=config.NUM_ZONES)
     rcc_partition = run_rcc_algorithm(G, kmeans_partition, k=config.NUM_ZONES)
@@ -1150,6 +1856,19 @@ def _build_simulation_context(
         eval_tasks = df_tasks[eval_mask].copy()
         eval_tasks = eval_tasks[eval_tasks['nearest_node'].isin(rcc_partition)].copy()
         eval_tasks['region_id'] = eval_tasks['nearest_node'].map(rcc_partition)
+        eval_slot_counts = []
+        for slot_idx in range(slots_to_run):
+            slot_start = test_start_hour * 3600 + slot_idx * time_slot_minutes * 60
+            slot_end = slot_start + time_slot_minutes * 60
+            eval_slot_counts.append(
+                int(((eval_tasks['seconds_of_day'] >= slot_start) & (eval_tasks['seconds_of_day'] < slot_end)).sum())
+            )
+        print(
+            f"   - Evaluation window tasks: {len(eval_tasks)} "
+            f"({test_start_hour:02d}:00-{compare_end_seconds // 3600:02d}:{(compare_end_seconds % 3600) // 60:02d}); "
+            f"per-slot={eval_slot_counts}"
+        )
+        df_tasks = eval_tasks.copy()
     else:
         print(f"⚠️ 未找到任务文件: {task_file}")
         df_tasks = pd.DataFrame()
@@ -1159,6 +1878,12 @@ def _build_simulation_context(
     if not eval_tasks.empty:
         for region_id, count in eval_tasks['region_id'].value_counts().items():
             total_tasks_per_center[region_id] = int(count)
+    counted_eval_tasks = int(sum(total_tasks_per_center.values()))
+    if counted_eval_tasks != int(len(eval_tasks)):
+        print(
+            f"   - WARNING: center task count mismatch: "
+            f"by_center={counted_eval_tasks}, eval_rows={len(eval_tasks)}"
+        )
 
     print("\n【阶段 4】初始化工人真实位置...")
     base_worker_sim = WorkerSimulator(G, config)
@@ -1184,6 +1909,7 @@ def _build_simulation_context(
         'df_tasks': df_tasks,
         'eval_tasks': eval_tasks,
         'total_tasks_per_center': total_tasks_per_center,
+        'scope': scope,
         'worker_state': {
             'worker_positions': copy.deepcopy(base_worker_sim.worker_positions),
             'worker_status': copy.deepcopy(base_worker_sim.worker_status),
@@ -1378,6 +2104,50 @@ def _get_or_train_center_lstm_predictor(
     )
     print("   - CenterPatternLSTM predictor ready")
     _CENTER_LSTM_PREDICTOR_CACHE[predictor_key] = predictor
+    return predictor
+
+
+def _get_or_train_event_task_predictor(
+        test_date: str,
+        test_start_hour: int,
+        test_end_hour: int,
+        time_slot_minutes: int,
+        coords,
+        nodes,
+        rcc_partition,
+        centers
+):
+    predictor_key = (
+        test_date,
+        test_start_hour,
+        test_end_hour,
+        time_slot_minutes,
+        getattr(config, 'EVENT_PRED_SLOT_MINUTES', 5),
+        config.DOWNLOAD_DIST,
+        config.NUM_ZONES,
+    )
+    if predictor_key in _EVENT_TASK_PREDICTOR_CACHE:
+        print("   - Reusing cached event-task predictor")
+        return _EVENT_TASK_PREDICTOR_CACHE[predictor_key]
+
+    print(f"\n[阶段 4.5] 训练事件级预测器并准备 {test_date} 的任务级预承诺计划...")
+    predictor = EventTaskDispatchPredictor(
+        data_dir=config.TASK_DATA_DIR,
+        coords=coords,
+        nodes=nodes,
+        partition=rcc_partition,
+        centers=centers,
+        time_interval=time_slot_minutes,
+        event_slot_minutes=int(getattr(config, 'EVENT_PRED_SLOT_MINUTES', 5)),
+        random_state=int(getattr(config, 'RBG_RANDOM_SEED', 42)),
+    )
+    predictor.fit(
+        target_date=test_date,
+        start_hour=float(test_start_hour),
+        end_hour=float(test_end_hour),
+    )
+    print(f"   - Event forecast tasks ready: {len(predictor.forecast)}")
+    _EVENT_TASK_PREDICTOR_CACHE[predictor_key] = predictor
     return predictor
 
 
@@ -1649,6 +2419,576 @@ def calculate_collaboration_unfairness(total_tasks_per_center, assigned_tasks_pe
     return rho, u_rho
 
 
+def _summarize_unique_assigned_tasks(details, region_ids):
+    task_region = {}
+    duplicate_detail_count = 0
+    for detail in details:
+        task_id = detail.get('task_id')
+        if task_id is None:
+            continue
+        if task_id in task_region:
+            duplicate_detail_count += 1
+            continue
+        task_region[task_id] = detail.get('region_id')
+
+    assigned_tasks_per_center = {region_id: 0 for region_id in region_ids}
+    for region_id in task_region.values():
+        if region_id in assigned_tasks_per_center:
+            assigned_tasks_per_center[region_id] += 1
+    return task_region, assigned_tasks_per_center, duplicate_detail_count
+
+
+def _count_unique_assigned_task_ids(assignments):
+    return len({task_id for _, task_id in assignments.keys()})
+
+
+def _count_unassigned_pool_tasks(unassigned_tasks_pool):
+    return sum(len(pool) for pool in unassigned_tasks_pool.values())
+
+
+def _expire_unassigned_tasks(unassigned_tasks_pool, current_time):
+    expired_count = 0
+    for rid, pool in unassigned_tasks_pool.items():
+        kept = []
+        for task in pool:
+            if float(current_time) >= float(task[3]):
+                expired_count += 1
+                continue
+            kept.append(task)
+        unassigned_tasks_pool[rid] = kept
+    return expired_count
+
+
+def _next_worker_service_completion_time(worker_sim, current_time, horizon_time):
+    eps = 1e-6
+    completion_times = [
+        float(busy_until)
+        for wid, busy_until in worker_sim.worker_busy_until.items()
+        if worker_sim.worker_status.get(wid) == 'en_route_to_task'
+        and busy_until is not None
+        and float(busy_until) > float(current_time) + eps
+        and float(busy_until) <= float(horizon_time) + eps
+    ]
+    return min(completion_times) if completion_times else None
+
+
+def _resolve_assignment_service_horizon(tasks_per_center, slot_start_seconds, slot_end_seconds):
+    if not bool(getattr(config, 'ONLINE_ALLOW_SERVICE_AFTER_BATCH_END', False)):
+        return slot_end_seconds
+    max_expire = None
+    for tasks in tasks_per_center.values():
+        for task in tasks:
+            expire_time = float(task[3])
+            max_expire = expire_time if max_expire is None else max(max_expire, expire_time)
+    if max_expire is None:
+        return slot_end_seconds
+    max_overtime = max(0.0, float(getattr(config, 'ONLINE_DRAIN_MAX_SECONDS', 0.0)))
+    capped_horizon = float(slot_end_seconds) + max_overtime if max_overtime > 0.0 else max_expire
+    return max(float(slot_end_seconds), min(max_expire, capped_horizon))
+
+
+def _online_force_center_pickup(commit_next_step_only):
+    return (
+        not commit_next_step_only
+        or bool(getattr(config, 'ONLINE_REPLAN_REQUIRES_CENTER_PICKUP', True))
+    )
+
+
+def _get_worker_pending_center_transfers(worker_sim):
+    pending = getattr(worker_sim, 'worker_pending_center_transfers', None)
+    if pending is None:
+        pending = {}
+        setattr(worker_sim, 'worker_pending_center_transfers', pending)
+    return pending
+
+
+def _shortest_distance_m(G, src_node, dst_node, distance_cache):
+    if src_node == dst_node:
+        return 0.0
+    key = (src_node, dst_node)
+    if key not in distance_cache:
+        try:
+            distance_cache[key] = float(nx.shortest_path_length(G, src_node, dst_node, weight='length'))
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            distance_cache[key] = float('inf')
+    return distance_cache[key]
+
+
+def _find_opportunistic_support_task(
+        G,
+        worker_node,
+        donor_center_node,
+        receiver_center_node,
+        donor_tasks,
+        current_time,
+):
+    if not donor_tasks:
+        return None
+
+    speed = max(1e-6, float(getattr(config, 'WORKER_SPEED_MS', 1.0)))
+    max_detour_m = max(0.0, float(getattr(config, 'SUPPORT_OPPORTUNISTIC_MAX_DETOUR_M', 800.0)))
+    max_detour_ratio = max(0.0, float(getattr(config, 'SUPPORT_OPPORTUNISTIC_MAX_DETOUR_RATIO', 0.35)))
+    candidate_limit = max(1, int(getattr(config, 'SUPPORT_OPPORTUNISTIC_CANDIDATE_LIMIT', 32)))
+    distance_cache = {}
+
+    direct_to_receiver = _shortest_distance_m(G, worker_node, receiver_center_node, distance_cache)
+    if not np.isfinite(direct_to_receiver):
+        return None
+
+    worker_to_donor = _shortest_distance_m(G, worker_node, donor_center_node, distance_cache)
+    if not np.isfinite(worker_to_donor):
+        return None
+
+    best = None
+    prioritized_tasks = sorted(
+        donor_tasks,
+        key=lambda task: (
+            max(0.0, float(task[3]) - float(current_time)),
+            float(task[4]) if len(task) > 4 else float(current_time),
+            str(task[1]),
+        ),
+    )[:candidate_limit]
+    for task in prioritized_tasks:
+        task_node = task[0]
+        donor_to_task = _shortest_distance_m(G, donor_center_node, task_node, distance_cache)
+        task_to_receiver = _shortest_distance_m(G, task_node, receiver_center_node, distance_cache)
+        if not np.isfinite(donor_to_task) or not np.isfinite(task_to_receiver):
+            continue
+
+        release_time = float(task[4]) if len(task) > 4 else float(current_time)
+        service_departure = max(float(current_time) + worker_to_donor / speed, release_time)
+        service_finish = service_departure + donor_to_task / speed
+        if service_finish > float(task[3]):
+            continue
+
+        via_distance = worker_to_donor + donor_to_task + task_to_receiver
+        detour_m = max(0.0, via_distance - direct_to_receiver)
+        detour_ratio = detour_m / max(1.0, direct_to_receiver)
+        if detour_m > max_detour_m and detour_ratio > max_detour_ratio:
+            continue
+
+        score = (
+            detour_m,
+            service_finish,
+            max(0.0, float(task[3]) - service_finish),
+            str(task[1]),
+        )
+        if best is None or score < best[0]:
+            best = (
+                score,
+                {
+                    'task': task,
+                    'detour_m': detour_m,
+                    'detour_ratio': detour_ratio,
+                    'direct_distance_m': direct_to_receiver,
+                    'via_distance_m': via_distance,
+                    'service_finish': service_finish,
+                },
+            )
+
+    return None if best is None else best[1]
+
+
+def _prepare_opportunistic_support_tasks(
+        G,
+        worker_sim,
+        centers,
+        unassigned_tasks_pool,
+        moves,
+        current_time,
+        stackelberg_control=None,
+):
+    if not bool(getattr(config, 'SUPPORT_OPPORTUNISTIC_LOCAL_TASK_ENABLED', True)):
+        return 0
+    if not moves:
+        return 0
+
+    pending = _get_worker_pending_center_transfers(worker_sim)
+    worker_task_priority_map = None
+    if isinstance(stackelberg_control, dict):
+        worker_task_priority_map = stackelberg_control.setdefault('worker_task_priority_map', {})
+
+    prepared = 0
+    wait_seconds = max(0.0, float(getattr(config, 'SUPPORT_OPPORTUNISTIC_WAIT_SECONDS', 60.0)))
+    priority_bonus = max(0.0, float(getattr(config, 'SUPPORT_OPPORTUNISTIC_PRIORITY_BONUS', 0.60)))
+    for move in moves:
+        try:
+            donor = int(move.get('from_region'))
+            receiver = int(move.get('to_region'))
+        except (TypeError, ValueError):
+            continue
+        wid = str(move.get('wid'))
+        if donor == receiver or donor not in centers or receiver not in centers:
+            continue
+        if wid not in worker_sim.worker_positions:
+            continue
+        if wid in pending:
+            continue
+        if worker_sim.worker_status.get(wid, 'idle') == 'en_route_to_task':
+            continue
+
+        donor_tasks = [
+            task for task in unassigned_tasks_pool.get(donor, [])
+            if float(task[3]) > float(current_time)
+        ]
+        match = _find_opportunistic_support_task(
+            G=G,
+            worker_node=worker_sim.worker_positions[wid][0],
+            donor_center_node=centers[donor],
+            receiver_center_node=centers[receiver],
+            donor_tasks=donor_tasks,
+            current_time=current_time,
+        )
+        if match is None:
+            continue
+
+        task = match['task']
+        task_id = str(task[1])
+        worker_sim.worker_center_map[wid] = donor
+        pending[wid] = {
+            'from_region': donor,
+            'to_region': receiver,
+            'task_id': task_id,
+            'created_at': float(current_time),
+            'release_after': float(current_time) + wait_seconds,
+        }
+        move['opportunistic_task_id'] = task_id
+        move['opportunistic_detour_m'] = float(match['detour_m'])
+        move['opportunistic_detour_ratio'] = float(match['detour_ratio'])
+        move['deferred_until_local_task'] = True
+        if worker_task_priority_map is not None:
+            pair_key = f"{wid}|{task_id}"
+            worker_task_priority_map[pair_key] = max(
+                float(worker_task_priority_map.get(pair_key, 1.0)),
+                1.0 + priority_bonus,
+            )
+        prepared += 1
+
+    return prepared
+
+
+def _prepare_and_log_opportunistic_support_tasks(
+        G,
+        worker_sim,
+        centers,
+        unassigned_tasks_pool,
+        moves,
+        current_time,
+        stackelberg_control=None,
+        label='顺路支援',
+):
+    prepared = _prepare_opportunistic_support_tasks(
+        G=G,
+        worker_sim=worker_sim,
+        centers=centers,
+        unassigned_tasks_pool=unassigned_tasks_pool,
+        moves=moves,
+        current_time=current_time,
+        stackelberg_control=stackelberg_control,
+    )
+    if prepared > 0:
+        print(
+            f"   [{label}] {prepared} 名支援工人先在原中心接顺路单，完成后继续支援目标中心"
+        )
+    return prepared
+
+
+def _release_stale_pending_support_transfers(worker_sim, unassigned_tasks_pool, current_time):
+    pending = _get_worker_pending_center_transfers(worker_sim)
+    if not pending:
+        return 0
+
+    released = 0
+    for wid, transfer in list(pending.items()):
+        if worker_sim.worker_status.get(wid, 'idle') == 'en_route_to_task':
+            continue
+        target_region = int(transfer.get('to_region'))
+        task_id = str(transfer.get('task_id'))
+        release_after = float(transfer.get('release_after', current_time))
+        donor = int(transfer.get('from_region', worker_sim.worker_center_map.get(wid, target_region)))
+        donor_tasks = unassigned_tasks_pool.get(donor, [])
+        task_still_waiting = any(str(task[1]) == task_id and float(task[3]) > float(current_time) for task in donor_tasks)
+        if current_time < release_after and task_still_waiting:
+            continue
+        worker_sim.worker_center_map[wid] = target_region
+        pending.pop(wid, None)
+        released += 1
+    return released
+
+
+def _node_rough_distance_m(G, src_node, dst_node):
+    if src_node == dst_node:
+        return 0.0
+    try:
+        src = G.nodes[src_node]
+        dst = G.nodes[dst_node]
+        src_lon = float(src.get('x', src.get('lon')))
+        src_lat = float(src.get('y', src.get('lat')))
+        dst_lon = float(dst.get('x', dst.get('lon')))
+        dst_lat = float(dst.get('y', dst.get('lat')))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    mean_lat = math.radians((src_lat + dst_lat) * 0.5)
+    lon_scale = 111320.0 * max(0.1, math.cos(mean_lat))
+    lat_scale = 111320.0
+    return math.hypot((src_lon - dst_lon) * lon_scale, (src_lat - dst_lat) * lat_scale)
+
+
+def _match_precommit_bundles_to_visible_tasks(
+        G,
+        tasks_per_center,
+        control,
+        current_time,
+        worker_task_priority_map,
+        task_priority_weight_map,
+):
+    bundles_by_worker = control.get('precommit_bundles_by_worker', {}) or {}
+    if not bundles_by_worker:
+        return worker_task_priority_map, control.get('task_bundle_map') or {}
+
+    max_match_distance_m = float(getattr(config, 'EVENT_PRECOMMIT_MATCH_MAX_DISTANCE_M', 500.0))
+    max_time_delta = float(getattr(config, 'EVENT_PRECOMMIT_MATCH_TIME_TOLERANCE_SECONDS', 180.0))
+    candidate_limit = max(1, int(getattr(config, 'EVENT_PRECOMMIT_MATCH_CANDIDATE_LIMIT', 4)))
+    route_weight = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_MATCH_ROUTE_INSERTION_WEIGHT', 1.0)))
+    time_weight = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_MATCH_TIME_WEIGHT', 0.5)))
+    expire_weight = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_MATCH_EXPIRE_WEIGHT', 0.1)))
+    priority_bonus = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_MATCH_PRIORITY_BONUS', 0.25)))
+
+    task_bundle_map = {
+        str(task_id): str(bundle_id)
+        for task_id, bundle_id in (control.get('task_bundle_map') or {}).items()
+    }
+    used_task_ids = set()
+    distance_cache = {}
+
+    def network_distance(src_node, dst_node):
+        if src_node == dst_node:
+            return 0.0
+        key = (src_node, dst_node)
+        if key not in distance_cache:
+            try:
+                distance_cache[key] = float(nx.shortest_path_length(G, src_node, dst_node, weight='length'))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                distance_cache[key] = float('inf')
+        return distance_cache[key]
+
+    for wid, bundle in bundles_by_worker.items():
+        anchors = list(bundle.get('anchors', []) or [])
+        anchors.sort(key=lambda item: (int(item.get('round_id', 0)), int(item.get('sequence_index', 0))))
+        for anchor_idx, anchor in enumerate(anchors):
+            rid = int(anchor.get('region_id', -1))
+            candidates = tasks_per_center.get(rid, [])
+            if not candidates:
+                continue
+            anchor_node = anchor.get('node')
+            anchor_release = float(anchor.get('release_time', current_time))
+            anchor_expire = float(anchor.get('expire_time', current_time))
+            rough_candidates = []
+            for task in candidates:
+                task_id = str(task[1])
+                if task_id in used_task_ids:
+                    continue
+                release_delta = abs((float(task[4]) if len(task) > 4 else float(current_time)) - anchor_release)
+                expire_delta = abs(float(task[3]) - anchor_expire)
+                if release_delta > max_time_delta and expire_delta > max_time_delta:
+                    continue
+                rough_distance = _node_rough_distance_m(G, anchor_node, task[0])
+                if rough_distance > max_match_distance_m * 2.0:
+                    continue
+                rough_candidates.append((rough_distance, release_delta, expire_delta, task))
+
+            best_task = None
+            best_score = None
+            for rough_distance, release_delta, expire_delta, task in sorted(rough_candidates)[:candidate_limit]:
+                distance_m = network_distance(anchor_node, task[0])
+                if not np.isfinite(distance_m) or distance_m > max_match_distance_m:
+                    continue
+
+                insertion_penalty = 0.0
+                if anchor_idx + 1 < len(anchors):
+                    next_anchor = anchors[anchor_idx + 1]
+                    if str(next_anchor.get('bundle_id')) == str(anchor.get('bundle_id')):
+                        next_node = next_anchor.get('node')
+                        direct_next = network_distance(anchor_node, next_node)
+                        via_next = distance_m + network_distance(task[0], next_node)
+                        if np.isfinite(direct_next) and np.isfinite(via_next):
+                            insertion_penalty = max(0.0, via_next - direct_next)
+
+                score = (
+                    distance_m
+                    + route_weight * insertion_penalty
+                    + time_weight * release_delta
+                    + expire_weight * expire_delta
+                    + 0.001 * rough_distance
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_task = task
+
+            if best_task is None:
+                continue
+
+            task_id = str(best_task[1])
+            used_task_ids.add(task_id)
+            base_weight = max(1.0, float(anchor.get('priority_weight', 1.0)))
+            matched_weight = base_weight + priority_bonus
+            pair_key = f"{wid}|{task_id}"
+            worker_task_priority_map[pair_key] = max(
+                worker_task_priority_map.get(pair_key, 1.0),
+                matched_weight,
+            )
+            task_priority_weight_map[task_id] = max(
+                task_priority_weight_map.get(task_id, 1.0),
+                1.0 + 0.5 * priority_bonus,
+            )
+            task_bundle_map[task_id] = str(anchor.get('bundle_id', f"{wid}:0"))
+
+    return worker_task_priority_map, task_bundle_map
+
+
+def _with_event_center_task_priorities(
+        algo_key,
+        G,
+        tasks_per_center,
+        stackelberg_control,
+        current_time,
+):
+    if algo_key not in PREDICTIVE_EVENT_RL_GAME_ALGOS or not stackelberg_control:
+        return stackelberg_control
+    profiles = stackelberg_control.get('event_center_task_action_profile', {})
+    if not profiles:
+        return stackelberg_control
+
+    control = dict(stackelberg_control)
+    task_priority_weight_map = {}
+    current_task_ids_by_region = {
+        rid: {str(task[1]) for task in tasks}
+        for rid, tasks in tasks_per_center.items()
+    }
+    all_current_task_ids = set()
+    for task_ids in current_task_ids_by_region.values():
+        all_current_task_ids.update(task_ids)
+    worker_task_priority_map = {
+        key: value
+        for key, value in (control.get('worker_task_priority_map') or {}).items()
+        if len(str(key).split('|', 1)) == 2
+        and str(key).split('|', 1)[1] in all_current_task_ids
+    }
+    match_precommit_tasks = bool(getattr(config, 'EVENT_PRECOMMIT_MATCH_ENABLED', False))
+    for rid, tasks in tasks_per_center.items():
+        action = profiles.get(rid, {})
+        backlog_weight = float(action.get('backlog_weight', 1.0))
+        arrival_weight = float(action.get('predicted_weight', 1.0))
+        urgency_weight = float(action.get('urgency_weight', 1.0))
+        for task in tasks:
+            release_seconds = float(task[4]) if len(task) > 4 else float(current_time)
+            is_backlog = release_seconds < float(current_time)
+            remaining = max(1.0, float(task[3]) - float(current_time))
+            urgency = 1.0 + 60.0 / remaining
+            source_weight = backlog_weight if is_backlog else arrival_weight
+            task_priority_weight_map[str(task[1])] = max(0.05, source_weight + urgency_weight * urgency)
+    if match_precommit_tasks:
+        worker_task_priority_map, task_bundle_map = _match_precommit_bundles_to_visible_tasks(
+            G=G,
+            tasks_per_center=tasks_per_center,
+            control=control,
+            current_time=current_time,
+            worker_task_priority_map=worker_task_priority_map,
+            task_priority_weight_map=task_priority_weight_map,
+        )
+        control['task_bundle_map'] = task_bundle_map
+    control['task_priority_weight_map'] = task_priority_weight_map
+    control['worker_task_priority_map'] = worker_task_priority_map
+    return control
+
+
+def _event_precommit_has_matching_actual_task(
+        G,
+        planned,
+        candidate_tasks,
+        current_time,
+):
+    max_match_distance_m = float(getattr(config, 'EVENT_PRECOMMIT_MATCH_MAX_DISTANCE_M', 500.0))
+    max_time_delta = float(getattr(config, 'EVENT_PRECOMMIT_MATCH_TIME_TOLERANCE_SECONDS', 180.0))
+    planned_node = planned.get('node')
+    planned_release = float(planned.get('release_time', current_time))
+    planned_expire = float(planned.get('expire_time', current_time))
+    for task in candidate_tasks:
+        if str(task[1]) == str(planned.get('task_id')):
+            distance_m = 0.0
+        else:
+            try:
+                distance_m = float(nx.shortest_path_length(G, planned_node, task[0], weight='length'))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+        if distance_m > max_match_distance_m:
+            continue
+        release_delta = abs((float(task[4]) if len(task) > 4 else float(current_time)) - planned_release)
+        expire_delta = abs(float(task[3]) - planned_expire)
+        if release_delta <= max_time_delta or expire_delta <= max_time_delta:
+            return True
+    return False
+
+
+def _filter_event_precommit_waiting_workers(
+        algo_key,
+        G,
+        centers,
+        workers_per_center,
+        tasks_per_center,
+        stackelberg_control,
+        current_time,
+):
+    if algo_key not in PREDICTIVE_EVENT_RL_GAME_ALGOS or not stackelberg_control:
+        return workers_per_center
+    if not bool(getattr(config, 'EVENT_PRECOMMIT_WAIT_ENABLED', False)):
+        return workers_per_center
+    precommit_records = stackelberg_control.get('precommit_task_records_by_worker', {}) or {}
+    if not precommit_records:
+        return workers_per_center
+
+    wait_before = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_WAIT_BEFORE_SECONDS', 60.0)))
+    wait_after = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_WAIT_AFTER_SECONDS', 120.0)))
+    speed = max(1e-6, float(getattr(config, 'WORKER_SPEED_MS', 1.0)))
+    filtered = {}
+    for rid, workers in workers_per_center.items():
+        kept_workers = []
+        center_node = centers.get(rid)
+        candidate_tasks = tasks_per_center.get(rid, [])
+        urgent_slack = max(0.0, float(getattr(config, 'EVENT_PRECOMMIT_WAIT_URGENT_SLACK_SECONDS', 120.0)))
+        backlog_release_ratio = max(
+            0.0,
+            float(getattr(config, 'EVENT_PRECOMMIT_WAIT_BACKLOG_RELEASE_RATIO', 0.35)),
+        )
+        urgent_backlog = any(float(task[3]) - float(current_time) <= urgent_slack for task in candidate_tasks)
+        backlog_pressure = len(candidate_tasks) >= max(1, int(math.ceil(len(workers) * backlog_release_ratio)))
+        if urgent_backlog or backlog_pressure:
+            filtered[rid] = list(workers)
+            continue
+        for worker in workers:
+            worker_node, wid = worker[0], str(worker[1])
+            should_wait = False
+            for planned in precommit_records.get(wid, []):
+                if int(planned.get('region_id', rid)) != int(rid):
+                    continue
+                planned_release = float(planned.get('release_time', current_time))
+                if current_time < planned_release - wait_before or current_time > planned_release + wait_after:
+                    continue
+                if _event_precommit_has_matching_actual_task(G, planned, candidate_tasks, current_time):
+                    continue
+                try:
+                    center_eta = float(nx.shortest_path_length(G, worker_node, center_node, weight='length')) / speed
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    center_eta = float('inf')
+                if current_time + center_eta <= planned_release + wait_after:
+                    should_wait = True
+                    break
+            if not should_wait:
+                kept_workers.append(worker)
+        filtered[rid] = kept_workers
+    return filtered
+
+
 def _run_assignment_for_window(
         algo_name,
         G,
@@ -1663,6 +3003,27 @@ def _run_assignment_for_window(
         force_center_pickup_on_first_departure=True,
 ):
     algo_key = algo_name.lower()
+    stackelberg_control = _with_event_center_task_priorities(
+        algo_key=algo_key,
+        G=G,
+        tasks_per_center=tasks_per_center,
+        stackelberg_control=stackelberg_control,
+        current_time=slot_start_seconds,
+    )
+    workers_per_center = _filter_event_precommit_waiting_workers(
+        algo_key=algo_key,
+        G=G,
+        centers=centers,
+        workers_per_center=workers_per_center,
+        tasks_per_center=tasks_per_center,
+        stackelberg_control=stackelberg_control,
+        current_time=slot_start_seconds,
+    )
+    assignment_end_seconds = _resolve_assignment_service_horizon(
+        tasks_per_center=tasks_per_center,
+        slot_start_seconds=slot_start_seconds,
+        slot_end_seconds=slot_end_seconds,
+    )
     if algo_key in ['greedy', 'predictive_greedy']:
         return greedy_assignment_with_center_pickup(
             G=G,
@@ -1672,7 +3033,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
         )
     if algo_key in ROUTE_ILP_ASSIGNMENT_ALGOS:
         return center_prepacked_assignment_with_center_pickup(
@@ -1682,7 +3043,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
             stackelberg_control=stackelberg_control if algo_key in RETENTION_RL_ALGOS else None,
             force_center_pickup_on_first_departure=force_center_pickup_on_first_departure,
         )
@@ -1694,7 +3055,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
             collaboration_mode=IMTAO_MODE_BDC,
             center_selection=IMTAO_SELECT_LOWEST_RHO,
         )
@@ -1706,7 +3067,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
             collaboration_mode=IMTAO_MODE_RBDC,
             center_selection=IMTAO_SELECT_RANDOM,
         )
@@ -1718,7 +3079,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
             collaboration_mode=IMTAO_MODE_DC,
             center_selection=IMTAO_SELECT_LOWEST_RHO,
         )
@@ -1730,7 +3091,7 @@ def _run_assignment_for_window(
             workers_per_center=workers_per_center,
             tasks_per_center=tasks_per_center,
             slot_start_seconds=slot_start_seconds,
-            slot_end_seconds=slot_end_seconds,
+            slot_end_seconds=assignment_end_seconds,
             collaboration_mode=IMTAO_MODE_WO_C,
             center_selection=IMTAO_SELECT_LOWEST_RHO,
         )
@@ -1774,6 +3135,11 @@ def _apply_assignment_results_to_workers(
         task_lon = G.nodes[task_node].get('x', G.nodes[task_node].get('lon'))
         task_lat = G.nodes[task_node].get('y', G.nodes[task_node].get('lat'))
         worker_sim.update_worker_position(wid, task_node, task_lon, task_lat)
+        pending_transfers = _get_worker_pending_center_transfers(worker_sim)
+        pending_transfer = pending_transfers.get(str(wid))
+        if pending_transfer is not None and str(detail.get('task_id')) == str(pending_transfer.get('task_id')):
+            worker_sim.worker_center_map[wid] = int(pending_transfer['to_region'])
+            pending_transfers.pop(str(wid), None)
         worker_sim.set_worker_en_route_to_task(wid, float(detail.get(time_key, 0.0)))
 
     return slot_dist_to_center, slot_dist_to_task
@@ -1791,7 +3157,10 @@ def _reduce_microbatch_results_for_online_replanning(
     if not micro_details:
         return micro_assignments, 0.0, micro_details
 
-    latest_departure_commit = bool(getattr(config, 'MICROBATCH_LATEST_DEPARTURE_COMMIT', False))
+    latest_departure_commit = (
+        bool(getattr(config, 'MICROBATCH_LATEST_DEPARTURE_COMMIT', False))
+        and not bool(getattr(config, 'ONLINE_COMMIT_ONE_TASK_AT_A_TIME', False))
+    )
     if latest_departure_commit and any('round_departure_time' in detail for detail in micro_details):
         rounds_by_worker = {}
         for detail in micro_details:
@@ -1892,15 +3261,35 @@ def _reduce_microbatch_results_for_online_replanning(
     return committed_assignments, committed_score, committed_details
 
 
+_MICROBATCH_CANDIDATE_DEFAULT = object()
+
+
 def _build_microbatch_candidate_tasks(
         unassigned_tasks_pool,
         workers_per_center,
         current_time,
         slot_end_seconds,
+        candidate_factor=_MICROBATCH_CANDIDATE_DEFAULT,
+        candidate_floor=_MICROBATCH_CANDIDATE_DEFAULT,
+        candidate_cap=_MICROBATCH_CANDIDATE_DEFAULT,
 ):
-    candidate_factor = float(getattr(config, 'MICROBATCH_TASK_CANDIDATE_FACTOR', 3.0))
-    candidate_floor = int(getattr(config, 'MICROBATCH_TASK_CANDIDATE_FLOOR', 48))
-    candidate_cap = int(getattr(config, 'MICROBATCH_TASK_CANDIDATE_CAP', 240))
+    raw_candidate_factor = (
+        getattr(config, 'MICROBATCH_TASK_CANDIDATE_FACTOR', 3.0)
+        if candidate_factor is _MICROBATCH_CANDIDATE_DEFAULT
+        else candidate_factor
+    )
+    candidate_factor = None if raw_candidate_factor is None else float(raw_candidate_factor)
+    candidate_floor = int(
+        getattr(config, 'MICROBATCH_TASK_CANDIDATE_FLOOR', 48)
+        if candidate_floor is _MICROBATCH_CANDIDATE_DEFAULT
+        else candidate_floor
+    )
+    raw_candidate_cap = (
+        getattr(config, 'MICROBATCH_TASK_CANDIDATE_CAP', 240)
+        if candidate_cap is _MICROBATCH_CANDIDATE_DEFAULT
+        else candidate_cap
+    )
+    candidate_cap = None if raw_candidate_cap is None else int(raw_candidate_cap)
     max_tasks_per_worker = int(getattr(config, 'MAX_TASKS_PER_WORKER', 4))
 
     tasks_per_center = {}
@@ -1914,9 +3303,14 @@ def _build_microbatch_candidate_tasks(
             tasks_per_center[rid] = []
             continue
 
-        limit = int(round(worker_count * max_tasks_per_worker * candidate_factor))
-        limit = max(candidate_floor, limit)
-        limit = min(candidate_cap, limit, len(pool))
+        if candidate_factor is None:
+            limit = len(pool)
+        else:
+            limit = int(round(worker_count * max_tasks_per_worker * candidate_factor))
+            limit = max(candidate_floor, limit)
+        if candidate_cap is not None and candidate_cap > 0:
+            limit = min(candidate_cap, limit)
+        limit = min(limit, len(pool))
 
         prioritized = sorted(
             pool,
@@ -1952,6 +3346,42 @@ def _build_intrabatch_online_tasks(
         )
 
     return tasks_per_center
+
+
+def _should_defer_online_dispatch(algo_key, unassigned_tasks_pool, total_workers, current_time):
+    if not bool(getattr(config, 'ONLINE_DISPATCH_HOLD_ENABLED', False)):
+        return False
+
+    hold_algos = {
+        str(item).lower()
+        for item in getattr(config, 'ONLINE_DISPATCH_HOLD_ALGOS', ())
+    }
+    if hold_algos and str(algo_key).lower() not in hold_algos:
+        return False
+
+    visible_tasks = [
+        task
+        for pool in unassigned_tasks_pool.values()
+        for task in pool
+    ]
+    if not visible_tasks or total_workers <= 0:
+        return False
+
+    urgent_slack = max(0.0, float(getattr(config, 'ONLINE_DISPATCH_HOLD_URGENT_SLACK_SECONDS', 120.0)))
+    if any(float(task[3]) - float(current_time) <= urgent_slack for task in visible_tasks):
+        return False
+
+    oldest_release = min(float(task[4]) if len(task) > 4 else float(current_time) for task in visible_tasks)
+    max_wait = max(0.0, float(getattr(config, 'ONLINE_DISPATCH_HOLD_MAX_SECONDS', 60.0)))
+    if float(current_time) - oldest_release >= max_wait:
+        return False
+
+    min_tasks = max(1, int(getattr(config, 'ONLINE_DISPATCH_HOLD_MIN_TASKS', 16)))
+    worker_ratio = max(0.0, float(getattr(config, 'ONLINE_DISPATCH_HOLD_WORKER_RATIO', 0.35)))
+    max_trigger = max(min_tasks, int(getattr(config, 'ONLINE_DISPATCH_HOLD_MAX_TRIGGER_TASKS', 48)))
+    worker_scaled = int(math.ceil(float(total_workers) * worker_ratio))
+    trigger_tasks = max(min_tasks, min(max_trigger, worker_scaled))
+    return len(visible_tasks) < trigger_tasks
 
 
 def _resolve_micro_redispatch_gap_batches(algo_name, micro_batch_seconds):
@@ -2405,19 +3835,22 @@ def _run_microbatch_simulation(
         uncertainty_dispatch_state,
         retention_game_state,
         platform_rl_state,
+        center_task_rl_state,
 ):
     algo_key = algo_name.lower()
     slot_duration_seconds = int(time_slot_minutes) * 60
     rbg_realtime_dispatch = (
         algo_key in RETENTION_RL_ALGOS
+        and algo_key not in PREDICTIVE_EVENT_RL_GAME_ALGOS
         and bool(getattr(config, 'RBG_INTRABATCH_REALTIME_DISPATCH', False))
     )
     is_intrabatch_online = (
         algo_key in INTRABATCH_ONLINE_ALGOS
+        or algo_key in PREDICTIVE_EVENT_RL_GAME_ALGOS
         or rbg_realtime_dispatch
         or micro_batch_seconds >= slot_duration_seconds
     )
-    commit_next_step_only = micro_batch_seconds < slot_duration_seconds
+    commit_next_step_only = bool(getattr(config, 'ONLINE_COMMIT_ONE_TASK_AT_A_TIME', True))
     all_assignments = {}
     all_details = []
     total_profit = 0.0
@@ -2443,6 +3876,7 @@ def _run_microbatch_simulation(
         current_slot_predicted_demand = None
         current_predict_label = None
         current_slot_rbg_transitions = {}
+        current_slot_center_transitions = {}
         current_slot_rbg_hoard_penalty = {}
         current_slot_rbg_move_cost = {}
         current_slot_rbg_moves = []
@@ -2464,7 +3898,33 @@ def _run_microbatch_simulation(
                 if algo_name.lower() in [*PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS] and hasattr(dispatch_predictor, 'predict_region_distribution'):
                     predicted_distribution = dispatch_predictor.predict_region_distribution(slot_timestamp)
 
-                if algo_name.lower() in RETENTION_RL_ALGOS:
+                if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+                    predicted_tasks = dispatch_predictor.predict_dispatch_tasks(slot_timestamp)
+                    predispatch_result = event_task_rl_game_predispatch_workers(
+                        G=G,
+                        worker_sim=worker_sim,
+                        centers=centers,
+                        predicted_tasks=predicted_tasks,
+                        backlog_tasks=unassigned_tasks_pool,
+                        predicted_distribution=predicted_distribution or {},
+                        state=retention_game_state,
+                        platform_state=platform_rl_state,
+                        center_task_state=center_task_rl_state,
+                        slot_idx=slot_idx,
+                        slot_start_seconds=slot_start_seconds,
+                        slot_end_seconds=slot_end_seconds,
+                    )
+                    current_slot_rbg_transitions = predispatch_result.get('transitions', {})
+                    current_slot_center_transitions = predispatch_result.get('center_transitions', {})
+                    current_slot_rbg_hoard_penalty = predispatch_result.get('hoard_penalty', {})
+                    current_slot_rbg_move_cost = predispatch_result.get('move_cost_by_region', {})
+                    current_slot_rbg_moves = predispatch_result.get('moves', [])
+                    current_slot_rbg_stackelberg_control = predispatch_result.get('stackelberg_control', {})
+                    current_slot_rbg_demand_profile = predispatch_result.get('demand_profile', {})
+                    current_slot_rbg_desired_workers = predispatch_result.get('desired_workers', {})
+                    current_slot_platform_transition = predispatch_result.get('platform_transition')
+                    predict_label = 'Event-RL-Game Predict'
+                elif algo_name.lower() in RETENTION_RL_ALGOS:
                     platform_task_weight = getattr(config, 'RBG_PLATFORM_TASK_WEIGHT', 0.30)
                     platform_gap_weight = getattr(config, 'RBG_PLATFORM_GAP_WEIGHT', 0.55)
                     platform_release_credit_weight = getattr(config, 'RBG_PLATFORM_RELEASE_CREDIT_WEIGHT', 0.35)
@@ -2686,16 +4146,56 @@ def _run_microbatch_simulation(
                         ]
                     )
                 print(f"   [{predict_label}] current-slot forecast: {prediction_text}")
-                if algo_name.lower() in RETENTION_RL_ALGOS:
+                if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+                    retain_text = ", ".join(
+                        [
+                            f"R{rid}: planned={predispatch_result.get('precommit_planned_by_region', {}).get(rid, 0)}, "
+                            f"bw={predispatch_result.get('center_action_profile', {}).get(rid, {}).get('backlog_weight', 1.0):.2f}, "
+                            f"pw={predispatch_result.get('center_action_profile', {}).get(rid, {}).get('predicted_weight', 1.0):.2f}, "
+                            f"uw={predispatch_result.get('center_action_profile', {}).get(rid, {}).get('urgency_weight', 1.0):.2f}, "
+                            f"trust={predispatch_result.get('center_prediction_trust', {}).get(rid, 1.0):.2f}, "
+                            f"workers_after_loan={max(0, predispatch_result['retain_count'].get(rid, 0))}"
+                            for rid in sorted(centers.keys())
+                        ]
+                    )
+                    print(f"   [{predict_label}] center task policy: {retain_text}")
+                elif algo_name.lower() in RETENTION_RL_ALGOS:
                     retain_text = ", ".join(
                         [
                             f"R{rid}: keep={predispatch_result['retain_count'].get(rid, 0)}, "
                             f"need={predispatch_result['desired_workers'].get(rid, 0)}, "
+                            f"rr={predispatch_result.get('action_profile', {}).get(rid, {}).get('retention_ratio', 0.0):+.2f}, "
+                            f"bid={predispatch_result.get('action_profile', {}).get(rid, {}).get('receive_bid_scale', 1.0):.2f}, "
+                            f"ask={predispatch_result.get('action_profile', {}).get(rid, {}).get('release_ask_scale', 1.0):.2f}, "
                             f"hoard={predispatch_result['hoard_penalty'].get(rid, 0):.1f}"
                             for rid in sorted(centers.keys())
                         ]
                     )
                     print(f"   [{predict_label}] retention policy: {retain_text}")
+                if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+                    planned_count = sum(
+                        len(task_ids)
+                        for task_ids in predispatch_result.get('precommit_plan_by_worker', {}).values()
+                    )
+                    planned_workers = len(predispatch_result.get('precommit_plan_by_worker', {}))
+                    uncovered_text = ", ".join(
+                        [
+                            f"R{rid}: uncovered={predispatch_result.get('precommit_uncovered_predicted', {}).get(rid, 0)}"
+                            for rid in sorted(centers.keys())
+                        ]
+                    )
+                    print(
+                        f"   [{predict_label}] precommitment: "
+                        f"{planned_workers} workers / {planned_count} planned tasks | {uncovered_text}"
+                    )
+                    plan_preview = []
+                    for wid, task_ids in list(predispatch_result.get('precommit_plan_by_worker', {}).items())[:3]:
+                        shown_tasks = ", ".join(str(tid) for tid in task_ids[:4])
+                        if len(task_ids) > 4:
+                            shown_tasks += ", ..."
+                        plan_preview.append(f"{wid}->[{shown_tasks}]")
+                    if plan_preview:
+                        print(f"   [{predict_label}] worker-task precommit sample: " + "; ".join(plan_preview))
 
                 if predispatch_result['moves']:
                     move_summary = ", ".join(
@@ -2703,7 +4203,12 @@ def _run_microbatch_simulation(
                     )
                     if len(predispatch_result['moves']) > 8:
                         move_summary += f", ... (+{len(predispatch_result['moves']) - 8} more)"
-                    print(f"   [{predict_label}] pre-dispatched {len(predispatch_result['moves'])} workers: {move_summary}")
+                    post_service_count = sum(1 for m in predispatch_result['moves'] if m.get('post_service'))
+                    post_service_note = f" (完成后支援 {post_service_count} 名)" if post_service_count else ""
+                    print(
+                        f"   [{predict_label}] pre-dispatched {len(predispatch_result['moves'])} workers"
+                        f"{post_service_note}: {move_summary}"
+                    )
                     if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
                         uncertainty_dispatch_state.record_moves(
                             slot_idx=slot_idx,
@@ -2771,6 +4276,9 @@ def _run_microbatch_simulation(
                 [
                     f"R{rid}: keep={predispatch_result['retain_count'].get(rid, 0)}, "
                     f"need={predispatch_result['desired_workers'].get(rid, 0)}, "
+                    f"rr={predispatch_result.get('action_profile', {}).get(rid, {}).get('retention_ratio', 0.0):+.2f}, "
+                    f"bid={predispatch_result.get('action_profile', {}).get(rid, {}).get('receive_bid_scale', 1.0):.2f}, "
+                    f"ask={predispatch_result.get('action_profile', {}).get(rid, {}).get('release_ask_scale', 1.0):.2f}, "
                     f"hoard={predispatch_result['hoard_penalty'].get(rid, 0):.1f}"
                     for rid in sorted(centers.keys())
                 ]
@@ -2825,6 +4333,17 @@ def _run_microbatch_simulation(
             else:
                 print("   [NoPred-Game Dispatch] no worker rebalancing needed")
 
+        _prepare_and_log_opportunistic_support_tasks(
+            G=G,
+            worker_sim=worker_sim,
+            centers=centers,
+            unassigned_tasks_pool=unassigned_tasks_pool,
+            moves=current_slot_rbg_moves,
+            current_time=slot_start_seconds,
+            stackelberg_control=current_slot_rbg_stackelberg_control,
+            label=f"{current_predict_label or 'RBG Dispatch'} 顺路支援",
+        )
+
         slot_assignments = {}
         slot_details = []
         slot_profit = 0.0
@@ -2846,32 +4365,10 @@ def _run_microbatch_simulation(
             micro_end_seconds = min(slot_end_seconds, micro_start_seconds + micro_batch_seconds)
             worker_sim.advance_workers_to_time(centers, micro_start_seconds)
 
-            micro_new_tasks = 0
-            if not df_tasks.empty:
-                mask = (df_tasks['seconds_of_day'] >= micro_start_seconds) & (df_tasks['seconds_of_day'] < micro_end_seconds)
-                current_tasks = df_tasks[mask]
-                for _, row in current_tasks.iterrows():
-                    nearest_node = row['nearest_node']
-                    if nearest_node not in rcc_partition:
-                        continue
-                    region_id = rcc_partition[nearest_node]
-                    task = (
-                        nearest_node,
-                        row['task_id'],
-                        config.TASK_BASE_REWARD,
-                        row['seconds_of_day'] + config.TASK_EXPIRE_MINUTES * 60,
-                        row['seconds_of_day'],
-                    )
-                    unassigned_tasks_pool[region_id].append(task)
-                    slot_new_tasks_per_center[region_id] += 1
-                    slot_total_tasks_per_center[region_id] += 1
-                    micro_new_tasks += 1
-
             workers_per_center = {}
             for region_id in centers.keys():
                 workers = worker_sim.get_available_workers_with_center_info(region_id, current_time=micro_start_seconds)
                 workers_per_center[region_id] = [(w[0], w[1], w[2], w[3], centers[region_id]) for w in workers]
-            micro_total_tasks_per_center = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
 
             if (
                 micro_idx > 0
@@ -2881,6 +4378,7 @@ def _run_microbatch_simulation(
                     'predictive_center_lstm', 'predictive_game_center_lstm',
                     *PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS, *NO_PRED_GAME_ALGOS
                 ]
+                and algo_name.lower() not in PREDICTIVE_EVENT_RL_GAME_ALGOS
             ):
                 micro_dispatch_result = _run_triggered_micro_predispatch(
                     algo_name=algo_name,
@@ -2912,92 +4410,273 @@ def _run_microbatch_simulation(
                         current_slot_rbg_desired_workers = micro_dispatch_result.get('desired_workers', current_slot_rbg_desired_workers)
                         if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
                             current_slot_platform_transition = micro_dispatch_result.get('platform_transition', current_slot_platform_transition)
+                        _prepare_and_log_opportunistic_support_tasks(
+                            G=G,
+                            worker_sim=worker_sim,
+                            centers=centers,
+                            unassigned_tasks_pool=unassigned_tasks_pool,
+                            moves=current_slot_rbg_moves,
+                            current_time=micro_start_seconds,
+                            stackelberg_control=current_slot_rbg_stackelberg_control,
+                            label='RBG-Micro 顺路支援',
+                        )
                     for region_id in centers.keys():
                         workers = worker_sim.get_available_workers_with_center_info(region_id, current_time=micro_start_seconds)
                         workers_per_center[region_id] = [(w[0], w[1], w[2], w[3], centers[region_id]) for w in workers]
 
-            total_workers = sum(len(w) for w in workers_per_center.values())
-            total_current_tasks = sum(len(unassigned_tasks_pool[rid]) for rid in centers.keys())
-            if total_current_tasks > 0 or micro_new_tasks > 0:
-                total_micro = len(range(slot_start_seconds, slot_end_seconds, micro_batch_seconds))
-                progress_label = "批次内在线" if is_intrabatch_online else "微批"
-                print(
-                    f"   [{progress_label} {micro_idx + 1}/{total_micro}] 可用工人: {total_workers} 个 | "
-                    f"新增订单: {micro_new_tasks} 个 | 池内总单量: {total_current_tasks} 个"
-                )
-
+            micro_new_tasks = 0
             micro_assignments = {}
             micro_profit = 0.0
             micro_details = []
             micro_assigned_tasks_per_center = {rid: 0 for rid in centers.keys()}
-            if total_current_tasks > 0 and total_workers > 0:
-                if is_intrabatch_online:
-                    tasks_per_center = _build_intrabatch_online_tasks(
+            micro_total_tasks_per_center = {rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()}
+            micro_event_count = 0
+
+            def run_visible_assignment(decision_time, force=False):
+                nonlocal micro_profit, slot_profit, slot_dist_to_center, slot_dist_to_task
+                nonlocal slot_expired_count
+                _release_stale_pending_support_transfers(
+                    worker_sim,
+                    unassigned_tasks_pool,
+                    decision_time,
+                )
+                total_workers_at_time = 0
+                workers_snapshot = {}
+                for region_id in centers.keys():
+                    workers = worker_sim.get_available_workers_with_center_info(
+                        region_id,
+                        current_time=decision_time,
+                    )
+                    workers_snapshot[region_id] = [(w[0], w[1], w[2], w[3], centers[region_id]) for w in workers]
+                    total_workers_at_time += len(workers)
+
+                total_tasks_at_time = sum(len(unassigned_tasks_pool[rid]) for rid in centers.keys())
+                if total_tasks_at_time <= 0 or total_workers_at_time <= 0:
+                    return 0
+
+                if (
+                    not force
+                    and _should_defer_online_dispatch(
+                        algo_key=algo_key,
                         unassigned_tasks_pool=unassigned_tasks_pool,
-                        current_time=micro_start_seconds,
+                        total_workers=total_workers_at_time,
+                        current_time=decision_time,
+                    )
+                ):
+                    return 0
+
+                if is_intrabatch_online and algo_key not in ROUTE_ILP_ASSIGNMENT_ALGOS:
+                    tasks_snapshot = _build_intrabatch_online_tasks(
+                        unassigned_tasks_pool=unassigned_tasks_pool,
+                        current_time=decision_time,
                     )
                 else:
-                    tasks_per_center = _build_microbatch_candidate_tasks(
+                    route_candidate_kwargs = {}
+                    if algo_key in ROUTE_ILP_ASSIGNMENT_ALGOS:
+                        route_candidate_kwargs = {
+                            'candidate_factor': getattr(config, 'ROUTE_ILP_MICROBATCH_TASK_CANDIDATE_FACTOR', None),
+                            'candidate_floor': getattr(config, 'ROUTE_ILP_MICROBATCH_TASK_CANDIDATE_FLOOR', None),
+                            'candidate_cap': getattr(config, 'ROUTE_ILP_MICROBATCH_TASK_CANDIDATE_CAP', None),
+                        }
+                    tasks_snapshot = _build_microbatch_candidate_tasks(
                         unassigned_tasks_pool=unassigned_tasks_pool,
-                        workers_per_center=workers_per_center,
-                        current_time=micro_start_seconds,
+                        workers_per_center=workers_snapshot,
+                        current_time=decision_time,
                         slot_end_seconds=slot_end_seconds,
+                        **route_candidate_kwargs,
                     )
-                micro_assignments, micro_profit, micro_details = _run_assignment_for_window(
+
+                assignment_kwargs = dict(
                     algo_name=algo_name,
                     G=G,
                     config=config,
                     centers=centers,
                     rcc_partition=rcc_partition,
-                    workers_per_center=workers_per_center,
-                    tasks_per_center=tasks_per_center,
-                    slot_start_seconds=micro_start_seconds,
+                    workers_per_center=workers_snapshot,
+                    tasks_per_center=tasks_snapshot,
+                    slot_start_seconds=decision_time,
                     slot_end_seconds=slot_end_seconds,
                     stackelberg_control=current_slot_rbg_stackelberg_control,
-                    force_center_pickup_on_first_departure=not commit_next_step_only,
+                    force_center_pickup_on_first_departure=_online_force_center_pickup(commit_next_step_only),
                 )
+                if bool(getattr(config, 'EVENT_ONLINE_ASSIGNMENT_VERBOSE', False)):
+                    event_assignments, event_profit, event_details = _run_assignment_for_window(**assignment_kwargs)
+                else:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        event_assignments, event_profit, event_details = _run_assignment_for_window(**assignment_kwargs)
                 if commit_next_step_only:
-                    micro_assignments, micro_profit, micro_details = _reduce_microbatch_results_for_online_replanning(
-                        micro_assignments=micro_assignments,
-                        micro_details=micro_details,
-                        commit_horizon_seconds=micro_end_seconds,
+                    event_assignments, event_profit, event_details = _reduce_microbatch_results_for_online_replanning(
+                        micro_assignments=event_assignments,
+                        micro_details=event_details,
+                        commit_horizon_seconds=decision_time,
                     )
 
                 dist_center_inc, dist_task_inc = _apply_assignment_results_to_workers(
                     G,
                     worker_sim,
-                    micro_details,
-                    commit_service_only=(
-                        commit_next_step_only
-                        and not bool(getattr(config, 'MICROBATCH_LATEST_DEPARTURE_COMMIT', False))
-                    ),
+                    event_details,
+                    commit_service_only=commit_next_step_only,
                 )
                 slot_dist_to_center += dist_center_inc
                 slot_dist_to_task += dist_task_inc
-                slot_assignments.update(micro_assignments)
-                slot_details.extend(micro_details)
-                slot_profit += micro_profit
-                for detail in micro_details:
+                micro_assignments.update(event_assignments)
+                micro_profit += event_profit
+                micro_details.extend(event_details)
+                slot_assignments.update(event_assignments)
+                slot_details.extend(event_details)
+                slot_profit += event_profit
+
+                for detail in event_details:
                     slot_assigned_tasks_per_center[detail['region_id']] += 1
                     micro_assigned_tasks_per_center[detail['region_id']] += 1
                     slot_worker_ids.add(detail['wid'])
-                if micro_assignments:
-                    print(
-                        f"      分配结果: 成交 {len(micro_assignments)} 单, "
-                        f"调度 {len(set(k[0] for k in micro_assignments.keys()))} 名工人"
-                    )
 
-            assigned_task_ids = {k[1] for k in micro_assignments.keys()}
+                assigned_task_ids = {k[1] for k in event_assignments.keys()}
+                if not assigned_task_ids:
+                    return 0
+
+                for rid in centers.keys():
+                    new_pool = []
+                    for t in unassigned_tasks_pool[rid]:
+                        if t[1] in assigned_task_ids:
+                            continue
+                        if decision_time >= t[3]:
+                            slot_expired_count += 1
+                            continue
+                        new_pool.append(t)
+                    unassigned_tasks_pool[rid] = new_pool
+                return len(assigned_task_ids)
+
+            # Carry-over orders are already known at the tick boundary; handling them
+            # here does not reveal any future arrivals inside the current minute.
+            run_visible_assignment(micro_start_seconds)
+
+            if not df_tasks.empty:
+                mask = (df_tasks['seconds_of_day'] >= micro_start_seconds) & (df_tasks['seconds_of_day'] < micro_end_seconds)
+                current_tasks = df_tasks[mask].sort_values(['seconds_of_day', 'task_id'])
+                for release_time, event_rows in current_tasks.groupby('seconds_of_day', sort=True):
+                    decision_time = float(release_time)
+                    worker_sim.advance_workers_to_time(centers, decision_time)
+                    event_new_tasks = 0
+                    for _, row in event_rows.iterrows():
+                        nearest_node = row['nearest_node']
+                        if nearest_node not in rcc_partition:
+                            continue
+                        region_id = rcc_partition[nearest_node]
+                        task = (
+                            nearest_node,
+                            row['task_id'],
+                            config.TASK_BASE_REWARD,
+                            decision_time + config.TASK_EXPIRE_MINUTES * 60,
+                            decision_time,
+                        )
+                        unassigned_tasks_pool[region_id].append(task)
+                        slot_new_tasks_per_center[region_id] += 1
+                        slot_total_tasks_per_center[region_id] += 1
+                        micro_total_tasks_per_center[region_id] += 1
+                        micro_new_tasks += 1
+                        event_new_tasks += 1
+
+                    if event_new_tasks > 0:
+                        micro_event_count += 1
+                        run_visible_assignment(decision_time)
+
+            worker_sim.advance_workers_to_time(centers, micro_end_seconds)
+
+            # At the tick boundary, workers that just became idle may process only the
+            # already-arrived backlog. No tasks from the next minute are visible here.
+            force_final_dispatch = (slot_idx == num_slots - 1 and micro_end_seconds >= slot_end_seconds)
+            run_visible_assignment(micro_end_seconds, force=force_final_dispatch)
+
+            cleanup_time = float(micro_end_seconds)
+            if (
+                slot_idx == num_slots - 1
+                and micro_end_seconds >= slot_end_seconds
+                and bool(getattr(config, 'ONLINE_DRAIN_AFTER_BATCH_END', True))
+                and _count_unassigned_pool_tasks(unassigned_tasks_pool) > 0
+            ):
+                drain_until = _resolve_assignment_service_horizon(
+                    tasks_per_center=unassigned_tasks_pool,
+                    slot_start_seconds=slot_start_seconds,
+                    slot_end_seconds=slot_end_seconds,
+                )
+                drain_time = float(micro_end_seconds)
+                drain_assigned = 0
+                drain_steps = 0
+                max_drain_steps = max(1, int(getattr(config, 'ONLINE_DRAIN_MAX_STEPS', 2000)))
+                while (
+                    drain_steps < max_drain_steps
+                    and drain_time <= drain_until + 1e-6
+                    and _count_unassigned_pool_tasks(unassigned_tasks_pool) > 0
+                ):
+                    worker_sim.advance_workers_to_time(centers, drain_time)
+                    slot_expired_count += _expire_unassigned_tasks(unassigned_tasks_pool, drain_time)
+                    if _count_unassigned_pool_tasks(unassigned_tasks_pool) <= 0:
+                        break
+
+                    assigned_now = run_visible_assignment(drain_time, force=True)
+                    drain_steps += 1
+                    if assigned_now:
+                        drain_assigned += assigned_now
+                        continue
+
+                    next_ready_time = _next_worker_service_completion_time(
+                        worker_sim,
+                        current_time=drain_time,
+                        horizon_time=drain_until,
+                    )
+                    future_expire_times = [
+                        float(task[3])
+                        for pool in unassigned_tasks_pool.values()
+                        for task in pool
+                        if float(task[3]) > drain_time + 1e-6
+                    ]
+                    idle_tick = max(1.0, float(getattr(config, 'ONLINE_DRAIN_IDLE_TICK_SECONDS', 30.0)))
+                    next_tick_time = min(drain_time + idle_tick, drain_until)
+                    if future_expire_times:
+                        next_tick_time = min(next_tick_time, min(future_expire_times))
+                    next_candidates = [next_tick_time]
+                    if next_ready_time is not None:
+                        next_candidates.append(next_ready_time)
+                    valid_next_times = [t for t in next_candidates if t > drain_time + 1e-6]
+                    if not valid_next_times:
+                        break
+                    next_decision_time = min(valid_next_times)
+                    drain_time = next_decision_time
+
+                if drain_assigned > 0:
+                    print(
+                        f"   [批后续跑] 继续到 {int(drain_time // 3600):02d}:{int((drain_time % 3600) // 60):02d}:{int(drain_time % 60):02d}, "
+                        f"补充分配 {drain_assigned} 单"
+                    )
+                cleanup_time = max(cleanup_time, drain_time)
+
             for rid in centers.keys():
                 new_pool = []
                 for t in unassigned_tasks_pool[rid]:
-                    if t[1] in assigned_task_ids:
-                        continue
-                    if micro_end_seconds >= t[3]:
+                    if cleanup_time >= t[3]:
                         slot_expired_count += 1
                         continue
                     new_pool.append(t)
                 unassigned_tasks_pool[rid] = new_pool
+
+            total_workers = sum(
+                len(worker_sim.get_available_workers_with_center_info(rid, current_time=micro_end_seconds))
+                for rid in centers.keys()
+            )
+            total_current_tasks = sum(len(unassigned_tasks_pool[rid]) for rid in centers.keys())
+            if total_current_tasks > 0 or micro_new_tasks > 0 or micro_assignments:
+                total_micro = len(range(slot_start_seconds, slot_end_seconds, micro_batch_seconds))
+                progress_label = "事件在线" if is_intrabatch_online else "事件微调"
+                print(
+                    f"   [{progress_label} {micro_idx + 1}/{total_micro}] 可用工人: {total_workers} 个 | "
+                    f"秒级到达: {micro_new_tasks} 个 | 触发时刻: {micro_event_count} 个 | 池内总单量: {total_current_tasks} 个"
+                )
+                if micro_assignments:
+                    print(
+                        f"      分配结果: 成交 {_count_unique_assigned_task_ids(micro_assignments)} 单, "
+                        f"调度 {len(set(k[0] for k in micro_assignments.keys()))} 名工人"
+                    )
 
             if (
                 batch_fine_tune_enabled
@@ -3109,6 +4788,21 @@ def _run_microbatch_simulation(
                 total_tasks_by_region=slot_total_tasks_per_center,
                 assigned_tasks_by_region=slot_assigned_tasks_per_center
             )
+        if center_task_rl_state is not None and current_slot_center_transitions:
+            center_rewards = update_center_task_allocation_state(
+                state=center_task_rl_state,
+                transitions=current_slot_center_transitions,
+                assigned_tasks_by_region=slot_assigned_tasks_per_center,
+                total_tasks_by_region=slot_total_tasks_per_center,
+                remaining_tasks_by_region={rid: len(unassigned_tasks_pool[rid]) for rid in centers.keys()},
+                actual_arrivals_by_region=slot_new_tasks_per_center,
+                predicted_demand_by_region=current_slot_predicted_demand,
+            )
+            reward_text = ", ".join(
+                f"R{rid}: reward={center_rewards.get(rid, 0.0):.2f}"
+                for rid in sorted(centers.keys())
+            )
+            print(f"   [Event-Center-RL Reward] {reward_text}")
         if retention_game_state is not None and algo_name.lower() in RETENTION_RL_ALGOS and current_slot_rbg_transitions:
                 next_available_workers = {
                     rid: len(worker_sim.get_available_workers_with_center_info(rid, current_time=slot_end_seconds))
@@ -3144,7 +4838,9 @@ def _run_microbatch_simulation(
                 reward_text = ", ".join(
                     [f"R{rid}: reward={reward_by_region.get(rid, 0.0):.2f}" for rid in sorted(centers.keys())]
                 )
-                if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
+                if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+                    reward_label = 'Event-RL-Game Reward'
+                elif algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS:
                     reward_label = 'Platform-RL-MCTGNet Reward'
                 elif algo_name.lower() in NO_PRED_RBG_ALGOS:
                     reward_label = 'NoPred-RL-Game Reward'
@@ -3211,7 +4907,7 @@ def _run_microbatch_simulation(
                 )
                 print(f"   [Predictive] next-slot forecast: {prediction_text}")
 
-        print(f"分配结果: 成交 {len(slot_assignments)} 单, 调度 {len(slot_worker_ids)} 名工人")
+        print(f"分配结果: 成交 {_count_unique_assigned_task_ids(slot_assignments)} 单, 调度 {len(slot_worker_ids)} 名工人")
         if slot_expired_count > 0:
             print(f"   ❌ 超时淘汰订单: {slot_expired_count} 个 (已自动取消该订单，不扣除利润)")
         if leftover_count > 0:
@@ -3241,8 +4937,10 @@ def run_online_simulation_with_center_pickup(
         time_slot_minutes: int = DEFAULT_TIME_SLOT_MINUTES
 ):
     algo_key = algo_name.lower()
-    execution_mode = "15分钟槽在线"
-    effective_micro_batch_minutes = time_slot_minutes
+    execution_mode = "事件级在线"
+    effective_micro_batch_minutes = int(
+        getattr(config, 'EXPERIMENT_MICRO_BATCH_MINUTES', time_slot_minutes)
+    )
     if algo_key in RETENTION_RL_ALGOS:
         effective_micro_batch_minutes = int(
             getattr(config, 'RBG_INTERNAL_MICRO_BATCH_MINUTES', time_slot_minutes)
@@ -3258,7 +4956,7 @@ def run_online_simulation_with_center_pickup(
     print("=" * 70)
     print(
         f"测试日期：{test_date} | 时段：{test_start_hour}:00-"
-        f"{compare_end_hour}:{compare_end_minute:02d} | 时间槽：{time_slot_minutes} 分钟 | 模式：{execution_mode} | 内部步长：{effective_micro_batch_minutes} 分钟"
+        f"{compare_end_hour}:{compare_end_minute:02d} | 时间槽：{time_slot_minutes} 分钟 | 模式：{execution_mode} | 工人调分布步长：{effective_micro_batch_minutes} 分钟"
     )
     print("=" * 70)
 
@@ -3274,6 +4972,7 @@ def run_online_simulation_with_center_pickup(
     centers = context['centers']
     df_tasks = context['df_tasks']
     total_tasks_per_center = copy.deepcopy(context['total_tasks_per_center'])
+    scope = context.get('scope', _current_scope_metadata())
     worker_sim = _restore_worker_simulator(G, context['worker_state'])
 
     unassigned_tasks_pool = {region_id: [] for region_id in centers.keys()}
@@ -3294,7 +4993,18 @@ def run_online_simulation_with_center_pickup(
     prediction_sq_errors = []
     uncertainty_dispatch_state = None
 
-    if algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', *PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
+    if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+        dispatch_predictor = _get_or_train_event_task_predictor(
+            test_date=test_date,
+            test_start_hour=test_start_hour,
+            test_end_hour=test_end_hour,
+            time_slot_minutes=time_slot_minutes,
+            coords=context['coords'],
+            nodes=context['nodes'],
+            rcc_partition=rcc_partition,
+            centers=centers
+        )
+    elif algo_name.lower() in ['predictive_mctgnet', 'predictive_game_mctgnet', 'predictive_bstgcnet', *PREDICTIVE_UABG_ALGOS, *PREDICTIVE_RBG_ALGOS, *PREDICTIVE_PLATFORM_RL_ALGOS]:
         dispatch_predictor = _get_or_train_mctg_predictor(
             test_date=test_date,
             test_start_hour=test_start_hour,
@@ -3330,18 +5040,23 @@ def run_online_simulation_with_center_pickup(
     retention_game_state = None
     if algo_name.lower() in RETENTION_RL_ALGOS:
         rl_device = _get_preferred_torch_device()
-        print(f"   - Retention RL device: {rl_device}")
+        state_label = 'Demand calibration continuous SAC' if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS else 'Retention continuous SAC'
+        print(f"   - {state_label} device: {rl_device}")
         retention_game_state = RLRetentionBilateralState(
             region_ids=sorted(centers.keys()),
-            action_ratios=tuple(getattr(config, 'RBG_ACTION_RATIOS', (-0.30, -0.15, 0.0, 0.15, 0.30))),
+            action_bounds=tuple(getattr(config, 'RBG_CONTINUOUS_ACTION_BOUNDS', ())),
             learning_rate=float(getattr(config, 'RBG_LEARNING_RATE', 0.03)),
-            temperature=float(getattr(config, 'RBG_TEMPERATURE', 0.85)),
             exploration_prob=float(getattr(config, 'RBG_EXPLORATION_PROB', 0.12)),
-            gamma=float(getattr(config, 'RBG_DQN_GAMMA', 0.0)),
-            replay_capacity=int(getattr(config, 'RBG_DQN_REPLAY_CAPACITY', 512)),
-            dqn_batch_size=int(getattr(config, 'RBG_DQN_BATCH_SIZE', 32)),
-            target_sync_interval=int(getattr(config, 'RBG_DQN_TARGET_SYNC_INTERVAL', 32)),
+            gamma=float(getattr(config, 'RBG_SAC_GAMMA', 0.6)),
+            replay_capacity=int(getattr(config, 'RBG_SAC_REPLAY_CAPACITY', 512)),
+            batch_size=int(getattr(config, 'RBG_SAC_BATCH_SIZE', 32)),
             hidden_dim=int(getattr(config, 'RBG_POLICY_HIDDEN_DIM', 32)),
+            critic_learning_rate=float(getattr(config, 'RBG_SAC_CRITIC_LEARNING_RATE', getattr(config, 'RBG_LEARNING_RATE', 0.001))),
+            alpha_learning_rate=float(getattr(config, 'RBG_SAC_ALPHA_LEARNING_RATE', 0.001)),
+            sac_tau=float(getattr(config, 'RBG_SAC_TAU', 0.01)),
+            sac_initial_alpha=float(getattr(config, 'RBG_SAC_INITIAL_ALPHA', 0.10)),
+            sac_auto_entropy=bool(getattr(config, 'RBG_SAC_AUTO_ENTROPY', True)),
+            sac_target_entropy_scale=float(getattr(config, 'RBG_SAC_TARGET_ENTROPY_SCALE', 0.60)),
             service_debt_decay=float(getattr(config, 'RBG_SERVICE_DEBT_DECAY', 0.85)),
             max_service_debt=float(getattr(config, 'RBG_MAX_SERVICE_DEBT', 4.0)),
             move_history_size=int(getattr(config, 'RBG_MOVE_HISTORY_SIZE', 8)),
@@ -3351,24 +5066,52 @@ def run_online_simulation_with_center_pickup(
     platform_rl_state = None
     if algo_name.lower() in PREDICTIVE_PLATFORM_RL_ALGOS and bool(getattr(config, 'PFRL_ENABLE_LEARNING', False)):
         platform_rl_device = _get_preferred_torch_device()
-        print(f"   - Platform RL device: {platform_rl_device}")
+        print(f"   - Platform continuous SAC device: {platform_rl_device}")
         platform_rl_state = PlatformTaskFirstRLState(
             region_ids=sorted(centers.keys()),
+            action_bounds=tuple(getattr(config, 'PFRL_CONTINUOUS_ACTION_BOUNDS', ())),
             learning_rate=float(getattr(config, 'PFRL_LEARNING_RATE', 0.03)),
-            temperature=float(getattr(config, 'PFRL_TEMPERATURE', 0.90)),
             exploration_prob=float(getattr(config, 'PFRL_EXPLORATION_PROB', 0.10)),
-            gamma=float(getattr(config, 'PFRL_DQN_GAMMA', 0.6)),
-            replay_capacity=int(getattr(config, 'PFRL_DQN_REPLAY_CAPACITY', 256)),
-            dqn_batch_size=int(getattr(config, 'PFRL_DQN_BATCH_SIZE', 32)),
-            target_sync_interval=int(getattr(config, 'PFRL_DQN_TARGET_SYNC_INTERVAL', 32)),
+            gamma=float(getattr(config, 'PFRL_SAC_GAMMA', 0.6)),
+            replay_capacity=int(getattr(config, 'PFRL_SAC_REPLAY_CAPACITY', 256)),
+            batch_size=int(getattr(config, 'PFRL_SAC_BATCH_SIZE', 32)),
             hidden_dim=int(getattr(config, 'PFRL_POLICY_HIDDEN_DIM', getattr(config, 'RBG_POLICY_HIDDEN_DIM', 32))),
+            critic_learning_rate=float(getattr(config, 'PFRL_SAC_CRITIC_LEARNING_RATE', getattr(config, 'PFRL_LEARNING_RATE', 0.001))),
+            alpha_learning_rate=float(getattr(config, 'PFRL_SAC_ALPHA_LEARNING_RATE', 0.001)),
+            sac_tau=float(getattr(config, 'PFRL_SAC_TAU', 0.01)),
+            sac_initial_alpha=float(getattr(config, 'PFRL_SAC_INITIAL_ALPHA', 0.10)),
+            sac_auto_entropy=bool(getattr(config, 'PFRL_SAC_AUTO_ENTROPY', True)),
+            sac_target_entropy_scale=float(getattr(config, 'PFRL_SAC_TARGET_ENTROPY_SCALE', 0.60)),
             random_seed=int(getattr(config, 'PFRL_RANDOM_SEED', 7)),
             device=platform_rl_device,
+        )
+    center_task_rl_state = None
+    if algo_name.lower() in PREDICTIVE_EVENT_RL_GAME_ALGOS:
+        center_rl_device = _get_preferred_torch_device()
+        print(f"   - Center task-allocation continuous SAC device: {center_rl_device}")
+        center_task_rl_state = CenterTaskAllocationRLState(
+            region_ids=sorted(centers.keys()),
+            action_bounds=tuple(getattr(config, 'EVENT_CENTER_CONTINUOUS_ACTION_BOUNDS', ())),
+            learning_rate=float(getattr(config, 'EVENT_CENTER_RL_LEARNING_RATE', 0.03)),
+            exploration_prob=float(getattr(config, 'EVENT_CENTER_RL_EXPLORATION_PROB', 0.02)),
+            gamma=float(getattr(config, 'EVENT_CENTER_SAC_GAMMA', 0.60)),
+            replay_capacity=int(getattr(config, 'EVENT_CENTER_SAC_REPLAY_CAPACITY', 512)),
+            batch_size=int(getattr(config, 'EVENT_CENTER_SAC_BATCH_SIZE', 32)),
+            hidden_dim=int(getattr(config, 'RBG_POLICY_HIDDEN_DIM', 32)),
+            critic_learning_rate=float(getattr(config, 'EVENT_CENTER_SAC_CRITIC_LEARNING_RATE', getattr(config, 'EVENT_CENTER_RL_LEARNING_RATE', 0.001))),
+            alpha_learning_rate=float(getattr(config, 'EVENT_CENTER_SAC_ALPHA_LEARNING_RATE', 0.001)),
+            sac_tau=float(getattr(config, 'EVENT_CENTER_SAC_TAU', 0.01)),
+            sac_initial_alpha=float(getattr(config, 'EVENT_CENTER_SAC_INITIAL_ALPHA', 0.10)),
+            sac_auto_entropy=bool(getattr(config, 'EVENT_CENTER_SAC_AUTO_ENTROPY', True)),
+            sac_target_entropy_scale=float(getattr(config, 'EVENT_CENTER_SAC_TARGET_ENTROPY_SCALE', 0.60)),
+            random_seed=int(getattr(config, 'RBG_RANDOM_SEED', 42)),
+            device=center_rl_device,
         )
     if retention_game_state is not None:
         _offline_warm_start_rbg_state(
             state=retention_game_state,
             platform_state=platform_rl_state,
+            center_task_state=center_task_rl_state,
             test_date=test_date,
             test_start_hour=test_start_hour,
             test_end_hour=test_end_hour,
@@ -3379,6 +5122,7 @@ def run_online_simulation_with_center_pickup(
             rcc_partition=rcc_partition,
             centers=centers,
             worker_sim=worker_sim,
+            algo_name=algo_name,
         )
 
     cpu_start = time.process_time()
@@ -3402,19 +5146,29 @@ def run_online_simulation_with_center_pickup(
         uncertainty_dispatch_state=uncertainty_dispatch_state,
         retention_game_state=retention_game_state,
         platform_rl_state=platform_rl_state,
+        center_task_rl_state=center_task_rl_state,
     )
 
-    assigned_tasks_per_center = {region_id: 0 for region_id in centers.keys()}
-    for detail in all_details:
-        assigned_tasks_per_center[detail['region_id']] += 1
+    unique_assigned_tasks, assigned_tasks_per_center, duplicate_assigned_details = _summarize_unique_assigned_tasks(
+        all_details,
+        centers.keys(),
+    )
 
     rho, u_rho = calculate_collaboration_unfairness(total_tasks_per_center, assigned_tasks_per_center)
     cpu_time = time.process_time() - cpu_start
     total_tasks_in_scope = int(sum(total_tasks_per_center.values()))
-    task_completion_rate = (len(all_assignments) / total_tasks_in_scope) if total_tasks_in_scope > 0 else 0.0
+    assigned_task_count = len(unique_assigned_tasks)
+    assignment_pair_count = len(all_assignments)
+    task_completion_rate = (assigned_task_count / total_tasks_in_scope) if total_tasks_in_scope > 0 else 0.0
 
     print(f"\n[{algo_name.upper()}] 仿真完成:")
-    print(f"  - #Assigned Tasks: {len(all_assignments)}")
+    print(f"  - #Assigned Tasks: {assigned_task_count}")
+    print(f"  - #Total Tasks: {total_tasks_in_scope}")
+    if duplicate_assigned_details or assignment_pair_count != assigned_task_count:
+        print(
+            f"  - Assignment de-dup: pairs={assignment_pair_count}, "
+            f"duplicate_details={duplicate_assigned_details}"
+        )
     print(f"  - Task Completion Rate: {task_completion_rate:.4f}")
     print(f"  - Collaboration Unfairness (Uρ): {u_rho:.4f}")
     print(f"  - CPU Time: {cpu_time:.4f}s")
@@ -3427,7 +5181,19 @@ def run_online_simulation_with_center_pickup(
         print(f"  - Prediction RMSE: {pred_rmse:.4f}")
 
     metrics = {
-        'assigned_tasks': len(all_assignments),
+        'assigned_tasks': assigned_task_count,
+        'total_tasks': total_tasks_in_scope,
+        'map_center_lat': scope.get('map_center_lat'),
+        'map_center_lon': scope.get('map_center_lon'),
+        'download_dist_m': scope.get('download_dist_m'),
+        'map_download_dist_m': scope.get('map_download_dist_m'),
+        'map_size_km': scope.get('map_size_km'),
+        'map_side_km': scope.get('map_side_km'),
+        'center_count': scope.get('center_count'),
+        'worker_speed_kmh': scope.get('worker_speed_kmh'),
+        'worker_speed_ms': scope.get('worker_speed_ms'),
+        'assignment_pairs': assignment_pair_count,
+        'duplicate_assigned_details': duplicate_assigned_details,
         'task_completion_rate': task_completion_rate,
         'rho': rho,
         'u_rho': u_rho,
@@ -3594,7 +5360,12 @@ def run_online_simulation_with_center_pickup(
                     )
                     if len(predispatch_result['moves']) > 8:
                         move_summary += f", ... (+{len(predispatch_result['moves']) - 8} more)"
-                    print(f"   [{predict_label}] pre-dispatched {len(predispatch_result['moves'])} workers: {move_summary}")
+                    post_service_count = sum(1 for m in predispatch_result['moves'] if m.get('post_service'))
+                    post_service_note = f" (完成后支援 {post_service_count} 名)" if post_service_count else ""
+                    print(
+                        f"   [{predict_label}] pre-dispatched {len(predispatch_result['moves'])} workers"
+                        f"{post_service_note}: {move_summary}"
+                    )
                     if uncertainty_dispatch_state is not None and algo_name.lower() in PREDICTIVE_UABG_ALGOS:
                         uncertainty_dispatch_state.record_moves(
                             slot_idx=slot_idx,
@@ -3927,7 +5698,7 @@ def run_online_simulation_with_center_pickup(
                     print("   [Predictive] no worker rebalancing needed for next slot")
 
         print(
-            f"分配结果: 成交 {len(slot_assignments)} 单, 调度 {len(set(k[0] for k in slot_assignments.keys()))} 名工人")
+            f"分配结果: 成交 {_count_unique_assigned_task_ids(slot_assignments)} 单, 调度 {len(set(k[0] for k in slot_assignments.keys()))} 名工人")
 
         if slot_expired_count > 0:
             print(f"   ❌ 超时淘汰订单: {slot_expired_count} 个 (已自动取消该订单，不扣除利润)")
@@ -3941,17 +5712,26 @@ def run_online_simulation_with_center_pickup(
         all_details.extend(slot_details)
         total_profit += slot_profit
 
-    assigned_tasks_per_center = {region_id: 0 for region_id in centers.keys()}
-    for detail in all_details:
-        assigned_tasks_per_center[detail['region_id']] += 1
+    unique_assigned_tasks, assigned_tasks_per_center, duplicate_assigned_details = _summarize_unique_assigned_tasks(
+        all_details,
+        centers.keys(),
+    )
 
     rho, u_rho = calculate_collaboration_unfairness(total_tasks_per_center, assigned_tasks_per_center)
     cpu_time = time.process_time() - cpu_start
     total_tasks_in_scope = int(sum(total_tasks_per_center.values()))
-    task_completion_rate = (len(all_assignments) / total_tasks_in_scope) if total_tasks_in_scope > 0 else 0.0
+    assigned_task_count = len(unique_assigned_tasks)
+    assignment_pair_count = len(all_assignments)
+    task_completion_rate = (assigned_task_count / total_tasks_in_scope) if total_tasks_in_scope > 0 else 0.0
 
     print(f"\n[{algo_name.upper()}] 仿真完成:")
-    print(f"  - #Assigned Tasks: {len(all_assignments)}")
+    print(f"  - #Assigned Tasks: {assigned_task_count}")
+    print(f"  - #Total Tasks: {total_tasks_in_scope}")
+    if duplicate_assigned_details or assignment_pair_count != assigned_task_count:
+        print(
+            f"  - Assignment de-dup: pairs={assignment_pair_count}, "
+            f"duplicate_details={duplicate_assigned_details}"
+        )
     print(f"  - Task Completion Rate: {task_completion_rate:.4f}")
     print(f"  - Collaboration Unfairness (Uρ): {u_rho:.4f}")
     print(f"  - CPU Time: {cpu_time:.4f}s")
@@ -3964,7 +5744,19 @@ def run_online_simulation_with_center_pickup(
         print(f"  - Prediction RMSE: {pred_rmse:.4f}")
 
     metrics = {
-        'assigned_tasks': len(all_assignments),
+        'assigned_tasks': assigned_task_count,
+        'total_tasks': total_tasks_in_scope,
+        'map_center_lat': scope.get('map_center_lat'),
+        'map_center_lon': scope.get('map_center_lon'),
+        'download_dist_m': scope.get('download_dist_m'),
+        'map_download_dist_m': scope.get('map_download_dist_m'),
+        'map_size_km': scope.get('map_size_km'),
+        'map_side_km': scope.get('map_side_km'),
+        'center_count': scope.get('center_count'),
+        'worker_speed_kmh': scope.get('worker_speed_kmh'),
+        'worker_speed_ms': scope.get('worker_speed_ms'),
+        'assignment_pairs': assignment_pair_count,
+        'duplicate_assigned_details': duplicate_assigned_details,
         'task_completion_rate': task_completion_rate,
         'rho': rho,
         'u_rho': u_rho,

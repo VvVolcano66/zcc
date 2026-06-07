@@ -138,7 +138,8 @@ def _assign_single_region_dynamic_greedy(
                 dist_to_center = 0.0 if worker_paid_center_cost[wid] else dist_worker_to_center[wid]
                 total_dist = dist_to_center + dist_to_task
                 travel_time = total_dist / config.WORKER_SPEED_MS
-                arrival_time = max(worker_current_time[wid] + travel_time, release_time)
+                departure_time = max(worker_current_time[wid], release_time)
+                arrival_time = departure_time + travel_time
                 if arrival_time > task_expires[tid]:
                     continue
 

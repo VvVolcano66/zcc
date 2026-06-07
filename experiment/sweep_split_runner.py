@@ -10,11 +10,11 @@ BATCH_COUNTS = [2, 4, 6, 8, 10]
 CENTER_COUNTS = [3, 4, 5, 6, 7]
 FIXED_WORKER_COUNT = 500
 ALGORITHMS = [
-    ("greedy", "Greedy"),
+    # ("greedy", "Greedy"),
     ("imtao", "IMTAO (Seq-BDC)"),
-    ("predictive_mctgnet", "Predictive-MCTGNet"),
+    # ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("no_pred_rl_game", "NoPred-RL-Game"),
-    ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
+    ("predictive_event_rl_game", "Event-RL-Game"),
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,8 +94,13 @@ def _write_single_setting_csv(
         "worker_count",
         "batch_count",
         "center_count",
+        "map_size_km",
+        "download_dist_m",
+        "worker_speed_kmh",
+        "worker_speed_ms",
         "algorithm",
         "assigned_tasks",
+        "total_tasks",
         "task_completion_rate",
         "u_rho",
         "cpu_time",
@@ -110,9 +115,14 @@ def _write_single_setting_csv(
                 {
                     "worker_count": worker_count,
                     "batch_count": batch_count,
-                    "center_count": center_count,
+                    "center_count": metrics.get("center_count", center_count),
+                    "map_size_km": metrics.get("map_size_km"),
+                    "download_dist_m": metrics.get("download_dist_m"),
+                    "worker_speed_kmh": metrics.get("worker_speed_kmh"),
+                    "worker_speed_ms": metrics.get("worker_speed_ms"),
                     "algorithm": algorithm,
                     "assigned_tasks": metrics["assigned_tasks"],
+                    "total_tasks": metrics.get("total_tasks"),
                     "task_completion_rate": metrics["task_completion_rate"],
                     "u_rho": metrics["u_rho"],
                     "cpu_time": metrics["cpu_time"],
@@ -128,7 +138,7 @@ def _print_summary(title: str, worker_count: int, batch_count: int, algo_results
     print(f"Worker Count: {worker_count} | Batch Count: {batch_count}")
     print("=" * 130)
     print(
-        f"{'Algorithm':<22} | {'#Assigned Tasks':<16} | {'Task Completion Rate':<22} | {'Collaboration Unfairness':<26} | "
+        f"{'Algorithm':<22} | {'#Assigned Tasks':<16} | {'#Total Tasks':<13} | {'Task Completion Rate':<22} | {'Collaboration Unfairness':<26} | "
         f"{'CPU Time (s)':<14} | {'Prediction MAE':<14} | {'Prediction RMSE':<14}"
     )
     print("-" * 130)
@@ -136,6 +146,7 @@ def _print_summary(title: str, worker_count: int, batch_count: int, algo_results
         print(
             f"{algorithm:<22} | "
             f"{metrics['assigned_tasks']:<16} | "
+            f"{str(metrics.get('total_tasks', '-')):<13} | "
             f"{metrics['task_completion_rate']:<22.4f} | "
             f"{metrics['u_rho']:<26.4f} | "
             f"{metrics['cpu_time']:<14.4f} | "

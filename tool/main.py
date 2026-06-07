@@ -21,7 +21,7 @@ def draw_real_map(G, nodes, coords, partition, centers=None, title="Real Map Vis
     pos = {node: (coords[i][0], coords[i][1]) for i, node in enumerate(nodes)}
 
     # 1. 绘制道路 (Edges)
-    nx.draw_networkx_edges(G, pos, alpha=0.1, edge_color='#AAAAAA', ax=ax, width=0.5)
+    nx.draw_networkx_edges(G, pos, alpha=0.1, edge_color='#000000', ax=ax, width=1.5)
 
     # [修复警告] 使用 plt.get_cmap 替代废弃的 cm.get_cmap
     try:

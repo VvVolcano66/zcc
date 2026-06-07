@@ -12,6 +12,7 @@ ALGORITHMS = [
     ("no_pred_rl_game", "NoPred-RL-Game"),
     ("predictive_mctgnet", "Predictive-MCTGNet"),
     ("predictive_platform_rl_mctgnet", "Platform-RL-MCTGNet"),
+    ("predictive_event_rl_game", "Event-RL-Game"),
 ]
 
 
@@ -20,6 +21,7 @@ def _fmt_optional(value):
 
 
 def run_single_setting(center_count: int):
+    original_worker_limit = batch_exp.DEFAULT_WORKER_LIMIT
     batch_exp._MCTG_PREDICTOR_CACHE.clear()
     batch_exp.DEFAULT_WORKER_LIMIT = FIXED_WORKER_COUNT
     batch_exp._SIMULATION_CONTEXT_CACHE.clear()
@@ -39,6 +41,7 @@ def run_single_setting(center_count: int):
             results[display_name] = metrics
         return results
     finally:
+        batch_exp.DEFAULT_WORKER_LIMIT = original_worker_limit
         batch_exp.config.NUM_ZONES = original_num_zones
 
 
@@ -47,8 +50,13 @@ def write_csv(results_by_center_count, output_path: str):
         "worker_count",
         "batch_count",
         "center_count",
+        "map_size_km",
+        "download_dist_m",
+        "worker_speed_kmh",
+        "worker_speed_ms",
         "algorithm",
         "assigned_tasks",
+        "total_tasks",
         "task_completion_rate",
         "u_rho",
         "cpu_time",
@@ -64,9 +72,14 @@ def write_csv(results_by_center_count, output_path: str):
                     {
                         "worker_count": FIXED_WORKER_COUNT,
                         "batch_count": batch_exp.DEFAULT_COMPARE_SLOT_COUNT,
-                        "center_count": int(center_count),
+                        "center_count": metrics.get("center_count", int(center_count)),
+                        "map_size_km": metrics.get("map_size_km"),
+                        "download_dist_m": metrics.get("download_dist_m"),
+                        "worker_speed_kmh": metrics.get("worker_speed_kmh"),
+                        "worker_speed_ms": metrics.get("worker_speed_ms"),
                         "algorithm": algorithm,
                         "assigned_tasks": metrics["assigned_tasks"],
+                        "total_tasks": metrics.get("total_tasks"),
                         "task_completion_rate": metrics["task_completion_rate"],
                         "u_rho": metrics["u_rho"],
                         "cpu_time": metrics["cpu_time"],
@@ -84,7 +97,7 @@ def print_summary(results_by_center_count):
         print(f"\n[Center Count = {int(center_count)}]")
         print("-" * 130)
         print(
-            f"{'Algorithm':<22} | {'#Assigned Tasks':<16} | {'Task Completion Rate':<22} | {'Collaboration Unfairness':<26} | "
+            f"{'Algorithm':<22} | {'#Assigned Tasks':<16} | {'#Total Tasks':<13} | {'Task Completion Rate':<22} | {'Collaboration Unfairness':<26} | "
             f"{'CPU Time (s)':<14} | {'Prediction MAE':<14} | {'Prediction RMSE':<14}"
         )
         print("-" * 130)
@@ -92,6 +105,7 @@ def print_summary(results_by_center_count):
             print(
                 f"{algorithm:<22} | "
                 f"{metrics['assigned_tasks']:<16} | "
+                f"{str(metrics.get('total_tasks', '-')):<13} | "
                 f"{metrics['task_completion_rate']:<22.4f} | "
                 f"{metrics['u_rho']:<26.4f} | "
                 f"{metrics['cpu_time']:<14.4f} | "
